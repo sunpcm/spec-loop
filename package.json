@@ -1,0 +1,30 @@
+{
+  "name": "spec-loop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub + Pi Coding Agent 本地文档驱动开发演示",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5174",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'tests/*.test.ts'",
+    "build": "vite build --configLoader native",
+    "demo:init": "node orchestrator/init.ts",
+    "demo": "node orchestrator/index.ts",
+    "demo:status": "node orchestrator/status.ts",
+    "demo:retry": "node orchestrator/retry.ts",
+    "demo:recover": "node orchestrator/recover.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@larksuiteoapi/node-sdk": "1.76.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0",
+    "vite": "^6.0.0"
+  }
+}
