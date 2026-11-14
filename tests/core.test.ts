@@ -39,6 +39,7 @@ function makeState(
     requirements,
     jobs,
     deploy: { activeSha: null, releaseDir: null, deployedPRs: [] },
+    specRequests: {},
     opLog: [],
   };
 }
@@ -761,7 +762,13 @@ test('createFeishuBridgeRuntime 未启用时返回 null 且不调用 logger', as
   const logged: string[] = [];
   const bridge = await createFeishuBridgeRuntime(
     { enabled: false, allowedUserIds: [] },
-    { status: async () => 'ok', retry: async () => 'ok' },
+    {
+      status: async () => 'ok',
+      retry: async () => 'ok',
+      help: async () => 'help',
+      require: async () => 'require',
+      retryRequirement: async () => 'retry-req',
+    },
     (m) => logged.push(m),
   );
   assert.equal(bridge, null);

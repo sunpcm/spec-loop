@@ -23,3 +23,9 @@ function load(name: string, fallback: string): string {
 
 export const WORKER_PROMPT = load('worker.md', DEFAULT_WORKER_PROMPT);
 export const PLANNER_PROMPT = load('planner.md', DEFAULT_PLANNER_PROMPT);
+export const SPEC_AUTHOR_PROMPT = load(
+  'spec-author.md',
+  `你是 Spec Loop 的 spec-author。根据用户文本，仅更新给定需求文档 docs/specs/counter.md 中现有 REQ-CNT-01 块。
+只输出一个 JSON 对象：{"summary":"...","content":"完整的新文档内容"}。
+必须保留所有现有需求 ID，不能新增或删除需求块，不能修改其它文件。`,
+);

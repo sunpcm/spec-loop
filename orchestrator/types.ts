@@ -42,9 +42,11 @@ export interface ManagedPR {
   merged: boolean;
   mergedAt?: string;
   headRefName: string;
+  headSHA?: string;
   baseRefName: string;
   mergeCommitSha?: string;
   meta: ManagedMeta | null;
+  labels?: string[];
   url?: string;
 }
 
@@ -79,6 +81,43 @@ export interface DeployState {
   deployFailedPRs?: number[];
 }
 
+export type SpecRequestStage =
+  | 'pi'
+  | 'write'
+  | 'commit'
+  | 'push'
+  | 'pr'
+  | 'pr-open'
+  | 'pr-merged'
+  | 'pr-closed'
+  | 'review'
+  | 'failed'
+  | 'stale';
+
+export interface SpecRequest {
+  requestId: string;
+  messageId: string;
+  description: string;
+  targetReqId: string;
+  baseSHA: string;
+  branch: string;
+  stage: SpecRequestStage;
+  /** Pi 已产出并通过控制器校验的文档内容；避免重试时重新调用 Pi 丢弃既有产物。 */
+  hasValidDoc: boolean;
+  docContent?: string;
+  summary?: string;
+  commitSHA?: string;
+  prNumber?: number;
+  prUrl?: string;
+  /** spec-patch 标签是否已经由控制器确认。false 时可从远端幂等补齐。 */
+  labelsSynced?: boolean;
+  error?: string;
+  /** failed 前正在执行/下一步应恢复的阶段；用于少量稳定状态之外的失败定位。 */
+  failureStage?: SpecRequestStage;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface OpLogEntry {
   ts: string;
   stage: string;
@@ -93,6 +132,7 @@ export interface OrchestratorState {
   requirements: Record<string, RequirementState>;
   jobs: Record<string, JobState>;
   deploy: DeployState;
+  specRequests: Record<string, SpecRequest>;
   opLog: OpLogEntry[];
 }
 
@@ -104,6 +144,7 @@ export function emptyState(): OrchestratorState {
     requirements: {},
     jobs: {},
     deploy: { activeSha: null, releaseDir: null, deployedPRs: [] },
+    specRequests: {},
     opLog: [],
   };
 }

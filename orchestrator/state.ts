@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { emptyState, type OrchestratorState } from './types.ts';
+import { emptyState, type OrchestratorState, type SpecRequest } from './types.ts';
 
 export class StateStore {
   private state: OrchestratorState;
@@ -26,6 +26,10 @@ export class StateStore {
     try {
       const parsed = JSON.parse(raw) as OrchestratorState;
       if (parsed && typeof parsed === 'object' && parsed.schemaVersion === 1) {
+        parsed.specRequests ??= {};
+        for (const req of Object.values(parsed.specRequests)) {
+          normalizeSpecRequest(req);
+        }
         this.state = parsed;
       } else {
         throw new Error('schemaVersion 不是 1');
@@ -65,12 +69,19 @@ export class StateStore {
     return resultPromise;
   }
 
-  private persist(state: OrchestratorState): void {
+  protected persist(state: OrchestratorState): void {
     mkdirSync(dirname(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, JSON.stringify(state, null, 2));
     renameSync(tmp, this.file);
   }
+}
+
+function normalizeSpecRequest(req: SpecRequest): void {
+  req.hasValidDoc ??= Boolean(req.docContent);
+  req.labelsSynced ??= false;
+  if (req.stage === 'commit') req.stage = 'write';
+  if (req.stage === 'review') req.stage = 'pr-open';
 }
 
 export function backupState(stateFile: string): void {

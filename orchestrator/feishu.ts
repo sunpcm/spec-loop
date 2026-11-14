@@ -1,4 +1,10 @@
 import type * as Lark from '@larksuiteoapi/node-sdk';
+import { HELP_TEXT } from './feishu-help.ts';
+import {
+  computeSpecRequestId,
+  normalizeSpecDescription,
+  SPEC_REQUEST_ID_RE,
+} from './spec-identity.ts';
 
 export interface FeishuSettings {
   enabled: boolean;
@@ -8,10 +14,7 @@ export interface FeishuSettings {
   allowedUserIds: string[];
 }
 
-export interface FeishuCommands {
-  status(): Promise<string>;
-  retry(issueNumber: number): Promise<string>;
-}
+import type { FeishuCommands } from './feishu-contract.ts';
 
 export interface FeishuBridge {
   start(): Promise<void>;
@@ -46,7 +49,14 @@ export interface FeishuDependencies {
   createWebSocket(settings: FeishuSettings, eventDispatcher: FeishuEventDispatcher): Promise<FeishuWebSocket>;
 }
 
-type FeishuCommand = { type: 'status' } | { type: 'retry'; issueNumber: number };
+type FeishuCommand =
+  | { type: 'status' }
+  | { type: 'retry'; issueNumber: number }
+  | { type: 'require'; description: string }
+  | { type: 'retry-requirement'; requestId: string }
+  | { type: 'invalid-requirement'; message: string }
+  | { type: 'help' }
+  | { type: 'unknown' };
 
 const DEDUP_LIMIT = 500;
 const MAX_MESSAGE_LENGTH = 3500;
@@ -56,16 +66,40 @@ const COMMAND_ACK_TEXT = '✅ 收到命令，正在处理，结果稍后返回�
 const COMMAND_ERROR_TEXT = '⚠️ 命令执行失败，请稍后重试。';
 
 export function parseFeishuCommand(rawText: string): FeishuCommand | null {
+  // 只去掉开头与结尾空白和 @ 提及，内部换行保持原样，避免折叠需求描述。
   const text = rawText
-    .split(/\s+/)
-    .filter((token) => token.length > 0 && !token.startsWith('@'))
-    .join(' ');
+    .trim()
+    .replace(/^(?:@[^\s@]+\s*)+/, '')
+    .trim();
   if (text === '/status' || text === '状态') {
     return { type: 'status' };
+  }
+  if (text === '/help' || text === '帮助') {
+    return { type: 'help' };
   }
   const retryMatch = /^(?:\/retry\s+|重试\s*)#?([1-9][0-9]{0,9})$/.exec(text);
   if (retryMatch) {
     return { type: 'retry', issueNumber: Number(retryMatch[1]) };
+  }
+  const retryRequirementMatch = /^(?:\/retry-requirement\s+|重试需求\s+)([A-Za-z0-9]{6,64})$/.exec(text);
+  if (retryRequirementMatch) {
+    const requestId = retryRequirementMatch[1]!;
+    if (SPEC_REQUEST_ID_RE.test(requestId)) {
+      return { type: 'retry-requirement', requestId };
+    }
+  }
+  const requireMatch = /^(?:\/require(?:\s+([\s\S]*))?|需求\s*[:：]\s*([\s\S]*))$/.exec(text);
+  if (requireMatch) {
+    const rawDescription = requireMatch[1] ?? requireMatch[2] ?? '';
+    try {
+      const description = normalizeSpecDescription(rawDescription);
+      return { type: 'require', description };
+    } catch (error) {
+      return {
+        type: 'invalid-requirement',
+        message: `⚠️ ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
   }
   return null;
 }
@@ -276,17 +310,38 @@ export function createFeishuBridgeWithDependencies(
     return sendQueue;
   }
 
-  async function runCommand(command: FeishuCommand): Promise<string> {
+  async function runCommand(command: FeishuCommand, messageId: string): Promise<string> {
     if (command.type === 'status') {
       return commands.status();
     }
-    return commands.retry(command.issueNumber);
+    if (command.type === 'retry') {
+      return commands.retry(command.issueNumber);
+    }
+    if (command.type === 'require') {
+      return commands.require(command.description, messageId);
+    }
+    if (command.type === 'retry-requirement') {
+      return commands.retryRequirement(command.requestId);
+    }
+    if (command.type === 'invalid-requirement') {
+      return command.message;
+    }
+    if (command.type === 'help') {
+      return commands.help();
+    }
+    return HELP_TEXT;
   }
 
   async function processCommand(chatId: string, command: FeishuCommand, messageId: string): Promise<void> {
-    await enqueueSend(chatId, COMMAND_ACK_TEXT);
+    if (command.type !== 'invalid-requirement') {
+      const ackText =
+        command.type === 'require'
+          ? `✅ 已收到需求消息，候选请求ID：${computeSpecRequestId(messageId)}；检查通过后受理`
+          : COMMAND_ACK_TEXT;
+      await enqueueSend(chatId, ackText);
+    }
     try {
-      const result = await runCommand(command);
+      const result = await runCommand(command, messageId);
       await enqueueSend(chatId, result);
       log(`飞书命令已完成: ${messageId}`);
     } catch (error) {
@@ -325,7 +380,8 @@ export function createFeishuBridgeWithDependencies(
       }
       const command = parseFeishuCommand(extractMessageText(message.content));
       if (!command) {
-        log(`忽略无法识别的飞书命令: ${messageId}`);
+        log(`未识别消息，回复帮助: ${messageId}`);
+        void processCommand(chatId, { type: 'unknown' }, messageId);
         return;
       }
       void processCommand(chatId, command, messageId);

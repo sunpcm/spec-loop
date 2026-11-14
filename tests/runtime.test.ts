@@ -97,6 +97,7 @@ function makeState(spec: Spec): OrchestratorState {
     },
     jobs: {},
     deploy: { activeSha: null, releaseDir: null, deployedPRs: [] },
+    specRequests: {},
     opLog: [],
   };
 }

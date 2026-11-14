@@ -103,10 +103,11 @@ interface GhPr {
   state: 'open' | 'closed';
   merged?: boolean;
   merged_at?: string | null;
-  head?: { ref: string };
+  head?: { ref: string; sha?: string };
   base?: { ref: string };
   merge_commit_sha?: string;
   html_url?: string;
+  labels?: Array<{ name: string }>;
 }
 
 export class GithubClient {
@@ -162,9 +163,11 @@ export class GithubClient {
       merged: p.merged ?? p.merged_at != null,
       mergedAt: p.merged_at ?? undefined,
       headRefName: p.head?.ref ?? '',
+      headSHA: p.head?.sha,
       baseRefName: p.base?.ref ?? '',
       mergeCommitSha: p.merge_commit_sha,
       meta: extractMeta(p.body ?? ''),
+      labels: (p.labels ?? []).map((label) => label.name),
       url: p.html_url,
     }));
   }
@@ -251,6 +254,42 @@ export class GithubClient {
     for (const label of labels) {
       await this.gh(['label', 'create', label, '--repo', this.repo, '--force']);
     }
+  }
+
+  /** 按 head 分支精确查找 PR（含已合并/关闭），用于 spec-intake 的确定性恢复。 */
+  async findPRByHead(headRef: string): Promise<ManagedPR | null> {
+    const prs = await this.listPRs();
+    return prs.find((p) => p.headRefName === headRef) ?? null;
+  }
+
+  async addPrLabels(number: number, labels: string[]): Promise<void> {
+    if (labels.length === 0) return;
+    await this.gh(['pr', 'edit', String(number), '--repo', this.repo, '--add-label', labels.join(',')]);
+  }
+
+  /** 分支是否存在（用于 push 前/后的远端对账）；读取失败不当作不存在。 */
+  async branchExists(branch: string): Promise<boolean> {
+    return (await this.branchSHA(branch)) !== null;
+  }
+
+  /** 读取远端分支 SHA。只有明确的 HTTP 404 才表示不存在，其余读取错误 fail closed。 */
+  async branchSHA(branch: string): Promise<string | null> {
+    const res = await this.runner(['api', `repos/${this.repo}/git/ref/heads/${branch}`]);
+    if (res.code !== 0) {
+      if (/\bHTTP 404\b/i.test(res.stderr)) return null;
+      throw new Error(`读取远端分支 ${branch} 失败: ${res.stderr.trim() || `退出码 ${res.code}`}`);
+    }
+    let parsed: { object?: { sha?: unknown } };
+    try {
+      parsed = JSON.parse(res.stdout) as { object?: { sha?: unknown } };
+    } catch {
+      throw new Error(`远端分支 ${branch} 返回非法 JSON`);
+    }
+    const sha = parsed.object?.sha;
+    if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/i.test(sha)) {
+      throw new Error(`远端分支 ${branch} 响应缺少有效 SHA`);
+    }
+    return sha;
   }
 }
 

@@ -30,6 +30,12 @@ import {
   type CommandRunner,
 } from './validate.ts';
 import { runWorkerJob, type WorkerDeps, type WorkerInput, type WorkerOutcome } from './worker.ts';
+import {
+  reconcileSpecRequests,
+  retrySpecRequirement,
+  submitSpecRequirement,
+  type SpecIntakeDeps,
+} from './spec-intake.ts';
 
 export type WorkerJobRunner = (deps: WorkerDeps, input: WorkerInput) => Promise<WorkerOutcome>;
 
@@ -44,6 +50,7 @@ export interface Core {
   workerDeps: WorkerDeps;
   deployDeps: DeployDeps;
   reconcileContext: ReconcileContext;
+  specIntakeDeps: SpecIntakeDeps;
   planner: ((spec: Spec) => Promise<string | null>) | null;
   repo: string | null;
   workerRunner?: WorkerJobRunner;
@@ -308,6 +315,21 @@ export function createCore(
     mainBranch: config.mainBranch,
   };
 
+  const specIntakeDeps: SpecIntakeDeps = {
+    repoDir: config.repoDir,
+    runDir: config.runDir,
+    git,
+    github,
+    state,
+    logger: createLogger('SPEC-INTAKE'),
+    notify: emitNotify,
+    piProvider: config.piProvider,
+    piModel: config.piModel,
+    piAgentDir: config.piAgentDir,
+    piTimeoutMs: config.piTimeoutMs,
+    piGraceMs: config.piGraceMs,
+  };
+
   // 先建立可变的 core 引用，供 retryWorker 闭包回指统一作业生命周期。
   const core: Core = {
     config,
@@ -320,6 +342,7 @@ export function createCore(
     workerDeps,
     deployDeps,
     reconcileContext,
+    specIntakeDeps,
     planner: null,
     repo,
     workerRunner: runWorkerJob,
@@ -335,6 +358,8 @@ export function createCore(
     worker: workerDeps,
     mainBranch: config.mainBranch,
     retryWorker: (input) => runOneWorkerForInput(core, input),
+    requireSpec: (description, messageId) => submitSpecRequirement(specIntakeDeps, description, messageId),
+    retrySpec: (requestId) => retrySpecRequirement(specIntakeDeps, requestId),
   });
 
   const plannerEnabled = Boolean(config.piProvider && config.piModel);
@@ -720,6 +745,11 @@ export async function runOnce(core: Core): Promise<{
   workers: WorkerOutcome[];
   deploy: DeployResult;
 }> {
+  try {
+    await reconcileSpecRequests(core.specIntakeDeps);
+  } catch (error) {
+    core.logger.warn(`spec 请求远端对账失败（本轮跳过）: ${error instanceof Error ? error.message : String(error)}`);
+  }
   await syncPendingStatusLabels(core);
   // applyReconciliation 关键操作失败会抛错（不推进游标），此处不捕获：
   // 异常向上传播，跳过 Worker 派发与部署，等待下轮重放差量。
