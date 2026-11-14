@@ -1,6 +1,6 @@
 import './style.css';
 import './counter-controls.css';
-import { CounterInputError, decrement, increment } from './counter';
+import { CounterInputError, decrement, doubleValue, increment } from './counter';
 
 declare const __APP_VERSION__: string;
 
@@ -77,12 +77,17 @@ app.innerHTML = `
               <button class='button button-primary' type='submit'>增加</button>
             </div>
           </div>
-          <p id='step-hint' class='field-hint'>增加与减少共用同一个整数步长，支持正负步长。</p>
+          <p id='step-hint' class='field-hint'>增加与减少共用同一个整数步长，支持正负步长；翻倍按当前计数乘以 2，不改变步长。</p>
         </form>
 
-        <button id='reset-button' class='button button-secondary' type='button'>
-          重置计数
-        </button>
+        <div class='utility-actions'>
+          <button id='double-button' class='button button-double' type='button'>
+            翻倍
+          </button>
+          <button id='reset-button' class='button button-secondary' type='button'>
+            重置计数
+          </button>
+        </div>
       </section>
 
       <aside class='side-column' aria-label='需求行为与错误提示'>
@@ -99,6 +104,7 @@ app.innerHTML = `
             <li><span>02</span><p>输入整数步长，点击“增加”累计计数。</p></li>
             <li><span>03</span><p>点击“减少”按同一步长减去计数。</p></li>
             <li><span>04</span><p>点击“重置”归零，并保留当前步长。</p></li>
+            <li><span>05</span><p>点击“翻倍”将当前计数乘以 2，步长保持不变。</p></li>
           </ul>
         </section>
 
@@ -134,6 +140,7 @@ const counterValue = requireElement<HTMLOutputElement>('#counter-value');
 const appVersionElement = requireElement<HTMLElement>('#app-version');
 const resetButton = requireElement<HTMLButtonElement>('#reset-button');
 const decrementButton = requireElement<HTMLButtonElement>('#decrement-button');
+const doubleButton = requireElement<HTMLButtonElement>('#double-button');
 const errorPanel = requireElement<HTMLElement>('#error-panel');
 const errorMessage = requireElement<HTMLParagraphElement>('#error-message');
 const errorRecovery = requireElement<HTMLButtonElement>('#error-recovery');
@@ -186,6 +193,21 @@ function runStep(operation: StepOperation) {
   }
 }
 
+function runValueOperation(operation: (value: number) => number) {
+  try {
+    current = operation(current);
+    renderCounter();
+    clearError();
+  } catch (error) {
+    if (error instanceof CounterInputError) {
+      showInputError(error);
+      return;
+    }
+
+    throw error;
+  }
+}
+
 form.addEventListener('submit', (event) => {
   event.preventDefault();
   runStep(increment);
@@ -193,6 +215,10 @@ form.addEventListener('submit', (event) => {
 
 decrementButton.addEventListener('click', () => {
   runStep(decrement);
+});
+
+doubleButton.addEventListener('click', () => {
+  runValueOperation(doubleValue);
 });
 
 resetButton.addEventListener('click', () => {
