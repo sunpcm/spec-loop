@@ -1,0 +1,27 @@
+.step-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.button-decrease {
+  min-width: 96px;
+  border: 1px solid #c4d7ca;
+  color: #285a42;
+  background: #edf5ef;
+}
+
+.button-decrease:hover {
+  background: #e1eee6;
+}
+
+@media (max-width: 480px) {
+  .step-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .button-decrease,
+  .button-primary {
+    width: 100%;
+  }
+}
