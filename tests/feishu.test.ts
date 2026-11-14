@@ -10,6 +10,7 @@ import {
   type FeishuIncomingEvent,
   type FeishuSettings,
 } from '../orchestrator/feishu.ts';
+import type { FeishuActorContext } from '../orchestrator/feishu-contract.ts';
 import { computeSpecRequestId } from '../orchestrator/spec-identity.ts';
 
 function createSettings(overrides: Partial<FeishuSettings> = {}): FeishuSettings {
@@ -28,6 +29,12 @@ function createCommands(overrides: { statusError?: Error; retryError?: Error } =
   const retryCalls: number[] = [];
   const requireCalls: Array<{ description: string; messageId?: string }> = [];
   const retryRequirementCalls: string[] = [];
+  const mergeCalls: Array<{ prNumber: number; context?: FeishuActorContext }> = [];
+  const confirmMergeCalls: Array<{
+    prNumber: number;
+    confirmationCode: string;
+    context?: FeishuActorContext;
+  }> = [];
   return {
     commands: {
       async status(): Promise<string> {
@@ -55,6 +62,18 @@ function createCommands(overrides: { statusError?: Error; retryError?: Error } =
         retryRequirementCalls.push(requestId);
         return `RETRY_REQ_OK_${requestId}`;
       },
+      async merge(prNumber: number, context?: FeishuActorContext): Promise<string> {
+        mergeCalls.push({ prNumber, context });
+        return `MERGE_OK_${prNumber}`;
+      },
+      async confirmMerge(
+        prNumber: number,
+        confirmationCode: string,
+        context?: FeishuActorContext,
+      ): Promise<string> {
+        confirmMergeCalls.push({ prNumber, confirmationCode, context });
+        return `CONFIRM_OK_${prNumber}_${confirmationCode}`;
+      },
     },
     get statusCalls() {
       return statusCalls;
@@ -67,6 +86,12 @@ function createCommands(overrides: { statusError?: Error; retryError?: Error } =
     },
     get retryRequirementCalls() {
       return [...retryRequirementCalls];
+    },
+    get mergeCalls() {
+      return mergeCalls.map((call) => ({ ...call }));
+    },
+    get confirmMergeCalls() {
+      return confirmMergeCalls.map((call) => ({ ...call }));
     },
   };
 }
@@ -193,6 +218,52 @@ test('命令解析支持需求/帮助/重试需求且保留描述换行', () => 
     type: 'invalid-requirement',
     message: '⚠️ 需求描述超过 2000 字符',
   });
+});
+
+test('合并命令解析支持中英文入口并明确拒绝非法编号与确认码', () => {
+  assert.deepEqual(parseFeishuCommand('合并 PR #8'), { type: 'merge', prNumber: 8 });
+  assert.deepEqual(parseFeishuCommand('/merge 8'), { type: 'merge', prNumber: 8 });
+  assert.deepEqual(parseFeishuCommand('/merge #8'), { type: 'merge', prNumber: 8 });
+  assert.deepEqual(parseFeishuCommand('确认合并 #8 A1B2C3D4'), {
+    type: 'confirm-merge',
+    prNumber: 8,
+    confirmationCode: 'a1b2c3d4',
+  });
+  assert.match((parseFeishuCommand('合并 PR #0') as { message: string }).message, /合并预检格式/);
+  assert.match((parseFeishuCommand('/merge nope') as { message: string }).message, /合并预检格式/);
+  assert.match(
+    (parseFeishuCommand('确认合并 #8 nothex') as { message: string }).message,
+    /确认格式/,
+  );
+});
+
+test('合并桥接从事件 envelope 传可信 actor/message/chat 身份', async () => {
+  const harness = createFakeHarness();
+  const commandState = createCommands();
+  const bridge = createFeishuBridgeWithDependencies(
+    createSettings(),
+    commandState.commands,
+    () => {},
+    async () => harness.dependencies,
+  );
+  await bridge.start();
+  await harness.dispatch(
+    createEvent({
+      message_id: 'om_merge_context',
+      content: JSON.stringify({ text: '合并 PR #8' }),
+    }),
+  );
+  await waitFor(() => commandState.mergeCalls.length === 1);
+  assert.deepEqual(commandState.mergeCalls[0], {
+    prNumber: 8,
+    context: {
+      messageId: 'om_merge_context',
+      actorId: 'ou_allowed_user',
+      chatId: 'oc_fake_chat',
+      senderType: 'user',
+    },
+  });
+  await bridge.stop();
 });
 
 test('需求命令 ACK 使用真实 message_id 身份，并把同一 ID 传给控制器', async () => {

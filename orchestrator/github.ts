@@ -127,6 +127,11 @@ export class GithubClient {
     return res.stdout;
   }
 
+  /** 受控 REST 入口：保留退出码，供合并状态机区分离线失败与结果未知。 */
+  async runApi(args: string[], opts?: { input?: string }): Promise<GhResult> {
+    return this.runner(args, opts);
+  }
+
   private async ghApiPaginate(path: string): Promise<string> {
     // --paginate 会把各页 JSON 数组原样串联，多页时直接 parse 会失败；
     // --slurp 让 gh 输出「页数组」，flatten 后重新序列化，调用方仍拿到单个 JSON 数组。

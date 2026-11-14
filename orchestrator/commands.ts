@@ -1,9 +1,10 @@
 import { retryDeployForIssue, type DeployDeps } from './deploy.ts';
-import type { FeishuCommands } from './feishu-contract.ts';
+import type { FeishuActorContext, FeishuCommands } from './feishu-contract.ts';
 import { HELP_TEXT } from './feishu-help.ts';
 import type { GithubClient } from './github.ts';
 import type { GitClient } from './git.ts';
 import { redact, type Logger } from './log.ts';
+import type { MergeService } from './merge.ts';
 import { parseSpecs } from './specs.ts';
 import type { StateStore } from './state.ts';
 import type { WorkerDeps, WorkerInput, WorkerOutcome } from './worker.ts';
@@ -24,6 +25,7 @@ export interface CommandsDeps {
   mainBranch?: string;
   requireSpec?: (description: string, messageId: string) => Promise<string>;
   retrySpec?: (requestId: string) => Promise<string>;
+  mergeService?: Pick<MergeService, 'preflight' | 'confirm'> | null;
 }
 
 export function createCommands(deps: CommandsDeps): FeishuCommands {
@@ -49,6 +51,9 @@ export function createCommands(deps: CommandsDeps): FeishuCommands {
           return `请求 ${r.requestId} ${r.stage}${r.prUrl ? ` ${r.prUrl}` : ''}${error}${next}`;
         })
         .join('\n');
+      const latestMerge = Object.values(state.mergeRequests ?? {})
+        .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0))
+        .at(0);
       return [
         `仓库: ${state.repo ?? '未绑定'}`,
         `游标 SHA: ${state.cursorMainSha ?? '-'}`,
@@ -56,6 +61,9 @@ export function createCommands(deps: CommandsDeps): FeishuCommands {
         `需求任务: ${Object.keys(state.requirements).length}`,
         `作业: ${jobs || '-'}`,
         specLines ? `需求请求:\n${specLines}` : '需求请求: -',
+        latestMerge
+          ? `最近合并: PR #${latestMerge.prNumber} ${latestMerge.stage}${latestMerge.result ? ` ${latestMerge.result}` : ''}`
+          : '最近合并: -',
       ].filter(Boolean).join('\n');
     },
 
@@ -75,6 +83,24 @@ export function createCommands(deps: CommandsDeps): FeishuCommands {
         return '需求重试尚未接线，等待 runtime 接入';
       }
       return deps.retrySpec(requestId);
+    },
+
+    async merge(prNumber: number, context?: FeishuActorContext): Promise<string> {
+      if (!deps.mergeService) {
+        return '合并入口尚未接线，等待 runtime 接入';
+      }
+      return deps.mergeService.preflight(prNumber, context);
+    },
+
+    async confirmMerge(
+      prNumber: number,
+      confirmationCode: string,
+      context?: FeishuActorContext,
+    ): Promise<string> {
+      if (!deps.mergeService) {
+        return '合并入口尚未接线，等待 runtime 接入';
+      }
+      return deps.mergeService.confirm(prNumber, confirmationCode, context);
     },
 
     async retry(issueNumber: number): Promise<string> {

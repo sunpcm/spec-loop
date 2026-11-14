@@ -7,6 +7,7 @@ import type { FeishuCommands } from './feishu-contract.ts';
 import { GitClient } from './git.ts';
 import { encodeMetaBlock, GithubClient } from './github.ts';
 import { createLogger, type Logger } from './log.ts';
+import { MergeService } from './merge.ts';
 import { Notifier } from './notifier.ts';
 import { deriveIssueBody } from './planner.ts';
 import { buildRequirementMeta } from './reconciler.ts';
@@ -47,6 +48,7 @@ export interface Core {
   github: GithubClient;
   notifier: Notifier;
   commands: FeishuCommands;
+  mergeService: MergeService | null;
   workerDeps: WorkerDeps;
   deployDeps: DeployDeps;
   reconcileContext: ReconcileContext;
@@ -330,6 +332,19 @@ export function createCore(
     piGraceMs: config.piGraceMs,
   };
 
+  const mergeService = repo
+    ? new MergeService({
+        repo,
+        repoDir: config.repoDir,
+        state,
+        git,
+        github,
+        logger: createLogger('MERGE'),
+        notify: emitNotify,
+        mainBranch: config.mainBranch,
+      })
+    : null;
+
   // 先建立可变的 core 引用，供 retryWorker 闭包回指统一作业生命周期。
   const core: Core = {
     config,
@@ -339,6 +354,7 @@ export function createCore(
     github,
     notifier,
     commands: null as unknown as FeishuCommands,
+    mergeService,
     workerDeps,
     deployDeps,
     reconcileContext,
@@ -360,6 +376,7 @@ export function createCore(
     retryWorker: (input) => runOneWorkerForInput(core, input),
     requireSpec: (description, messageId) => submitSpecRequirement(specIntakeDeps, description, messageId),
     retrySpec: (requestId) => retrySpecRequirement(specIntakeDeps, requestId),
+    mergeService,
   });
 
   const plannerEnabled = Boolean(config.piProvider && config.piModel);
@@ -509,6 +526,15 @@ async function markWorkerOutcome(core: Core, jobId: string, outcome: WorkerOutco
     if (outcome.status === 'published') {
       job.status = 'in-review';
       job.prNumber = outcome.prNumber;
+      const outcomeHead = typeof outcome.headSHA === 'string'
+        ? outcome.headSHA.trim().toLowerCase()
+        : '';
+      if (/^[0-9a-f]{40}$/.test(outcomeHead)) {
+        job.headSHA = outcomeHead;
+      } else {
+        // 可信 head 只能来自本次 Worker 提交后的 outcome；缺失或非法时清除旧值，禁止沿用。
+        delete job.headSHA;
+      }
       return undefined;
     }
     job.status = 'failed';
@@ -625,6 +651,16 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
   }
 
   await core.state.update((s) => {
+    const previous = s.jobs[jobId];
+    const preserveTrustedHead =
+      previous &&
+      previous.reqId === input.reqId &&
+      previous.issueNumber === input.issueNumber &&
+      previous.specHash === input.spec.hash &&
+      previous.sourceMainSha === input.sourceMainSha &&
+      previous.attempt === input.attempt
+        ? previous.headSHA
+        : undefined;
     s.jobs[jobId] = {
       jobId,
       reqId: input.reqId,
@@ -633,6 +669,7 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
       sourceMainSha: input.sourceMainSha,
       attempt: input.attempt,
       status: 'processing',
+      headSHA: preserveTrustedHead,
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -745,6 +782,13 @@ export async function runOnce(core: Core): Promise<{
   workers: WorkerOutcome[];
   deploy: DeployResult;
 }> {
+  try {
+    await core.mergeService?.reconcilePending();
+  } catch (error) {
+    core.logger.warn(
+      `合并记录只读对账失败（本轮跳过）: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   try {
     await reconcileSpecRequests(core.specIntakeDeps);
   } catch (error) {

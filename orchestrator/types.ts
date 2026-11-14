@@ -63,6 +63,8 @@ export interface JobState {
   failureStage?: string;
   resumeAction?: string;
   prNumber?: number;
+  /** Worker 实际提交并经控制器持久验证的完整 head SHA；缺失时合并必须 fail closed。 */
+  headSHA?: string;
   startedAt: string;
   updatedAt: string;
 }
@@ -125,6 +127,47 @@ export interface OpLogEntry {
   detail: string;
 }
 
+export type MergePrType = 'docs' | 'code';
+
+export type MergeRequestStage =
+  | 'confirmable'
+  | 'attempted'
+  | 'unknown'
+  | 'merged'
+  | 'failed'
+  | 'expired'
+  | 'invalidated';
+
+/**
+ * 飞书合并许可的本地审计记录。确认码和操作者标识只保存在本地 state，
+ * 不写入 GitHub，也不在 [MERGE] 日志中输出。
+ */
+export interface MergeRequestState {
+  requestId: string;
+  repo: string;
+  prNumber: number;
+  prTitle: string;
+  prUrl: string;
+  type: MergePrType;
+  headSHA: string;
+  baseSHA: string;
+  operatorId: string;
+  chatId: string;
+  originalMessageId: string;
+  preflightMessageIds: string[];
+  confirmationMessageIds: string[];
+  confirmationCode: string;
+  checksSummary: string;
+  localValidation: string;
+  stage: MergeRequestStage;
+  result?: string;
+  mergeCommitSha?: string;
+  error?: string;
+  createdAt: string;
+  expiresAt: string;
+  updatedAt: string;
+}
+
 export interface OrchestratorState {
   schemaVersion: number;
   repo: string | null;
@@ -133,6 +176,8 @@ export interface OrchestratorState {
   jobs: Record<string, JobState>;
   deploy: DeployState;
   specRequests: Record<string, SpecRequest>;
+  /** schema 1 的向后兼容可选扩展；旧 state 加载时补为空对象。 */
+  mergeRequests?: Record<string, MergeRequestState>;
   opLog: OpLogEntry[];
 }
 
@@ -145,6 +190,7 @@ export function emptyState(): OrchestratorState {
     jobs: {},
     deploy: { activeSha: null, releaseDir: null, deployedPRs: [] },
     specRequests: {},
+    mergeRequests: {},
     opLog: [],
   };
 }

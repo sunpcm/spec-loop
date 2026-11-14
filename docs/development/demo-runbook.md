@@ -1,6 +1,6 @@
 # 第一轮启动与验收指南
 
-本文覆盖 Demo 阶段 1～4 的运行与历史验收，并补充飞书结构化需求入口。阶段 1～4 已真实完成，PR #1、#3、#4 均由用户人工 Merge，`main` 406d27b 已验收。新入口启用需合并本 PR 并重启控制器；启用后，每次业务需求依次人工 Merge 文档 PR 和代码 PR。闭环 B、普通闲聊、多轮澄清编辑和 Triage 后置。
+本文覆盖 Demo 阶段 1～4 的运行与历史验收，并补充飞书结构化需求入口。阶段 1～4 已真实完成，PR #1、#3、#4 均由用户人工 Merge，`main` 406d27b 已验收。受控确认合并入口启用需合并本 PR 并重启控制器；启用后，每次业务需求依次完成文档 PR 和代码 PR 合并。受控确认合并契约见 [飞书受控确认合并 PR](feishu-merge-plan.md)。闭环 B、普通闲聊、多轮澄清编辑和 Triage 后置。
 
 ## 1. 环境与基础检查
 建议使用 Node 24 或更新的兼容版本；Node 26 已用于本轮本地开发。当前物理隔离依赖 macOS 的 `sandbox-exec`，其他系统暂不支持直接运行 Agent；缺少隔离时会停止执行。在仓库根目录执行：
@@ -129,7 +129,7 @@ curl --fail --silent --show-error http://127.0.0.1:5173/__version
 
 ## 6. 闭环 A：飞书业务需求入口
 
-入口启用后，每次业务需求执行两次人工 Merge：先人工 Merge docs-only 文档 PR，再人工 Merge 自动产生的代码 PR。
+入口启用后，每次业务需求完成两次确认合并：先合并 docs-only 文档 PR，再合并自动产生的代码 PR。可在 GitHub 网页人工执行；受管 PR 也可在受控飞书入口启用后按契约预检并二次确认。
 
 阶段 1～4 的已验收路径是人工修改 `docs/specs/counter.md`、push `main`，随后由控制器生成 Worker PR。飞书结构化入口把第一段改为受控 docs PR：
 
@@ -161,7 +161,7 @@ gh pr list --repo sunpcm/spec-loop --state open --limit 20
 - 文档 PR 只修改 `docs/specs/counter.md`，保留现有 `REQ-CNT-01`，并带 `spec-patch` 标签与确定性元数据；不得使用 `Closes`。
 - 同一飞书 `messageId`、重复描述和进程重启不重复调用 Pi/建 PR；冲突请求返回现有请求链接。
 - 当前 `main` 与原请求 `baseSHA` 不一致时 fail closed，提示基于新主重新提需求。
-- 文档 PR 由用户人工 Merge；Merge 后自动触发的代码 PR 只修改 `src/**`，仍等待人工 Merge。
+- 文档 PR 由用户确认合并；Merge 后自动触发的代码 PR 只修改 `src/**`，仍等待用户确认合并。
 - Issue 进入处理中及 review 状态，并记录需求 ID、需求哈希和来源 `main` SHA。
 - PR 只修改 `src/**`，等待人工审查，不自动 Merge。
 - 飞书收到对应阶段通知。通知失败不回滚 GitHub 主链路。
@@ -175,7 +175,7 @@ gh pr diff <PR编号> --repo sunpcm/spec-loop --name-only
 
 ## 7. 闭环 C：人工 Merge 到部署
 
-由用户在 GitHub 人工 Merge 代码 PR。对飞书需求入口而言，这是继文档 PR 后的第二次人工 Merge。控制器识别 Merge 后 fetch `origin/main`、构建新版本、执行健康检查并切换 5173；失败时保留旧预览。
+由用户在 GitHub 人工 Merge 或通过受控飞书入口确认合并代码 PR。对飞书需求入口而言，这是继文档 PR 后的第二次合并。控制器识别 Merge 后 fetch `origin/main`、构建新版本、执行健康检查并切换 5173；失败时保留旧预览。受控 Merge 成功只表示 PR 进入 `main`，不等于部署完成。
 ```bash
 curl --fail --silent --show-error http://127.0.0.1:5173/__version
 npm run demo:status
@@ -209,6 +209,7 @@ npm run demo:retry -- --issue <Issue编号>
 - `重试需求 <请求ID>` 只恢复对应 spec 请求中未完成的阶段；已有有效文档、commit、push、PR 或标签不能重复创建。
 - `重试 #<Issue编号>` 继续用于原有 Worker 交付，与需求请求重试相互独立。
 - `帮助`、`/help` 和未知文本返回中文帮助；未知文本不会进入需求生成或闲聊。所有命令仍受绑定会话和白名单限制。
+- 受控合并失败、超时、重启或重放按 [飞书受控确认合并 PR](feishu-merge-plan.md) 对账；不能把“已合并”当作部署完成，也不能用重复确认码重发 PUT。
 
 飞书需求入口要求先落盘阶段再产生外部效果，`runOnce`、`状态` 和显式重试先做无 Pi 的远端对账。远端读取失败时 fail closed；已合并或已关闭的 PR 不重新创建。既有 Planner/Worker 的更细阶段恢复仍按自身契约单独验收，不能由本次文档入口测试推定完成。
 

@@ -1,6 +1,11 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { emptyState, type OrchestratorState, type SpecRequest } from './types.ts';
+import {
+  emptyState,
+  type MergeRequestState,
+  type OrchestratorState,
+  type SpecRequest,
+} from './types.ts';
 
 export class StateStore {
   private state: OrchestratorState;
@@ -29,6 +34,10 @@ export class StateStore {
         parsed.specRequests ??= {};
         for (const req of Object.values(parsed.specRequests)) {
           normalizeSpecRequest(req);
+        }
+        parsed.mergeRequests ??= {};
+        for (const merge of Object.values(parsed.mergeRequests)) {
+          normalizeMergeRequest(merge);
         }
         this.state = parsed;
       } else {
@@ -82,6 +91,11 @@ function normalizeSpecRequest(req: SpecRequest): void {
   req.labelsSynced ??= false;
   if (req.stage === 'commit') req.stage = 'write';
   if (req.stage === 'review') req.stage = 'pr-open';
+}
+
+function normalizeMergeRequest(merge: MergeRequestState): void {
+  merge.preflightMessageIds ??= [merge.originalMessageId];
+  merge.confirmationMessageIds ??= [];
 }
 
 export function backupState(stateFile: string): void {

@@ -440,6 +440,9 @@ test('runWorkerJob 成功路径：快照验证后发布 PR', async () => {
     async commit(_c: string, _m: string): Promise<void> {
       calls.push('commit');
     },
+    async revParse(_c: string, _ref: string): Promise<string> {
+      return '1'.repeat(40);
+    },
     async push(_c: string, _b: string): Promise<void> {
       calls.push('push');
     },
@@ -484,6 +487,7 @@ test('runWorkerJob 成功路径：快照验证后发布 PR', async () => {
   );
   assert.equal(outcome.status, 'published');
   assert.equal(outcome.prNumber, 42);
+  assert.equal(outcome.headSHA, '1'.repeat(40));
   assert.ok(calls.includes('archive'));
   assert.ok(calls.includes('commit'));
   assert.ok(calls.includes('push'));
@@ -504,6 +508,9 @@ test('runWorkerJob 越权变更范围在提交前被拒绝', async () => {
     },
     async archive(): Promise<void> {},
     async commit(): Promise<void> {},
+    async revParse(): Promise<string> {
+      return '2'.repeat(40);
+    },
     async push(): Promise<void> {},
     async removeWorktree(): Promise<void> {},
   } as unknown as GitClient;
@@ -558,6 +565,9 @@ test('runWorkerJob 作业内重试：首次失败、二次成功', async () => {
     },
     async archive(): Promise<void> {},
     async commit(): Promise<void> {},
+    async revParse(): Promise<string> {
+      return '2'.repeat(40);
+    },
     async push(): Promise<void> {},
     async removeWorktree(): Promise<void> {},
   } as unknown as GitClient;
@@ -612,6 +622,7 @@ test('runWorkerJob 作业内重试：首次失败、二次成功', async () => {
   );
   assert.equal(outcome.status, 'published');
   assert.equal(outcome.prNumber, 43);
+  assert.equal(outcome.headSHA, '2'.repeat(40));
   assert.equal(outcome.piAttempts, 2);
   assert.equal(piCalls, 2);
 });
@@ -768,6 +779,8 @@ test('createFeishuBridgeRuntime 未启用时返回 null 且不调用 logger', as
       help: async () => 'help',
       require: async () => 'require',
       retryRequirement: async () => 'retry-req',
+      merge: async () => 'merge',
+      confirmMerge: async () => 'confirm-merge',
     },
     (m) => logged.push(m),
   );
