@@ -78,6 +78,10 @@ export class GitClient {
     await this.raw(['worktree', 'add', '-b', branch, dir, base], cwd);
   }
 
+  async attachWorktree(cwd: string, dir: string, branch: string): Promise<void> {
+    await this.raw(['worktree', 'add', dir, branch], cwd);
+  }
+
   async createDetachedWorktree(cwd: string, dir: string, sha: string): Promise<void> {
     await this.raw(['worktree', 'add', '--detach', dir, sha], cwd);
   }
@@ -99,6 +103,20 @@ export class GitClient {
 
   async createBranch(cwd: string, branch: string, base: string): Promise<void> {
     await this.raw(['checkout', '-b', branch, base], cwd);
+  }
+
+  async hasBranch(cwd: string, branch: string): Promise<boolean> {
+    const out = await this.raw(['branch', '--list', branch], cwd);
+    return out.trim().length > 0;
+  }
+
+  async hasCommit(cwd: string, sha: string): Promise<boolean> {
+    try {
+      await this.raw(['cat-file', '-e', `${sha}^{commit}`], cwd);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async add(cwd: string, paths: string[]): Promise<void> {
@@ -128,5 +146,16 @@ export class GitClient {
   async diffNameOnly(cwd: string, ref = 'HEAD'): Promise<string[]> {
     const out = await this.raw(['diff', '--name-only', '--cached', ref, '--'], cwd);
     return out.split('\n').map((s) => s.trim()).filter(Boolean);
+  }
+
+  /** 提交与工作树（已暂存）之间相对 HEAD 的改动文件，用 git diff-tree 核对 docs-only 提交。 */
+  async diffTreeNames(cwd: string, ref = 'HEAD'): Promise<string[]> {
+    const out = await this.raw(['diff-tree', '--no-commit-id', '--name-only', '-r', ref], cwd);
+    return out.split('\n').map((s) => s.trim()).filter(Boolean);
+  }
+
+  async stagedMode(cwd: string, path: string): Promise<string> {
+    const out = await this.raw(['ls-files', '--stage', '--', path], cwd);
+    return out.trim().split(/\s+/, 1)[0] ?? '';
   }
 }

@@ -9,6 +9,9 @@ export interface FeishuSettings {
 export interface FeishuCommands {
   status(): Promise<string>;
   retry(issueNumber: number): Promise<string>;
+  help(): Promise<string>;
+  require(description: string, messageId?: string): Promise<string>;
+  retryRequirement(requestId: string): Promise<string>;
 }
 
 export type FeishuLogger = (message: string) => void;

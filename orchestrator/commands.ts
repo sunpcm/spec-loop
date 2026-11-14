@@ -1,8 +1,9 @@
 import { retryDeployForIssue, type DeployDeps } from './deploy.ts';
 import type { FeishuCommands } from './feishu-contract.ts';
+import { HELP_TEXT } from './feishu-help.ts';
 import type { GithubClient } from './github.ts';
 import type { GitClient } from './git.ts';
-import type { Logger } from './log.ts';
+import { redact, type Logger } from './log.ts';
 import { parseSpecs } from './specs.ts';
 import type { StateStore } from './state.ts';
 import type { WorkerDeps, WorkerInput, WorkerOutcome } from './worker.ts';
@@ -21,6 +22,8 @@ export interface CommandsDeps {
    */
   retryWorker?: (input: WorkerInput) => Promise<WorkerOutcome>;
   mainBranch?: string;
+  requireSpec?: (description: string, messageId: string) => Promise<string>;
+  retrySpec?: (requestId: string) => Promise<string>;
 }
 
 export function createCommands(deps: CommandsDeps): FeishuCommands {
@@ -28,17 +31,50 @@ export function createCommands(deps: CommandsDeps): FeishuCommands {
 
   return {
     async status(): Promise<string> {
-      const s = deps.state.snapshot();
-      const jobs = Object.values(s.jobs)
+      const state = deps.state.snapshot();
+      const jobs = Object.values(state.jobs)
         .map((j) => `#${j.issueNumber}:${j.status}`)
         .join(', ');
+      const specLines = Object.values(state.specRequests ?? {})
+        .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0))
+        .slice(0, 5)
+        .map((r) => {
+          const next =
+            r.stage === 'stale'
+              ? ' 请重新发送需求'
+              : r.stage === 'failed' || r.stage === 'pi' || r.stage === 'write' || r.stage === 'push' || r.stage === 'pr'
+                ? ` 恢复命令:重试需求 ${r.requestId}`
+                : '';
+          const error = r.error ? ` 错误:${boundedStatusText(r.error)}` : '';
+          return `请求 ${r.requestId} ${r.stage}${r.prUrl ? ` ${r.prUrl}` : ''}${error}${next}`;
+        })
+        .join('\n');
       return [
-        `仓库: ${s.repo ?? '未绑定'}`,
-        `游标 SHA: ${s.cursorMainSha ?? '-'}`,
-        `部署 SHA: ${s.deploy.activeSha ?? '-'}`,
-        `需求任务: ${Object.keys(s.requirements).length}`,
+        `仓库: ${state.repo ?? '未绑定'}`,
+        `游标 SHA: ${state.cursorMainSha ?? '-'}`,
+        `部署 SHA: ${state.deploy.activeSha ?? '-'}`,
+        `需求任务: ${Object.keys(state.requirements).length}`,
         `作业: ${jobs || '-'}`,
-      ].join('\n');
+        specLines ? `需求请求:\n${specLines}` : '需求请求: -',
+      ].filter(Boolean).join('\n');
+    },
+
+    async help(): Promise<string> {
+      return HELP_TEXT;
+    },
+
+    async require(description: string, messageId?: string): Promise<string> {
+      if (!deps.requireSpec) {
+        return '需求入口尚未接线，等待 runtime 接入';
+      }
+      return deps.requireSpec(description, messageId ?? '');
+    },
+
+    async retryRequirement(requestId: string): Promise<string> {
+      if (!deps.retrySpec) {
+        return '需求重试尚未接线，等待 runtime 接入';
+      }
+      return deps.retrySpec(requestId);
     },
 
     async retry(issueNumber: number): Promise<string> {
@@ -98,4 +134,9 @@ export function createCommands(deps: CommandsDeps): FeishuCommands {
         : `#${issueNumber} 重试失败: ${outcome.error ?? outcome.status}`;
     },
   };
+}
+
+function boundedStatusText(text: string): string {
+  const safe = redact(text).replace(/\s+/g, ' ').trim();
+  return safe.length > 240 ? `${safe.slice(0, 240)}…` : safe;
 }

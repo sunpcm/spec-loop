@@ -122,10 +122,15 @@ async function main(): Promise<void> {
 
     // 飞书桥（可选）：失败降级为仅本地控制接口，不阻断守护进程启动。
     try {
-      // retry 必须走 runExclusive 与轮询/HTTP 共用同一串行队列，status 保持只读直连。
+      // status 只读取 StateStore 快照；写命令仍与轮询任务共用串行队列。
       const bridgedCommands = {
         status: () => core.commands.status(),
         retry: (issueNumber: number) => runExclusive(() => core.commands.retry(issueNumber)),
+        help: () => core.commands.help(),
+        require: (description: string, messageId?: string) =>
+          runExclusive(() => core.commands.require(description, messageId)),
+        retryRequirement: (requestId: string) =>
+          runExclusive(() => core.commands.retryRequirement(requestId)),
       };
       bridge = await createFeishuBridgeRuntime(config.feishu, bridgedCommands, (m) => logger.info(m));
       if (bridge) await bridge.start();

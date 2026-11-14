@@ -10,6 +10,7 @@ import {
   type FeishuIncomingEvent,
   type FeishuSettings,
 } from '../orchestrator/feishu.ts';
+import { computeSpecRequestId } from '../orchestrator/spec-identity.ts';
 
 function createSettings(overrides: Partial<FeishuSettings> = {}): FeishuSettings {
   return {
@@ -25,6 +26,8 @@ function createSettings(overrides: Partial<FeishuSettings> = {}): FeishuSettings
 function createCommands(overrides: { statusError?: Error; retryError?: Error } = {}) {
   let statusCalls = 0;
   const retryCalls: number[] = [];
+  const requireCalls: Array<{ description: string; messageId?: string }> = [];
+  const retryRequirementCalls: string[] = [];
   return {
     commands: {
       async status(): Promise<string> {
@@ -34,6 +37,9 @@ function createCommands(overrides: { statusError?: Error; retryError?: Error } =
         }
         return 'STATUS_OK';
       },
+      async help(): Promise<string> {
+        return 'HELP_TEXT';
+      },
       async retry(issueNumber: number): Promise<string> {
         retryCalls.push(issueNumber);
         if (overrides.retryError) {
@@ -41,12 +47,26 @@ function createCommands(overrides: { statusError?: Error; retryError?: Error } =
         }
         return `RETRY_OK_${issueNumber}`;
       },
+      async require(description: string, messageId?: string): Promise<string> {
+        requireCalls.push({ description, messageId });
+        return `REQUIRE_OK_${description}`;
+      },
+      async retryRequirement(requestId: string): Promise<string> {
+        retryRequirementCalls.push(requestId);
+        return `RETRY_REQ_OK_${requestId}`;
+      },
     },
     get statusCalls() {
       return statusCalls;
     },
     get retryCalls() {
       return [...retryCalls];
+    },
+    get requireCalls() {
+      return [...requireCalls];
+    },
+    get retryRequirementCalls() {
+      return [...retryRequirementCalls];
     },
   };
 }
@@ -151,6 +171,89 @@ test('命令解析支持中英文命令、@前缀并拒绝非法输入', () => {
   assert.equal(parseFeishuCommand('重试 abc'), null);
   assert.equal(parseFeishuCommand('hello'), null);
   assert.equal(parseFeishuCommand(''), null);
+});
+
+test('命令解析支持需求/帮助/重试需求且保留描述换行', () => {
+  assert.deepEqual(parseFeishuCommand('帮助'), { type: 'help' });
+  assert.deepEqual(parseFeishuCommand('/help'), { type: 'help' });
+  assert.deepEqual(parseFeishuCommand('/require 增加减少按钮'), { type: 'require', description: '增加减少按钮' });
+  assert.deepEqual(parseFeishuCommand('需求：增加\n减少按钮'), { type: 'require', description: '增加\n减少按钮' });
+  assert.deepEqual(parseFeishuCommand('需求: ascii colon'), { type: 'require', description: 'ascii colon' });
+  assert.deepEqual(parseFeishuCommand('重试需求 a1b2c3d4e5f6'), { type: 'retry-requirement', requestId: 'a1b2c3d4e5f6' });
+  assert.deepEqual(parseFeishuCommand('/retry-requirement a1b2c3d4e5f6'), { type: 'retry-requirement', requestId: 'a1b2c3d4e5f6' });
+  assert.deepEqual(parseFeishuCommand('需求：'), {
+    type: 'invalid-requirement',
+    message: '⚠️ 需求描述为空',
+  });
+  assert.deepEqual(parseFeishuCommand('需求：   '), {
+    type: 'invalid-requirement',
+    message: '⚠️ 需求描述为空',
+  });
+  assert.deepEqual(parseFeishuCommand(`需求：${'x'.repeat(2001)}`), {
+    type: 'invalid-requirement',
+    message: '⚠️ 需求描述超过 2000 字符',
+  });
+});
+
+test('需求命令 ACK 使用真实 message_id 身份，并把同一 ID 传给控制器', async () => {
+  const harness = createFakeHarness();
+  const commandState = createCommands();
+  const bridge = createFeishuBridgeWithDependencies(
+    createSettings(),
+    commandState.commands,
+    () => {},
+    async () => harness.dependencies,
+  );
+  await bridge.start();
+  await harness.dispatch(
+    createEvent({
+      message_id: 'om_require_identity',
+      content: JSON.stringify({ text: '需求：增加\n导出入口' }),
+    }),
+  );
+  await waitFor(() => commandState.requireCalls.length === 1);
+  await waitFor(() => harness.sent.some((text) => text.startsWith('REQUIRE_OK_')));
+  assert.deepEqual(commandState.requireCalls, [
+    { description: '增加\n导出入口', messageId: 'om_require_identity' },
+  ]);
+  assert.equal(
+    harness.sent[0],
+    `✅ 已收到需求消息，候选请求ID：${computeSpecRequestId('om_require_identity')}；检查通过后受理`,
+  );
+  await bridge.stop();
+});
+
+test('空或超长需求不发送“已接收”，只返回明确校验错误', async () => {
+  const harness = createFakeHarness();
+  const commandState = createCommands();
+  const bridge = createFeishuBridgeWithDependencies(
+    createSettings(),
+    commandState.commands,
+    () => {},
+    async () => harness.dependencies,
+  );
+  await bridge.start();
+  await harness.dispatch(
+    createEvent({
+      message_id: 'om_require_empty',
+      content: JSON.stringify({ text: '需求：   ' }),
+    }),
+  );
+  await waitFor(() => harness.sent.length === 1);
+  assert.equal(harness.sent[0], '⚠️ 需求描述为空');
+  assert.equal(harness.sent.some((text) => text.includes('已接收')), false);
+  assert.equal(commandState.requireCalls.length, 0);
+
+  await harness.dispatch(
+    createEvent({
+      message_id: 'om_require_long',
+      content: JSON.stringify({ text: `需求：${'x'.repeat(2001)}` }),
+    }),
+  );
+  await waitFor(() => harness.sent.length === 2);
+  assert.equal(harness.sent[1], '⚠️ 需求描述超过 2000 字符');
+  assert.equal(commandState.requireCalls.length, 0);
+  await bridge.stop();
 });
 
 test('飞书API真实envelope校验：code=0成功，非零或缺失状态码抛安全摘要', () => {
@@ -324,9 +427,11 @@ test('非文本消息与无法识别命令不会触发执行', async () => {
   await bridge.start();
   await harness.dispatch(createEvent({ message_id: 'om_image', message_type: 'image' }));
   await harness.dispatch(createEvent({ message_id: 'om_unknown', content: JSON.stringify({ text: '随便聊聊' }) }));
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await waitFor(() => harness.sent.some((text) => text.startsWith('可用命令：')));
   assert.equal(commandState.statusCalls, 0);
-  assert.deepEqual(harness.sent, []);
+  assert.equal(commandState.retryCalls.length, 0);
+  assert.equal(commandState.requireCalls.length, 0);
+  assert.ok(harness.sent[0]?.includes('收到命令'));
   await bridge.stop();
 });
 
