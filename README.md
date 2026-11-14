@@ -129,13 +129,3 @@ npm run demo
 
 `docs/development/` 用于工程设计与维护，不参与产品需求扫描；其中草案和目标设计不能代替实际验收结果。
 
-## 品牌素材
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand-v1/motion/logo-loop-dark.gif">
-    <img src="docs/assets/brand-v1/motion/logo-loop-light.gif" alt="Spec Loop 品牌动效：文档形成，连续转化为产品。" width="480" height="320" loading="lazy">
-  </picture>
-</p>
-
-[Logo、Icon 与套图](docs/assets/brand-v1/README.md) · [动图 GIF](docs/assets/brand-v1/motion/logo-loop-light.gif) · [下载完整素材包](docs/assets/spec-loop-brand-kit-v1.zip)
