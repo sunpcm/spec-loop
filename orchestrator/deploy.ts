@@ -14,6 +14,7 @@ export interface DeployDeps {
   state: StateStore;
   logger: Logger;
   mainBranch?: string;
+  publicUrl?: string;
   build: (sha: string) => Promise<{ ok: boolean; detail: string }>;
   healthCheck: (sha: string) => Promise<boolean>;
   switchPreview: (sha: string, releaseDir: string) => Promise<void>;
@@ -128,6 +129,11 @@ async function markDeployed(
   ctx.logger.info(`部署成功（PR #${pr.number} → ${sha}）`);
 }
 
+function publicEntryNotice(publicUrl?: string): string {
+  if (!publicUrl) return '';
+  return `公网入口（Vercel独立发布）：${publicUrl}`;
+}
+
 async function syncDeployReceipt(
   ctx: DeployDeps,
   issueNumber: number | undefined,
@@ -161,7 +167,12 @@ async function syncDeployReceipt(
   if (includeComment) {
     const alreadyCommented = await hasDeployComment(ctx, issueNumber, marker);
     if (!alreadyCommented) {
-      results.push(await tryGithub(() => ctx.github.comment(issueNumber, `🚀 ${marker}，预览 http://127.0.0.1:5173`)));
+      const publicNotice = publicEntryNotice(ctx.publicUrl);
+      const receipt = [
+        `🚀 本地已部署：\`${sha}\`，健康检查通过，本地预览 http://127.0.0.1:5173`,
+        publicNotice,
+      ].filter(Boolean).join('\n\n');
+      results.push(await tryGithub(() => ctx.github.comment(issueNumber, receipt)));
     }
   }
   return results.every(Boolean);
@@ -250,7 +261,10 @@ export async function deployMergedPR(
 
   await ctx.switchPreview(sha, join(ctx.runDir, 'releases', sha));
   await markDeployed(ctx, pr, issueNumber, sha);
-  await ctx.notify?.(`🚀 已部署：${sha}`);
+  const publicNotice = publicEntryNotice(ctx.publicUrl);
+  await ctx.notify?.(
+    [`🚀 本地已部署：${sha}（健康检查通过）`, publicNotice].filter(Boolean).join('\n\n'),
+  );
   return { status: 'deployed', sha, prNumber: pr.number, issueNumber };
 }
 

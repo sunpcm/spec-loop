@@ -7,7 +7,7 @@ import test from 'node:test';
 
 import { isCrossSiteRequest } from '../orchestrator/control-server.ts';
 import { createFeishuBridgeRuntime } from '../orchestrator/feishu-factory.ts';
-import { loadConfig, type Config } from '../orchestrator/config.ts';
+import { loadConfig, parsePublicUrl, type Config } from '../orchestrator/config.ts';
 import { checkFeishu, initGuardDecision, publishBaselinePreview, recordBaseline } from '../orchestrator/init.ts';
 import { acquireInstanceLock, createMutex } from '../orchestrator/lock.ts';
 import { buildPiEnv, preparePiAgentDir, runPi } from '../orchestrator/pi-runner.ts';
@@ -832,6 +832,33 @@ test('loadConfig 将空白 SPEC_LOOP_REPO 视为未设置', () => {
   } finally {
     if (prev === undefined) delete process.env.SPEC_LOOP_REPO;
     else process.env.SPEC_LOOP_REPO = prev;
+  }
+});
+
+test('SPEC_LOOP_PUBLIC_URL 默认空且只接受无凭据 HTTPS URL', () => {
+  assert.equal(parsePublicUrl(undefined), '');
+  assert.equal(parsePublicUrl('   '), '');
+  assert.equal(parsePublicUrl('https://spec-loop.vercel.app'), 'https://spec-loop.vercel.app/');
+
+  for (const invalid of [
+    'not-a-url',
+    'http://spec-loop.vercel.app',
+    'https://user@spec-loop.vercel.app',
+    `https://user:${'not-a-secret'}@spec-loop.vercel.app`,
+  ]) {
+    assert.throws(() => parsePublicUrl(invalid), /SPEC_LOOP_PUBLIC_URL/);
+  }
+});
+
+test('loadConfig 将合法 SPEC_LOOP_PUBLIC_URL 写入部署配置', () => {
+  const previous = process.env.SPEC_LOOP_PUBLIC_URL;
+  process.env.SPEC_LOOP_PUBLIC_URL = 'https://spec-loop.vercel.app';
+  try {
+    const dir = mkdtempSync(join(tmpdir(), 'spec-loop-public-url-'));
+    assert.equal(loadConfig(dir).publicUrl, 'https://spec-loop.vercel.app/');
+  } finally {
+    if (previous === undefined) delete process.env.SPEC_LOOP_PUBLIC_URL;
+    else process.env.SPEC_LOOP_PUBLIC_URL = previous;
   }
 });
 

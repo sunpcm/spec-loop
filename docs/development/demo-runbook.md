@@ -38,6 +38,8 @@ SPEC_LOOP_MAIN_BRANCH=main
 SPEC_LOOP_HTTP_PORT=4000
 SPEC_LOOP_PREVIEW_PORT=5173
 SPEC_LOOP_DEV_PORT=5174
+# Vercel 独立静态站上线后填写；未配置时不显示公网入口
+SPEC_LOOP_PUBLIC_URL=https://spec-loop.vercel.app
 ```
 加载配置的进程必须显式指定文件。每个运行 `demo:*` 的终端都执行：
 ```bash
@@ -155,6 +157,16 @@ gh pr view <PR编号> --repo sunpcm/spec-loop --json state,mergeCommit
 ```
 确认 `/__version` 的 SHA、页面显示的 `__APP_VERSION__` 和部署回执一致，Issue 带有 `status:done`，并重新验收本轮要求的行为。GitHub 因 `Closes #N` 自动关闭 Issue 不代表部署完成。
 
+### 7.1 Vercel 静态前端（可选）
+
+Vercel 部署只承载纯静态前端，配置步骤见 [Vercel 静态前端部署](vercel-setup.md)。PR 先生成 Vercel Preview；只有人工 Merge 到 `main` 后，Vercel 的 production deployment 才按该 Merge commit 运行构建。控制器不调用 Vercel，也不能把 Vercel deployment 的成功或 URL 存在当作本地部署成功。
+
+本地 `status:done` 始终表示本机完成了构建、HTTP 健康检查和预览切换。配置合法的 `SPEC_LOOP_PUBLIC_URL` 后，本地部署成功的飞书通知和 Issue 回执会附“公网入口（Vercel独立发布）”，该链接不代表 Vercel 已部署或 Ready 当前 SHA。
+
+Vercel 构建产物中的 `version.json` 固定为 `{ "version": "<版本>" }`；版本优先取 `SPEC_LOOP_VERSION`，其次取 Vercel 的 `VERCEL_GIT_COMMIT_SHA`，本地普通开发回退为 `dev`。本地稳定预览继续使用 `/__version`，Vercel 静态站使用 `/version.json`。
+
+电脑关机后，已上线的 Vercel 页面仍可查看，但本地控制器、Pi Worker、飞书命令和本地稳定预览都会停止。当前 Vercel 站点没有后端 API；闭环 B 如需云端调用，必须另行设计公网 API 与服务端安全边界。
+
 ## 8. 状态、重试与失败处理
 ```bash
 export SPEC_LOOP_ENV_FILE="$PWD/.env.local"
@@ -172,6 +184,6 @@ npm run demo:retry -- --issue <Issue编号>
 
 ## 9. 验收记录
 
-记录日期与运行人员、Node/npm/Pi 版本、仓库和 `main` SHA、基础实现 PR 与 Merge SHA、需求 ID/路径/哈希、Issue 与 Worker PR、部署 SHA 和 `/__version`、页面与飞书证据、失败与重试结果、仍未验证项。真实远端 A/C 在两次人工 Merge 前不能报告全链路成功。
+记录日期与运行人员、Node/npm/Pi 版本、仓库和 `main` SHA、基础实现 PR 与 Merge SHA、需求 ID/路径/哈希、Issue 与 Worker PR、部署 SHA 和 `/__version`、本地页面与飞书证据、Vercel 的 Preview/Production URL 与 `version.json`、失败与重试结果、仍未验证项。真实远端 A/C 在两次人工 Merge 前不能报告全链路成功。
 
 闭环 B 在 A/C 的真实远端流程稳定后另行启动。

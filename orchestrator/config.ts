@@ -11,6 +11,7 @@ export interface Config {
   httpPort: number;
   previewPort: number;
   devPort: number;
+  publicUrl: string;
   pollIntervalMs: number;
   piTimeoutMs: number;
   piGraceMs: number;
@@ -45,6 +46,25 @@ function splitCsv(raw: string | undefined): string[] {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
+}
+
+export function parsePublicUrl(raw: string | undefined): string {
+  const value = raw?.trim() ?? '';
+  if (!value) return '';
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error('SPEC_LOOP_PUBLIC_URL 必须是有效 URL');
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error('SPEC_LOOP_PUBLIC_URL 仅接受 https URL');
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('SPEC_LOOP_PUBLIC_URL 不得包含用户名或口令');
+  }
+  return parsed.toString();
 }
 
 export function loadEnvFile(path: string): void {
@@ -101,6 +121,7 @@ export function loadConfig(repoDir: string = process.cwd()): Config {
     httpPort: intEnv('SPEC_LOOP_HTTP_PORT', 4000),
     previewPort: intEnv('SPEC_LOOP_PREVIEW_PORT', 5173),
     devPort: intEnv('SPEC_LOOP_DEV_PORT', 5174),
+    publicUrl: parsePublicUrl(process.env.SPEC_LOOP_PUBLIC_URL),
     pollIntervalMs: intEnv('SPEC_LOOP_POLL_MS', 5000),
     piTimeoutMs: intEnv('SPEC_LOOP_PI_TIMEOUT_MS', 300000),
     piGraceMs: intEnv('SPEC_LOOP_PI_GRACE_MS', 5000),

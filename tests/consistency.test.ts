@@ -192,14 +192,20 @@ interface DeployFixture {
   switched: string[];
   closedIssues: number[];
   comments: string[];
+  notifications: string[];
   setBuildOk(ok: boolean): void;
 }
 
-function deployFixture(store: StateStore, prs: ManagedPR[], opts: { buildOk?: boolean } = {}): DeployFixture {
+function deployFixture(
+  store: StateStore,
+  prs: ManagedPR[],
+  opts: { buildOk?: boolean; publicUrl?: string } = {},
+): DeployFixture {
   const builds: string[] = [];
   const switched: string[] = [];
   const closedIssues: number[] = [];
   const comments: string[] = [];
+  const notifications: string[] = [];
   let buildOk = opts.buildOk ?? true;
   const ctx: DeployDeps = {
     repoDir: '/tmp/fake-repo',
@@ -218,6 +224,7 @@ function deployFixture(store: StateStore, prs: ManagedPR[], opts: { buildOk?: bo
     } as unknown as GithubClient,
     state: store,
     logger: silentLogger,
+    publicUrl: opts.publicUrl,
     build: async (sha: string) => {
       builds.push(sha);
       return { ok: buildOk, detail: buildOk ? '' : '构建失败（fake）' };
@@ -226,9 +233,19 @@ function deployFixture(store: StateStore, prs: ManagedPR[], opts: { buildOk?: bo
     switchPreview: async (sha: string) => {
       switched.push(sha);
     },
-    notify: async () => {},
+    notify: async (text: string) => {
+      notifications.push(text);
+    },
   };
-  return { ctx, builds, switched, closedIssues, comments, setBuildOk: (ok: boolean) => { buildOk = ok; } };
+  return {
+    ctx,
+    builds,
+    switched,
+    closedIssues,
+    comments,
+    notifications,
+    setBuildOk: (ok: boolean) => { buildOk = ok; },
+  };
 }
 
 test('F1 对账：需求更新关闭旧版本 open PR、保留当前版本 PR', async () => {
@@ -517,6 +534,36 @@ test('部署：缺少 merge SHA 不猜测目标并按失败处理', async () => 
     assert.ok(result.error?.includes('merge'));
     assert.deepEqual(fx.builds, []);
     assert.deepEqual(store.snapshot().deploy.deployFailedPRs, [5]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('本地部署成功通知与回执附 Vercel 入口，但不宣称云端完成', async () => {
+  const h1 = hashOf(specDoc(REQ_A, 'v1'));
+  const publicUrl = 'https://spec-loop.vercel.app/';
+  const { dir, store } = makeStore(stateWith({
+    requirements: { [REQ_A]: requirement(12, h1) },
+    jobs: { j1: job({ jobId: 'j1', issueNumber: 12, status: 'in-review', prNumber: 5, specHash: h1 }) },
+  }));
+  try {
+    const fx = deployFixture(
+      store,
+      [mergedPR(5, REQ_A, h1, '2026-11-14T01:00:00Z')],
+      { publicUrl },
+    );
+    const result = await deployOnce(fx.ctx);
+
+    assert.equal(result.status, 'deployed');
+    assert.equal(store.snapshot().deploy.activeSha, 'merge-5');
+    assert.equal(store.snapshot().jobs.j1?.status, 'done');
+    assert.equal(fx.notifications.length, 1);
+    assert.equal(fx.comments.length, 1);
+    for (const text of [fx.notifications[0]!, fx.comments[0]!]) {
+      assert.match(text, /本地已部署/);
+      assert.match(text, /公网入口（Vercel独立发布）：https:\/\/spec-loop\.vercel\.app\//);
+      assert.doesNotMatch(text, /Vercel (已部署|Ready)/);
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

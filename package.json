@@ -5,7 +5,7 @@
   "type": "module",
   "description": "GitHub + Pi Coding Agent 本地文档驱动开发演示",
   "engines": {
-    "node": ">=22.19.0"
+    "node": "24.x"
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5174",
