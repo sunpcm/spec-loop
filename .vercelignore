@@ -7,5 +7,5 @@
 !package-lock.json
 !vite.config.ts
 !tsconfig.json
-!src/
+!src
 !src/**
