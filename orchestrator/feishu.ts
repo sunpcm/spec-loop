@@ -14,7 +14,7 @@ export interface FeishuSettings {
   allowedUserIds: string[];
 }
 
-import type { FeishuCommands } from './feishu-contract.ts';
+import type { FeishuActorContext, FeishuCommands } from './feishu-contract.ts';
 
 export interface FeishuBridge {
   start(): Promise<void>;
@@ -55,6 +55,9 @@ type FeishuCommand =
   | { type: 'require'; description: string }
   | { type: 'retry-requirement'; requestId: string }
   | { type: 'invalid-requirement'; message: string }
+  | { type: 'merge'; prNumber: number }
+  | { type: 'confirm-merge'; prNumber: number; confirmationCode: string }
+  | { type: 'invalid-merge'; message: string }
   | { type: 'help' }
   | { type: 'unknown' };
 
@@ -87,6 +90,30 @@ export function parseFeishuCommand(rawText: string): FeishuCommand | null {
     if (SPEC_REQUEST_ID_RE.test(requestId)) {
       return { type: 'retry-requirement', requestId };
     }
+  }
+  if (text.startsWith('确认合并')) {
+    const match = /^确认合并\s*#([1-9][0-9]{0,9})\s+([0-9A-Fa-f]{8})$/.exec(text);
+    if (!match) {
+      return {
+        type: 'invalid-merge',
+        message: '⚠️ 确认格式应为：确认合并 #N 8位十六进制确认码',
+      };
+    }
+    return {
+      type: 'confirm-merge',
+      prNumber: Number(match[1]),
+      confirmationCode: match[2]!.toLowerCase(),
+    };
+  }
+  if (text.startsWith('/merge') || text.startsWith('合并')) {
+    const match = /^(?:\/merge\s+#?([1-9][0-9]{0,9})|合并\s*PR\s*#([1-9][0-9]{0,9}))$/.exec(text);
+    if (!match) {
+      return {
+        type: 'invalid-merge',
+        message: '⚠️ 合并预检格式应为：合并 PR #N 或 /merge N',
+      };
+    }
+    return { type: 'merge', prNumber: Number(match[1] ?? match[2]) };
   }
   const requireMatch = /^(?:\/require(?:\s+([\s\S]*))?|需求\s*[:：]\s*([\s\S]*))$/.exec(text);
   if (requireMatch) {
@@ -127,6 +154,28 @@ function extractSenderIds(event: FeishuIncomingEvent): string[] {
   return [senderId?.open_id, senderId?.user_id, senderId?.union_id].filter(
     (id): id is string => typeof id === 'string' && id.trim().length > 0,
   );
+}
+
+function trustedActorContext(
+  event: FeishuIncomingEvent,
+  settings: FeishuSettings,
+  messageId: string,
+  chatId: string,
+): FeishuActorContext | null {
+  if (event.sender?.sender_type !== 'user') {
+    return null;
+  }
+  const allowed = new Set(settings.allowedUserIds.map((id) => id.trim()).filter(Boolean));
+  const actorId = extractSenderIds(event).find((id) => allowed.has(id.trim()));
+  if (!actorId) {
+    return null;
+  }
+  return {
+    messageId,
+    actorId: actorId.trim(),
+    chatId,
+    senderType: 'user',
+  };
 }
 
 function truncateForFeishu(text: string): string {
@@ -310,7 +359,11 @@ export function createFeishuBridgeWithDependencies(
     return sendQueue;
   }
 
-  async function runCommand(command: FeishuCommand, messageId: string): Promise<string> {
+  async function runCommand(
+    command: FeishuCommand,
+    messageId: string,
+    context: FeishuActorContext,
+  ): Promise<string> {
     if (command.type === 'status') {
       return commands.status();
     }
@@ -323,7 +376,16 @@ export function createFeishuBridgeWithDependencies(
     if (command.type === 'retry-requirement') {
       return commands.retryRequirement(command.requestId);
     }
+    if (command.type === 'merge') {
+      return commands.merge(command.prNumber, context);
+    }
+    if (command.type === 'confirm-merge') {
+      return commands.confirmMerge(command.prNumber, command.confirmationCode, context);
+    }
     if (command.type === 'invalid-requirement') {
+      return command.message;
+    }
+    if (command.type === 'invalid-merge') {
       return command.message;
     }
     if (command.type === 'help') {
@@ -332,21 +394,25 @@ export function createFeishuBridgeWithDependencies(
     return HELP_TEXT;
   }
 
-  async function processCommand(chatId: string, command: FeishuCommand, messageId: string): Promise<void> {
-    if (command.type !== 'invalid-requirement') {
+  async function processCommand(
+    chatId: string,
+    command: FeishuCommand,
+    context: FeishuActorContext,
+  ): Promise<void> {
+    if (command.type !== 'invalid-requirement' && command.type !== 'invalid-merge') {
       const ackText =
         command.type === 'require'
-          ? `✅ 已收到需求消息，候选请求ID：${computeSpecRequestId(messageId)}；检查通过后受理`
+          ? `✅ 已收到需求消息，候选请求ID：${computeSpecRequestId(context.messageId)}；检查通过后受理`
           : COMMAND_ACK_TEXT;
       await enqueueSend(chatId, ackText);
     }
     try {
-      const result = await runCommand(command, messageId);
+      const result = await runCommand(command, context.messageId, context);
       await enqueueSend(chatId, result);
-      log(`飞书命令已完成: ${messageId}`);
+      log(`飞书命令已完成: ${context.messageId}`);
     } catch (error) {
       await enqueueSend(chatId, COMMAND_ERROR_TEXT);
-      log(`飞书命令执行失败: ${messageId} ${formatError(error)}`);
+      log(`飞书命令执行失败: ${context.messageId} ${formatError(error)}`);
     }
   }
 
@@ -367,13 +433,14 @@ export function createFeishuBridgeWithDependencies(
       if (message?.message_type !== 'text') {
         return;
       }
-      const senderIds = extractSenderIds(event);
-      const allowed = settings.allowedUserIds.some((allowedId) => senderIds.includes(allowedId));
-      if (!allowed) {
+      const chatId = message.chat_id;
+      const context = chatId
+        ? trustedActorContext(event, settings, messageId, chatId)
+        : null;
+      if (!context) {
         log(`拒绝未授权飞书消息: ${messageId}`);
         return;
       }
-      const chatId = message.chat_id;
       if (!chatId || !settings.chatId || chatId !== settings.chatId) {
         log(`拒绝非配置会话的飞书消息: ${messageId}`);
         return;
@@ -381,10 +448,10 @@ export function createFeishuBridgeWithDependencies(
       const command = parseFeishuCommand(extractMessageText(message.content));
       if (!command) {
         log(`未识别消息，回复帮助: ${messageId}`);
-        void processCommand(chatId, { type: 'unknown' }, messageId);
+        void processCommand(chatId, { type: 'unknown' }, context);
         return;
       }
-      void processCommand(chatId, command, messageId);
+      void processCommand(chatId, command, context);
     } catch (error) {
       log(`处理飞书消息异常: ${formatError(error)}`);
     }

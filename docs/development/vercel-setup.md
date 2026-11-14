@@ -17,7 +17,7 @@
 2. Framework Preset 选择 Vite；若仓库内 `vercel.json` 已生效，应显示同一构建命令与输出目录。
 3. 确认 Node.js Version 使用 24.x。`package.json` 的 `engines.node` 会覆盖面板中的其他版本。
 4. Production Branch 选择 `main`，不要为本地运行配置 `FEISHU_*`、`PI_*`、`SPEC_LOOP_PI_API_KEY`、GitHub token 或本地 `.orchestrator` 路径。
-5. 第一次 PR 生成 Preview URL；由用户检查页面和 `/version.json`。任何 Agent 都不得自动 Merge PR，只有人工 Merge 到 `main` 后，Vercel 才会生成 production deployment。
+5. 第一次 PR 生成 Preview URL；由用户检查页面和 `/version.json`。任何 Agent 都不得未经用户确认自主 Merge PR；受管 PR 可按 [飞书受控确认合并 PR](feishu-merge-plan.md) 执行，其他 PR 仍需人工 Merge 到 `main` 后，Vercel 才会生成 production deployment。
 
 当前 Vercel CLI 不进入 Demo 主链路，控制器不调用 Vercel。仓库 `.gitignore` 忽略本地 `.vercel/` 链接目录。
 

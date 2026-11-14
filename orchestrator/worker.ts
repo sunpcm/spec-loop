@@ -55,6 +55,7 @@ export interface WorkerOutcome {
   status: WorkerStatus;
   prNumber?: number;
   branch?: string;
+  headSHA?: string;
   error?: string;
   failureStage?: 'plan' | 'write' | 'verify' | 'commit' | 'publish';
   resumeAction?: string;
@@ -64,6 +65,16 @@ export interface WorkerOutcome {
 
 function slugify(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+export function buildWorkerBranchName(
+  reqId: string,
+  issueNumber: number,
+  specHash: string,
+  sourceMainSha: string,
+  attempt: number,
+): string {
+  return `pi/${slugify(reqId)}-i${issueNumber}-r${specHash.slice(0, 8)}-a${attempt}-s${sourceMainSha.slice(0, 8)}`;
 }
 
 export async function checkSpecCurrent(
@@ -175,7 +186,13 @@ export function buildVerifierSandboxSpec(
 export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promise<WorkerOutcome> {
   const logger = deps.logger;
   const mainBranch = deps.mainBranch ?? 'main';
-  const branch = `pi/${slugify(input.reqId)}-i${input.issueNumber}-r${input.spec.hash.slice(0, 8)}-a${input.attempt}-s${input.sourceMainSha.slice(0, 8)}`;
+  const branch = buildWorkerBranchName(
+    input.reqId,
+    input.issueNumber,
+    input.spec.hash,
+    input.sourceMainSha,
+    input.attempt,
+  );
   const workDir = join(deps.runDir, 'worktrees', input.jobId);
   const snapshotDir = join(deps.runDir, 'verify', input.jobId);
   const jobRoot = join(deps.runDir, 'jobs', input.jobId);
@@ -336,6 +353,10 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
     }
 
     await deps.git.commit(workDir, `feat(${input.reqId}): 实现 ${input.spec.title}`);
+    const headSHA = (await deps.git.revParse(workDir, 'HEAD')).trim().toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(headSHA)) {
+      throw new Error(`提交后的 HEAD 不是完整 40 位 SHA: ${headSHA || '(空)'}`);
+    }
     await deps.git.push(workDir, branch);
 
     const prBody = buildPrBody(input, verification);
@@ -343,7 +364,7 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
 
     published = true;
     await deps.notify?.(`🔎 PR #${prNumber} 等待审查`);
-    return { status: 'published', prNumber, branch, piAttempts: attemptsRun };
+    return { status: 'published', prNumber, branch, headSHA, piAttempts: attemptsRun };
   } catch (error) {
     return {
       status: 'failed',

@@ -10,6 +10,39 @@ import { createLogger } from './log.ts';
 import { createPreviewServer } from './preview.ts';
 import { createCore, resolveRepoFromOrigin, runOnce } from './runtime.ts';
 
+export type ExclusiveRunner = <T>(task: () => Promise<T>) => Promise<T>;
+
+/** 轮询与写命令共用的进程内串行门；只包住会写状态/远端的命令。 */
+export function createExclusiveRunner(): ExclusiveRunner {
+  let active: Promise<unknown> = Promise.resolve();
+  return <T>(task: () => Promise<T>): Promise<T> => {
+    const run = active.then(task, task);
+    active = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+}
+
+export function createBridgedCommands(
+  commands: import('./feishu-contract.ts').FeishuCommands,
+  runExclusive: ExclusiveRunner,
+): import('./feishu-contract.ts').FeishuCommands {
+  return {
+    status: () => commands.status(),
+    retry: (issueNumber: number) => runExclusive(() => commands.retry(issueNumber)),
+    help: () => commands.help(),
+    require: (description: string, messageId?: string) =>
+      runExclusive(() => commands.require(description, messageId)),
+    retryRequirement: (requestId: string) =>
+      runExclusive(() => commands.retryRequirement(requestId)),
+    merge: (prNumber, context) => runExclusive(() => commands.merge(prNumber, context)),
+    confirmMerge: (prNumber, confirmationCode, context) =>
+      runExclusive(() => commands.confirmMerge(prNumber, confirmationCode, context)),
+  };
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -48,7 +81,6 @@ async function main(): Promise<void> {
   let controlServer: Server | null = null;
   let previewServer: Server | null = null;
   let stopped = false;
-  let active: Promise<unknown> = Promise.resolve();
 
   const releaseLock = (): void => {
     if (lock) {
@@ -77,15 +109,8 @@ async function main(): Promise<void> {
     await cleanup();
   };
 
-  // 全局串行互斥：轮询 runOnce 与 HTTP/飞书 retry 共用同一条队列，避免并发写状态/派单。
-  const runExclusive = <T>(task: () => Promise<T>): Promise<T> => {
-    const run = active.then(task, task);
-    active = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
-  };
+  // 全局串行互斥：轮询 runOnce 与 HTTP/飞书写命令共用同一条队列。
+  const runExclusive = createExclusiveRunner();
 
   // 默认本地降级；飞书桥启动成功后替换为真实桥通知。
   let send: (text: string) => Promise<void> = async (text) => {
@@ -122,16 +147,8 @@ async function main(): Promise<void> {
 
     // 飞书桥（可选）：失败降级为仅本地控制接口，不阻断守护进程启动。
     try {
-      // status 只读取 StateStore 快照；写命令仍与轮询任务共用串行队列。
-      const bridgedCommands = {
-        status: () => core.commands.status(),
-        retry: (issueNumber: number) => runExclusive(() => core.commands.retry(issueNumber)),
-        help: () => core.commands.help(),
-        require: (description: string, messageId?: string) =>
-          runExclusive(() => core.commands.require(description, messageId)),
-        retryRequirement: (requestId: string) =>
-          runExclusive(() => core.commands.retryRequirement(requestId)),
-      };
+      // status/help 只读取快照；写命令仍与轮询任务共用串行队列。
+      const bridgedCommands = createBridgedCommands(core.commands, runExclusive);
       bridge = await createFeishuBridgeRuntime(config.feishu, bridgedCommands, (m) => logger.info(m));
       if (bridge) await bridge.start();
     } catch (error) {
@@ -180,7 +197,7 @@ async function main(): Promise<void> {
           bridge = null;
         }
         // 3) 等待当前 exclusive 任务结束（Pi 自身有总超时）。
-        await active;
+        await runExclusive(async () => undefined);
         // 4) 释放实例锁后退出，避免留下无锁却挂起的进程。
         releaseLock();
         process.exit(0);

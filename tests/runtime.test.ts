@@ -30,6 +30,7 @@ const silentLogger: Logger = {
 };
 
 const sourceSha = '1'.repeat(40);
+const workerHeadSha = '2'.repeat(40);
 
 function makeConfig(dir: string): Config {
   return {
@@ -259,11 +260,21 @@ test('createCore 的通知封装在 5 秒后中止永不返回的通知', async 
 
 test('runOneWorkerForInput 同步完整 processing → in-review 生命周期并带链接通知', async () => {
   const harness = makeWorkerHarness();
-  harness.setOutcome({ status: 'published', prNumber: 34, branch: 'pi/req' });
+  harness.setOutcome({
+    status: 'published',
+    prNumber: 34,
+    branch: 'pi/req',
+    headSHA: workerHeadSha,
+  });
 
   const outcome = await runOneWorkerForInput(harness.core, input(harness));
 
-  assert.deepEqual(outcome, { status: 'published', prNumber: 34, branch: 'pi/req' });
+  assert.deepEqual(outcome, {
+    status: 'published',
+    prNumber: 34,
+    branch: 'pi/req',
+    headSHA: workerHeadSha,
+  });
   assert.deepEqual(labelSequence(harness.ghCalls), [
     'remove:all',
     'add:pi-task+status:processing',
@@ -275,6 +286,7 @@ test('runOneWorkerForInput 同步完整 processing → in-review 生命周期并
   const job = harness.core.state.snapshot().jobs['job-1'];
   assert.equal(job?.status, 'in-review');
   assert.equal(job?.prNumber, 34);
+  assert.equal(job?.headSHA, workerHeadSha);
   assert.equal(
     harness.notifications.some((text) => text.includes('https://github.com/owner/repo/issues/12')),
     true,
@@ -318,8 +330,9 @@ test('runOneWorkerForInput failed 结局同步 failed 标签并安全截断 Issu
   );
 });
 
-test('远端已有当前 revision PR 时本地失败重试只回填状态，不调用 Worker', async () => {
+test('远端恢复保留已有可信 head，绝不用远端观察值补齐，也不调用 Worker', async () => {
   const harness = makeWorkerHarness();
+  const remoteHeadSha = '3'.repeat(40);
   const meta = {
     kind: 'code-pr',
     reqId: 'REQ-A-01',
@@ -334,11 +347,27 @@ test('远端已有当前 revision PR 时本地失败重试只回填状态，不�
       state: 'open',
       merged: false,
       headRefName: 'pi/existing',
+      headSHA: remoteHeadSha,
       baseRefName: 'main',
       meta,
     },
   ]);
   harness.setOutcome({ status: 'failed', error: '不应执行 Worker' });
+  await harness.core.state.update((state) => {
+    state.jobs['job-1'] = {
+      jobId: 'job-1',
+      reqId: 'REQ-A-01',
+      issueNumber: 12,
+      specHash: 'h1',
+      sourceMainSha: sourceSha,
+      attempt: 1,
+      status: 'in-review',
+      prNumber: 76,
+      headSHA: workerHeadSha,
+      startedAt: '2026-11-14T00:00:00.000Z',
+      updatedAt: '2026-11-14T00:00:00.000Z',
+    };
+  });
 
   const outcome = await runOneWorkerForInput(harness.core, input(harness));
 
@@ -352,10 +381,53 @@ test('远端已有当前 revision PR 时本地失败重试只回填状态，不�
   const job = harness.core.state.snapshot().jobs['job-1'];
   assert.equal(job?.status, 'in-review');
   assert.equal(job?.prNumber, 77);
+  assert.equal(job?.headSHA, workerHeadSha);
+  assert.notEqual(job?.headSHA, remoteHeadSha);
   assert.equal(
     harness.notifications.some((text) => text.includes('https://github.com/owner/repo/pull/77')),
     true,
   );
+
+  await harness.core.state.update((state) => {
+    delete state.jobs['job-1']!.headSHA;
+  });
+  await runOneWorkerForInput(harness.core, input(harness));
+  assert.equal(harness.core.state.snapshot().jobs['job-1']?.headSHA, undefined);
+  assert.deepEqual(harness.workerInputs, []);
+});
+
+test('published outcome 缺失或非法 head 时清除旧可信值，禁止跨 attempt 沿用', async () => {
+  for (const badHead of [undefined, 'not-a-complete-sha']) {
+    const harness = makeWorkerHarness();
+    await harness.core.state.update((state) => {
+      state.jobs['job-1'] = {
+        jobId: 'job-1',
+        reqId: 'REQ-A-01',
+        issueNumber: 12,
+        specHash: 'h1',
+        sourceMainSha: sourceSha,
+        attempt: 1,
+        status: 'failed',
+        prNumber: 75,
+        headSHA: workerHeadSha,
+        startedAt: '2026-11-14T00:00:00.000Z',
+        updatedAt: '2026-11-14T00:00:00.000Z',
+      };
+    });
+    harness.setOutcome({
+      status: 'published',
+      prNumber: 79,
+      branch: 'pi/req',
+      ...(badHead === undefined ? {} : { headSHA: badHead }),
+    });
+
+    await runOneWorkerForInput(harness.core, input(harness));
+
+    const job = harness.core.state.snapshot().jobs['job-1'];
+    assert.equal(job?.status, 'in-review');
+    assert.equal(job?.prNumber, 79);
+    assert.equal(job?.headSHA, undefined);
+  }
 });
 
 test('远端交付预检失败时 fail closed，不执行 Worker', async () => {
