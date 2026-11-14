@@ -287,6 +287,7 @@ export function createCore(
     logger: createLogger('DEPLOY'),
     notify: emitNotify,
     mainBranch: config.mainBranch,
+    publicUrl: config.publicUrl,
     build,
     healthCheck: async (sha) => verifyReleaseOverHttp(join(config.runDir, 'releases', sha), sha),
     switchPreview: async (sha, releaseDir) => {

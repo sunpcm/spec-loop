@@ -41,6 +41,7 @@ function makeConfig(dir: string): Config {
     httpPort: 4000,
     previewPort: 5173,
     devPort: 5174,
+    publicUrl: '',
     pollIntervalMs: 5000,
     piTimeoutMs: 300000,
     piGraceMs: 5000,

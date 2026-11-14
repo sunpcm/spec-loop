@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { build } from "vite";
+
+import { resolveAppVersion, resolveAssetBase } from "../vite.config.ts";
 
 type CounterModule = typeof import("../src/counter");
 
@@ -71,4 +77,51 @@ test("increment leaves counting safe and rejects unsafe results", () => {
 test("main entry retains the requirement and trusted version system contract", () => {
   assert.match(sourceFiles.main, /REQ-CNT-01/);
   assert.match(sourceFiles.main, /__APP_VERSION__/);
+});
+
+test("version and asset base select the expected Vercel and local values", () => {
+  assert.equal(
+    resolveAppVersion({
+      SPEC_LOOP_VERSION: "local-sha",
+      VERCEL_GIT_COMMIT_SHA: "vercel-sha",
+    }),
+    "local-sha",
+  );
+  assert.equal(resolveAppVersion({ VERCEL_GIT_COMMIT_SHA: "vercel-sha" }), "vercel-sha");
+  assert.equal(resolveAppVersion({}), "dev");
+  assert.equal(resolveAssetBase({ VERCEL: "1", SPEC_LOOP_ASSET_BASE: "/releases/old/" }), "/");
+  assert.equal(resolveAssetBase({ SPEC_LOOP_ASSET_BASE: "/releases/local/" }), "/releases/local/");
+});
+
+test("Vite build emits a static version manifest", async () => {
+  const root = mkdtempSync(join(tmpdir(), "spec-loop-vite-version-"));
+  const output = join(root, "dist");
+  const previous = {
+    SPEC_LOOP_OUT_DIR: process.env.SPEC_LOOP_OUT_DIR,
+    SPEC_LOOP_VERSION: process.env.SPEC_LOOP_VERSION,
+    VERCEL_GIT_COMMIT_SHA: process.env.VERCEL_GIT_COMMIT_SHA,
+    SPEC_LOOP_ASSET_BASE: process.env.SPEC_LOOP_ASSET_BASE,
+    VERCEL: process.env.VERCEL,
+  };
+  process.env.SPEC_LOOP_OUT_DIR = output;
+  process.env.SPEC_LOOP_VERSION = "artifact-version";
+  process.env.VERCEL_GIT_COMMIT_SHA = "ignored-vercel-sha";
+  process.env.SPEC_LOOP_ASSET_BASE = "/releases/ignored/";
+  delete process.env.VERCEL;
+  try {
+    await build({
+      configFile: fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
+      configLoader: "native",
+      logLevel: "silent",
+    });
+    assert.deepEqual(JSON.parse(readFileSync(join(output, "version.json"), "utf8")), {
+      version: "artifact-version",
+    });
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -1,0 +1,11 @@
+# 仅上传构建静态前端所需的根文件与 src。
+/*
+!.vercelignore
+!vercel.json
+!index.html
+!package.json
+!package-lock.json
+!vite.config.ts
+!tsconfig.json
+!src/
+!src/**
