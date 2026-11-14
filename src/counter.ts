@@ -71,3 +71,11 @@ export function decrement(current: number, raw: string): number {
   assertResult(next);
   return next;
 }
+
+export function doubleValue(current: number): number {
+  assertCurrentValue(current);
+
+  const next = current * 2;
+  assertResult(next);
+  return next;
+}
