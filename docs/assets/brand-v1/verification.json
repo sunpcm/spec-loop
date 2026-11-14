@@ -1,0 +1,46 @@
+{
+  "checkedAt": "2026-11-14T13:14:17.209Z",
+  "status": "passed",
+  "pngFilesChecked": 31,
+  "animations": [
+    {
+      "file": "motion/icon-loop.gif",
+      "width": 256,
+      "height": 256,
+      "frames": 96,
+      "durationMs": 4800,
+      "loop": "infinite",
+      "uniqueFrames": 52
+    },
+    {
+      "file": "motion/logo-loop-dark.gif",
+      "width": 768,
+      "height": 512,
+      "frames": 96,
+      "durationMs": 4800,
+      "loop": "infinite",
+      "uniqueFrames": 52
+    },
+    {
+      "file": "motion/logo-loop-light.gif",
+      "width": 768,
+      "height": 512,
+      "frames": 96,
+      "durationMs": 4800,
+      "loop": "infinite",
+      "uniqueFrames": 52
+    }
+  ],
+  "transparentPngCorners": "passed",
+  "faviconEmbeddedSizes": [
+    16,
+    32,
+    48
+  ],
+  "selectedReferencePreserved": true,
+  "visualReview": [
+    "主 Logo、简化 Icon、深浅背景组合与色板总览",
+    "文档形成到产品成形的四阶段动效分镜"
+  ],
+  "scope": "品牌素材与 README；未更改产品代码、需求、控制器或部署"
+}

@@ -1,0 +1,12 @@
+Mode: built-in imagegen for the simplified icon exploration.
+Approved reference: selected-reference.jpg (supplied and selected by the user).
+Imagegen output: icon-imagegen-reference.png.
+The final scalable logo and compact icon were redrawn as native SVG from the approved reference; the original raster reference is retained unchanged. Static sizes and compositions were exported from the SVG geometry. GIF motion was assembled locally from SVG reveal frames and encoded using FFmpeg.
+
+IMAGEGEN ICON PROMPT
+Use case: precise-object-edit / logo-brand
+Edit target: the supplied approved Spec Loop logo. This is the final selected identity, not a starting point for a redesign.
+Create its simplified small application-icon version. Preserve the essential silhouette exactly: at left a rounded rectangular document with a folded upper-right corner; its bottom edge flows upward in one smooth continuous S-shaped band, becoming a tall softly rounded open product loop at the right, with a small upward-pointing return at the lower-left of that loop. Same gentle asymmetry, same left-to-right transformation, same continuous body.
+Simplify only the finish: remove all shading, gradients, internal overlap planes, tiny fold shading, and pointed hairline details. Use exactly two flat colors: deep navy blue #223E69 for the document/left half, and mint green #52CFA7 for the product/right half, joined at one simple clean diagonal along the central bend. Smooth curves, generous open white space, moderate uniform band width, clean silhouette at 32px.
+Use a compact aspect ratio around 1.45:1 for the mark itself, centered within a square white canvas with generous safe padding. Do not distort it into a circular icon. No extra enclosing rounded-square background, no text, no name, no slogan, no dots, no arrows added, no checkmark, no face. Single logo symbol only, pristine pure-white background with white interior openings.
+The goal is a faithful flat-color small-size companion to the approved logo, recognizably the same brand.

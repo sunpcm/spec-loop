@@ -1,0 +1,427 @@
+{
+  "brand": "Spec Loop",
+  "version": 1,
+  "totalFiles": 63,
+  "hashesExclude": [
+    "manifest.json",
+    "verification.json"
+  ],
+  "files": [
+    {
+      "file": "README.md",
+      "bytes": 4208,
+      "sha256": "17a4d5f20898286e1b62e90a5c503d9a6dcf6388f102823d471dc2881f98aec3"
+    },
+    {
+      "file": "icon/apple-touch-icon.png",
+      "bytes": 3605,
+      "sha256": "6f7be28a08454993aa5efe7c51520160904c112d23d1eae7812fc2af8fd1b90c",
+      "width": 180,
+      "height": 180,
+      "alpha": false
+    },
+    {
+      "file": "icon/avatar-dark.png",
+      "bytes": 40086,
+      "sha256": "ca9a4fb6319b57806a883f8c378b7bc01c552212a3d5526fb5f0db6b1e823a1f",
+      "width": 1024,
+      "height": 1024,
+      "alpha": true
+    },
+    {
+      "file": "icon/avatar-dark.svg",
+      "bytes": 2899,
+      "sha256": "9b8e29517dc42bde47ed0bd64ff7b29376c2c3cbc4446a36445aa3c841d3946c"
+    },
+    {
+      "file": "icon/avatar-light.png",
+      "bytes": 39503,
+      "sha256": "fd0ab61059069452fd7e3ba76d8776edab91cd432d8863eee47269f746ee9c1e",
+      "width": 1024,
+      "height": 1024,
+      "alpha": true
+    },
+    {
+      "file": "icon/avatar-light.svg",
+      "bytes": 2899,
+      "sha256": "96c76f3841a1e77ca2cee5c14a08d1b614368f7a1d9dba5ce91791ccb56db5a2"
+    },
+    {
+      "file": "icon/favicon.ico",
+      "bytes": 2086,
+      "sha256": "e4af3e67b5ed74526473f16c40a1684808253861ee17ba2361cbec48340ec476"
+    },
+    {
+      "file": "icon/favicon.svg",
+      "bytes": 774,
+      "sha256": "20043273ae512f735ab99a096aeed56fb4733921b2b3347e49da0383a4855388"
+    },
+    {
+      "file": "icon/icon-1024.png",
+      "bytes": 33928,
+      "sha256": "a7b9548e4ec26aa8e96e5abc64b9dd17f6bc6d6d7678c00119fa4e16bb7970a1",
+      "width": 1024,
+      "height": 1024,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-128.png",
+      "bytes": 2995,
+      "sha256": "9f57d02bb414c584bd0cb6608a393fd7654a46647dfc87154e90563556efa7bf",
+      "width": 128,
+      "height": 128,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-16.png",
+      "bytes": 469,
+      "sha256": "b88e66696bf61cd9a4acbff477933728eba09b3aec942c73fb9bf2da54eea614",
+      "width": 16,
+      "height": 16,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-180.png",
+      "bytes": 4219,
+      "sha256": "ca246336c2a1590dd7f2aeecec17671b355ddb07100a44eeffd27cc321950f69",
+      "width": 180,
+      "height": 180,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-192.png",
+      "bytes": 4490,
+      "sha256": "e0128ace37ec7033a8aac692635b3faeb00c30d3e56051f5a406e594261725e8",
+      "width": 192,
+      "height": 192,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-256.png",
+      "bytes": 6258,
+      "sha256": "fcc95a0de39ab8ac69f29c65894014df9165c1776c7bdcd4d305fa5af98700fe",
+      "width": 256,
+      "height": 256,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-32.png",
+      "bytes": 862,
+      "sha256": "b0121eee225215591d1102a554816cf66fbe31ed52ecd8b2b9af5c7f743e1ebf",
+      "width": 32,
+      "height": 32,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-48.png",
+      "bytes": 1151,
+      "sha256": "19f9560b69d1be24dc51c8a9695c8e17de9a9f170fe9e5b8bcb239338c0f6a50",
+      "width": 48,
+      "height": 48,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-512.png",
+      "bytes": 14051,
+      "sha256": "6d2223c7f64cddfb3cb55e88a7f52282eceeaa46c4c3e44e4c55f464c442dfd7",
+      "width": 512,
+      "height": 512,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-64.png",
+      "bytes": 1531,
+      "sha256": "9f974eebc0b9b0778f97edb30d57322de43cd6d4974d663e8bcfd5d813de31d2",
+      "width": 64,
+      "height": 64,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-dark-32.png",
+      "bytes": 517,
+      "sha256": "2c15266bff8daf31ab53e6744a02b218fd6faaa46901762b854ff6f21cabab8a",
+      "width": 32,
+      "height": 32,
+      "alpha": true
+    },
+    {
+      "file": "icon/icon-white.svg",
+      "bytes": 695,
+      "sha256": "c87c86103ba7f1ea9c5c8b5905d619806c7431412cbb1df0bf9251b6a09e2afd"
+    },
+    {
+      "file": "icon/icon.svg",
+      "bytes": 2818,
+      "sha256": "f87091e4ce0378576ea3d868b65f1f78442e87d263deeab3e6a3a08cb66305dd"
+    },
+    {
+      "file": "lockup/horizontal-dark.png",
+      "bytes": 28372,
+      "sha256": "6496cd8adbfee8566509167d31f3d968226ffffa7ee6fac02baee96f34f0b70a",
+      "width": 1360,
+      "height": 360,
+      "alpha": true
+    },
+    {
+      "file": "lockup/horizontal-dark.svg",
+      "bytes": 2287,
+      "sha256": "882deb8c310a42ef8ff52d40633887c3335a436b91d2153a8aa97268d52dd114"
+    },
+    {
+      "file": "lockup/horizontal-light.png",
+      "bytes": 28794,
+      "sha256": "422fb3e5d91719fd5b68808ba59ccfe6d7dd672306cb057bc170f89ab24037b7",
+      "width": 1360,
+      "height": 360,
+      "alpha": true
+    },
+    {
+      "file": "lockup/horizontal-light.svg",
+      "bytes": 2287,
+      "sha256": "605e2969723812a84ca97f268207201bf8045b3f2682d1a522ac7666171967d7"
+    },
+    {
+      "file": "lockup/vertical-dark.png",
+      "bytes": 39872,
+      "sha256": "b7b5bee546463bd546038fa40142ca35e2fba5d41d9a577c65152e6aea2aa3a0",
+      "width": 1000,
+      "height": 1000,
+      "alpha": true
+    },
+    {
+      "file": "lockup/vertical-dark.svg",
+      "bytes": 2331,
+      "sha256": "8a5f5f53c1aa76fe7626c8ff4e115d0b77616a9378c4887707712f14ed5247e1"
+    },
+    {
+      "file": "lockup/vertical-light.png",
+      "bytes": 40479,
+      "sha256": "80d60869b1c336f0139d1c3a7f642f69d6362baea53e78baa7060fd456b404bb",
+      "width": 1000,
+      "height": 1000,
+      "alpha": true
+    },
+    {
+      "file": "lockup/vertical-light.svg",
+      "bytes": 2331,
+      "sha256": "cc0949dde04a51ca27ab39a90e073fb4259114098fee9a303317f855fdd5ea0b"
+    },
+    {
+      "file": "logo/logo-flat.png",
+      "bytes": 78420,
+      "sha256": "b6c089a6a368c4f96167f28862c26ff239b6664f935f4b8d6401c2a895e8d447",
+      "width": 2000,
+      "height": 1360,
+      "alpha": true
+    },
+    {
+      "file": "logo/logo-flat.svg",
+      "bytes": 2795,
+      "sha256": "1725f5f28844c6277644cb8afd724ff03b76ea645b4ab7b96622bfe61e26fea3"
+    },
+    {
+      "file": "logo/logo-gradient.png",
+      "bytes": 89963,
+      "sha256": "c9c2c94fb533e72c90a0b170bf00231a826ee6aa2559a61351262a2e3dfc4bd7",
+      "width": 2000,
+      "height": 1360,
+      "alpha": true
+    },
+    {
+      "file": "logo/logo-gradient.svg",
+      "bytes": 1888,
+      "sha256": "f88047f45421b60975064d6c676a5cfb27cf3a128c65947d498fc04c993d6f2b"
+    },
+    {
+      "file": "logo/logo-mono-navy.png",
+      "bytes": 52528,
+      "sha256": "a7ba03a4af76fb6c33dfbadc0437177691981dbd65a41e93c3947d6fc65ae78d",
+      "width": 1600,
+      "height": 1088,
+      "alpha": true
+    },
+    {
+      "file": "logo/logo-mono-navy.svg",
+      "bytes": 672,
+      "sha256": "c4753dd1e0eafb243765cd8b14f82c02dfd530f9b305cae999d6bd96386d2450"
+    },
+    {
+      "file": "logo/logo-mono-white.png",
+      "bytes": 41401,
+      "sha256": "ab2cbe86a4d5bef95fd0e41724be94f5ab72a284d3394760ff2288b67284d0cf",
+      "width": 1600,
+      "height": 1088,
+      "alpha": true
+    },
+    {
+      "file": "logo/logo-mono-white.svg",
+      "bytes": 672,
+      "sha256": "30814bf7bed24e94075cb588b71721601838e0ad0b8e8b0b8d5f6b737a9c791a"
+    },
+    {
+      "file": "logo/logo-on-dark.png",
+      "bytes": 64449,
+      "sha256": "e730b880f998f6aa8ee9f010cef3d7ab90a30bb677ac7404c3b1082a896f2e31",
+      "width": 1600,
+      "height": 1088,
+      "alpha": true
+    },
+    {
+      "file": "logo/logo-on-dark.svg",
+      "bytes": 1944,
+      "sha256": "f0ee5f7900b89e2a83b0287387f6256d26473cf7fe707d31420b83701c00c8de"
+    },
+    {
+      "file": "logo/logo-on-light.png",
+      "bytes": 62535,
+      "sha256": "e59b55f4395f1f952d00a4d013a4ed72f117f8f0273163cf7c77404e67892e4b",
+      "width": 1600,
+      "height": 1088,
+      "alpha": true
+    },
+    {
+      "file": "logo/logo-on-light.svg",
+      "bytes": 1936,
+      "sha256": "d6d58e61e20bc5f2da68b8fa7190b52ba9bf70a38358c0fd57f1ed6f09782d16"
+    },
+    {
+      "file": "motion/icon-loop.gif",
+      "bytes": 35223,
+      "sha256": "b87fa083e48a544609ebc553371e242bfe4e064ad5e123dd076bc735714c4d3e",
+      "width": 256,
+      "height": 256,
+      "frames": 96,
+      "durationMs": 4800,
+      "loop": "infinite",
+      "uniqueFrames": 52
+    },
+    {
+      "file": "motion/logo-loop-dark.gif",
+      "bytes": 182304,
+      "sha256": "74daaaffd81e35d19ba1f2333f3d08431cfe5d81bf0f94912fa7953eb1667e68",
+      "width": 768,
+      "height": 512,
+      "frames": 96,
+      "durationMs": 4800,
+      "loop": "infinite",
+      "uniqueFrames": 52
+    },
+    {
+      "file": "motion/logo-loop-light.gif",
+      "bytes": 209179,
+      "sha256": "ffd8aa9c9fb6a598f6ec43746370fdb3ba1b387a7e7b3e78b17327bbb71c1e27",
+      "width": 768,
+      "height": 512,
+      "frames": 96,
+      "durationMs": 4800,
+      "loop": "infinite",
+      "uniqueFrames": 52
+    },
+    {
+      "file": "motion/logo-loop.svg",
+      "bytes": 4532,
+      "sha256": "479900d34716a9c4b8155fc1363725e619b30f425f92d44b213be616466f3e0f"
+    },
+    {
+      "file": "preview.html",
+      "bytes": 3091,
+      "sha256": "ea02424dac982691f72a0776f5ae204096168c98a72c7f655f1bfcf72ba976bb"
+    },
+    {
+      "file": "preview/brand-overview.png",
+      "bytes": 156175,
+      "sha256": "ceac13219e60307e75ac264a563844446d2d9db0691def0cc49f1f6b10753652",
+      "width": 1500,
+      "height": 1670,
+      "alpha": true
+    },
+    {
+      "file": "preview/motion-storyboard.png",
+      "bytes": 20747,
+      "sha256": "d7ba6a039e3c42efba87ccfc6a870fa32a81b7cac6bed4b43a5d4382090b86c8",
+      "width": 1440,
+      "height": 420,
+      "alpha": false
+    },
+    {
+      "file": "social/readme-banner-dark.png",
+      "bytes": 30810,
+      "sha256": "c0265b5b1eaab8afd4322019bfe10bf360f795b64b06286f4c3b5d321ab546ce",
+      "width": 1200,
+      "height": 400,
+      "alpha": true
+    },
+    {
+      "file": "social/readme-banner-dark.svg",
+      "bytes": 2498,
+      "sha256": "8c2ae3eb49ee614d1d6d3cd68b7450dd929af2b34cba4e6d2ef447d7fe10993b"
+    },
+    {
+      "file": "social/readme-banner-light.png",
+      "bytes": 29725,
+      "sha256": "2536079b41e7fe55342e08790a2cef756384fd5173375410cea8a3cb7f055548",
+      "width": 1200,
+      "height": 400,
+      "alpha": true
+    },
+    {
+      "file": "social/readme-banner-light.svg",
+      "bytes": 2498,
+      "sha256": "c66f86ed464f757d2dd4a0b0c8bcf028810947156f15222354a33df010988333"
+    },
+    {
+      "file": "social/share-card-dark.png",
+      "bytes": 40735,
+      "sha256": "fdbe71cfc38ff05577afe779d03f70698a9942bf252994b8cc03bdad6b644e7b",
+      "width": 1200,
+      "height": 630,
+      "alpha": true
+    },
+    {
+      "file": "social/share-card-dark.svg",
+      "bytes": 2691,
+      "sha256": "50923212991ea75384f8d52e735513db877887d61e8c80d261943f17eab8de95"
+    },
+    {
+      "file": "social/share-card-light.png",
+      "bytes": 39971,
+      "sha256": "7a964cba713aac5cd7bbed4411677fa4d20212f30c59e9a52a7eac2a68065ed7",
+      "width": 1200,
+      "height": 630,
+      "alpha": true
+    },
+    {
+      "file": "social/share-card-light.svg",
+      "bytes": 2691,
+      "sha256": "90f8995cbf792f1b405377b5f38afd439c9fdd23da5da50d8d52007b33c34579"
+    },
+    {
+      "file": "source/icon-imagegen-reference.png",
+      "bytes": 1026118,
+      "sha256": "7eba1459a603f6f8e0cd064b5f09d0dfde0c53f85dc33191422fdf775199fde3",
+      "width": 1254,
+      "height": 1254,
+      "alpha": false
+    },
+    {
+      "file": "source/logo-master.svg",
+      "bytes": 1888,
+      "sha256": "f88047f45421b60975064d6c676a5cfb27cf3a128c65947d498fc04c993d6f2b"
+    },
+    {
+      "file": "source/palette.json",
+      "bytes": 171,
+      "sha256": "ad231fae05aaf38e2091f4ba87d3a4e050a93971067bca30f7e67fa20c455cfa"
+    },
+    {
+      "file": "source/prompts.txt",
+      "bytes": 2029,
+      "sha256": "a61f1de176ea9c8cdeb02e278f7a20b7760165a19727bf235f28fe2641baac86"
+    },
+    {
+      "file": "source/selected-reference.jpg",
+      "bytes": 30251,
+      "sha256": "7642b1ece34d228c2d3dcb1b3da83a151895708ef4b388b97afdb993e49cef2c"
+    }
+  ]
+}
