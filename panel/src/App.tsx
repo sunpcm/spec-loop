@@ -32,6 +32,13 @@ import {
   type FlowDefinition,
   type FlowNodeDefinition,
 } from './flow-model';
+import {
+  applyPanelTheme,
+  persistPanelTheme,
+  readPanelThemeSelection,
+  subscribeToSystemTheme,
+  type PanelTheme,
+} from './theme';
 import type {
   DeliveryDeployStatus,
   LinkBasis,
@@ -983,6 +990,11 @@ function NoticeBanner({
 }
 
 export function App(): JSX.Element {
+  const [initialThemeSelection] = useState(() => readPanelThemeSelection());
+  const [theme, setTheme] = useState<PanelTheme>(initialThemeSelection.theme);
+  const [followsSystemTheme, setFollowsSystemTheme] = useState(
+    initialThemeSelection.followsSystem,
+  );
   const [demoMode, setDemoMode] = useState(false);
   const [demoState, dispatchDemo] = useReducer(
     demoReducer,
@@ -998,6 +1010,15 @@ export function App(): JSX.Element {
   const [followCurrentNode, setFollowCurrentNode] = useState(true);
   const [canvasFocused, setCanvasFocused] = useState(false);
   const hasUsableSnapshot = useRef(false);
+
+  useEffect(() => {
+    applyPanelTheme(theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (!followsSystemTheme) return;
+    return subscribeToSystemTheme(setTheme);
+  }, [followsSystemTheme]);
 
   useEffect(() => {
     if (demoMode) return;
@@ -1154,6 +1175,12 @@ export function App(): JSX.Element {
   const confirmDocument = () => dispatchDemo({ type: 'CONFIRM_DOCUMENT' });
   const confirmCode = () => dispatchDemo({ type: 'CONFIRM_CODE' });
   const retryCheck = () => dispatchDemo({ type: 'RETRY_CHECK' });
+  const toggleTheme = () => {
+    const nextTheme = theme === 'dark' ? 'light' : 'dark';
+    setFollowsSystemTheme(false);
+    setTheme(nextTheme);
+    persistPanelTheme(nextTheme);
+  };
 
   const scopeTitle = useMemo(() => {
     if (demoMode) return `演示：${DEMO_STORY.title}`;
@@ -1187,6 +1214,22 @@ export function App(): JSX.Element {
         </div>
 
         <div className="header-readout">
+          <button
+            type="button"
+            className={`theme-toggle${theme === 'light' ? ' is-light' : ''}`}
+            aria-label={
+              theme === 'dark'
+                ? '当前深色主题，切换到浅色主题'
+                : '当前浅色主题，切换到深色主题'
+            }
+            title={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+            onClick={toggleTheme}
+          >
+            <span className="theme-toggle-icon" aria-hidden="true">
+              {theme === 'dark' ? '☀' : '☾'}
+            </span>
+            <span>{theme === 'dark' ? '浅色' : '深色'}</span>
+          </button>
           <ConnectionPill demo={demoMode} fetchState={fetchState} />
           {!demoMode && view ? (
             <span
@@ -1290,6 +1333,7 @@ export function App(): JSX.Element {
             definition={flowDefinition}
             selectedNodeId={selectedNode?.id ?? null}
             onSelectNode={selectNode}
+            theme={theme}
           />
 
           <div className="canvas-legend" aria-label="状态图例">

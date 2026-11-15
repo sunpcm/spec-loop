@@ -129,6 +129,16 @@ export const FLOW_STATUS_COLORS: Record<PanelStatus, string> = {
   unknown: '#8490a4',
 };
 
+export const FLOW_STATUS_COLORS_LIGHT: Record<PanelStatus, string> = {
+  pending: '#64748b',
+  running: '#078d8b',
+  waiting: '#b7791f',
+  succeeded: '#138a5b',
+  failed: '#d14354',
+  stale: '#7651c9',
+  unknown: '#697586',
+};
+
 export const FLOW_EDGE_COLORS: Record<FlowEdgeKind, string> = {
   done: '#35d39a',
   active: '#22d3c5',
@@ -136,4 +146,13 @@ export const FLOW_EDGE_COLORS: Record<FlowEdgeKind, string> = {
   retry: '#f4b84a',
   pending: '#425168',
   dormant: '#26384a',
+};
+
+export const FLOW_EDGE_COLORS_LIGHT: Record<FlowEdgeKind, string> = {
+  done: '#138a5b',
+  active: '#078d8b',
+  failed: '#d14354',
+  retry: '#b7791f',
+  pending: '#94a3b8',
+  dormant: '#cbd5e1',
 };

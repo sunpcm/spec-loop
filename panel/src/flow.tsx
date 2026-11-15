@@ -19,7 +19,9 @@ import {
 } from '@xyflow/react';
 import {
   FLOW_EDGE_COLORS,
+  FLOW_EDGE_COLORS_LIGHT,
   FLOW_STATUS_COLORS,
+  FLOW_STATUS_COLORS_LIGHT,
   type FlowDefinition,
   type FlowEdgeDefinition,
   type FlowEdgeKind,
@@ -27,6 +29,7 @@ import {
   type FlowNodeKind,
   type FlowPoint,
 } from './flow-model';
+import type { PanelTheme } from './theme';
 import type { PanelStatus } from './types';
 
 type FlowNodeData = {
@@ -315,6 +318,27 @@ const EDGE_TYPES = {
   routed: RoutedEdge,
 };
 
+const FLOW_PALETTES = {
+  dark: {
+    status: FLOW_STATUS_COLORS,
+    edge: FLOW_EDGE_COLORS,
+    dormantNode: '#26384a',
+    dormantLabel: '#698094',
+    backgroundDot: 'rgba(129, 151, 178, 0.2)',
+    minimapStroke: 'rgba(255, 255, 255, 0.2)',
+    minimapMask: 'rgba(4, 11, 22, 0.72)',
+  },
+  light: {
+    status: FLOW_STATUS_COLORS_LIGHT,
+    edge: FLOW_EDGE_COLORS_LIGHT,
+    dormantNode: '#cbd5e1',
+    dormantLabel: '#718096',
+    backgroundDot: 'rgba(71, 85, 105, 0.2)',
+    minimapStroke: 'rgba(51, 65, 85, 0.24)',
+    minimapMask: 'rgba(15, 23, 42, 0.12)',
+  },
+} as const;
+
 function toFlowNodes(
   definition: FlowDefinition,
   selectedNodeId: string | null,
@@ -338,9 +362,12 @@ function toFlowNodes(
   }));
 }
 
-function toFlowEdges(definition: FlowDefinition): FlowEdge[] {
+function toFlowEdges(
+  definition: FlowDefinition,
+  palette: (typeof FLOW_PALETTES)[PanelTheme],
+): FlowEdge[] {
   return definition.edges.map((edge) => {
-    const color = FLOW_EDGE_COLORS[edge.kind];
+    const color = palette.edge[edge.kind];
     return {
       id: edge.id,
       source: edge.source,
@@ -353,7 +380,7 @@ function toFlowEdges(definition: FlowDefinition): FlowEdge[] {
       label: edge.label,
       data: {
         route: edge.route,
-        color: edge.kind === 'dormant' ? '#698094' : color,
+        color: edge.kind === 'dormant' ? palette.dormantLabel : color,
         kind: edge.kind,
       },
       style: {
@@ -378,28 +405,34 @@ function toFlowEdges(definition: FlowDefinition): FlowEdge[] {
   });
 }
 
-function minimapColor(node: Node): string {
+function minimapColor(
+  node: Node,
+  palette: (typeof FLOW_PALETTES)[PanelTheme],
+): string {
   const data = node.data as FlowNodeData | undefined;
-  if (data?.node?.dormant) return '#26384a';
-  return data?.node ? FLOW_STATUS_COLORS[data.node.status] : FLOW_STATUS_COLORS.unknown;
+  if (data?.node?.dormant) return palette.dormantNode;
+  return data?.node ? palette.status[data.node.status] : palette.status.unknown;
 }
 
 interface FlowCanvasProps {
   definition: FlowDefinition;
   selectedNodeId: string | null;
   onSelectNode: (nodeId: string) => void;
+  theme: PanelTheme;
 }
 
 export function FlowCanvas({
   definition,
   selectedNodeId,
   onSelectNode,
+  theme,
 }: FlowCanvasProps): JSX.Element {
   const canvasRef = useRef<HTMLDivElement>(null);
   const flowRef = useRef<ReactFlowInstance<StageFlowNode, FlowEdge> | null>(null);
   const fitFrameRef = useRef<number | null>(null);
+  const palette = FLOW_PALETTES[theme];
   const flowNodes = toFlowNodes(definition, selectedNodeId, onSelectNode);
-  const flowEdges = toFlowEdges(definition);
+  const flowEdges = toFlowEdges(definition, palette);
   const topologySignature = [
     definition.sequenceTotal,
     ...definition.nodes.map((node) => [
@@ -484,6 +517,7 @@ export function FlowCanvas({
         edges={flowEdges}
         nodeTypes={NODE_TYPES}
         edgeTypes={EDGE_TYPES}
+        colorMode={theme}
         fitView
         fitViewOptions={FIT_VIEW_OPTIONS}
         minZoom={0.32}
@@ -510,17 +544,17 @@ export function FlowCanvas({
           variant={BackgroundVariant.Dots}
           gap={24}
           size={1.2}
-          color="rgba(129, 151, 178, 0.2)"
+          color={palette.backgroundDot}
         />
         <Controls position="bottom-right" showInteractive={false} />
         <MiniMap
           position="bottom-left"
           pannable
           zoomable
-          nodeColor={minimapColor}
-          nodeStrokeColor="rgba(255,255,255,0.2)"
+          nodeColor={(node) => minimapColor(node, palette)}
+          nodeStrokeColor={palette.minimapStroke}
           nodeBorderRadius={3}
-          maskColor="rgba(4, 11, 22, 0.72)"
+          maskColor={palette.minimapMask}
         />
       </ReactFlow>
     </div>

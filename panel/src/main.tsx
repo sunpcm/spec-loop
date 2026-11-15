@@ -3,6 +3,9 @@ import { createRoot } from 'react-dom/client';
 import '@xyflow/react/dist/style.css';
 import { App } from './App';
 import './styles.css';
+import { initializePanelTheme } from './theme';
+
+initializePanelTheme();
 
 const root = document.getElementById('root');
 
