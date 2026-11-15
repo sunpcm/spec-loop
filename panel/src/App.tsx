@@ -24,6 +24,7 @@ import {
   getDemoStepIndex,
   isDemoProgressEnabled,
   isDemoStepComplete,
+  type DemoGate,
   type DemoState,
 } from './demo-state';
 import { FlowCanvas, STATUS_TEXT } from './flow';
@@ -112,6 +113,33 @@ const STATUS_GUIDANCE: Record<PanelStatus, string> = {
   failed: '该阶段记录失败，后续阶段需要重新取得执行证据。',
   stale: '交付已过期或被替换，不再作为当前发布依据。',
   unknown: '现有记录不足以支持确定状态。',
+};
+
+const DEMO_GATE_NODE_ID: Record<DemoGate, string> = {
+  document: 'docs-confirm',
+  retry: 'check-retry',
+  code: 'code-confirm',
+};
+
+const DEMO_GATE_CONTENT: Record<
+  DemoGate,
+  { title: string; copy: string; actionLabel: string }
+> = {
+  document: {
+    title: '等待文档人工确认',
+    copy: '只有显式模拟确认才能越过文档合并关口。播放、下一步、计时器和节点选择均不会代做确认。',
+    actionLabel: '模拟确认文档合并',
+  },
+  retry: {
+    title: '固定检查失败',
+    copy: '首轮失败已记录并保留产物。只有显式模拟重试才会回到 Worker 开始第二次尝试。',
+    actionLabel: '模拟重试当前阶段',
+  },
+  code: {
+    title: '等待代码人工确认',
+    copy: '只有显式模拟确认才能越过代码合并关口。确认前不会开始候选构建。',
+    actionLabel: '模拟确认代码合并',
+  },
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -709,6 +737,35 @@ function DemoStoryContext({
   );
 }
 
+function GateActionCard({
+  gate,
+  onAction,
+}: {
+  gate: DemoGate;
+  onAction: (gate: DemoGate) => void;
+}): JSX.Element {
+  const content = DEMO_GATE_CONTENT[gate];
+
+  return (
+    <section
+      className={`demo-gate demo-gate-detail demo-gate-${gate}`}
+      aria-labelledby={`gate-${gate}-title`}
+    >
+      <div role="status" aria-live="polite">
+        <strong id={`gate-${gate}-title`}>{content.title}</strong>
+        <span>{content.copy}</span>
+      </div>
+      <button
+        type="button"
+        className={`gate-action${gate === 'retry' ? ' retry' : ''}`}
+        onClick={() => onAction(gate)}
+      >
+        {content.actionLabel}
+      </button>
+    </section>
+  );
+}
+
 function DetailsPanel({
   view,
   scope,
@@ -717,6 +774,11 @@ function DetailsPanel({
   demoMode,
   demoState,
   demoEvidence,
+  gate,
+  drawerOpen,
+  navigationRequest,
+  onGateAction,
+  onCloseDrawer,
 }: {
   view: PanelView | null;
   scope: Scope;
@@ -725,7 +787,14 @@ function DetailsPanel({
   demoMode: boolean;
   demoState: DemoState;
   demoEvidence: DemoEvidence | null;
+  gate: DemoGate | null;
+  drawerOpen: boolean;
+  navigationRequest: { sequence: number; focusTitle: boolean };
+  onGateAction: (gate: DemoGate) => void;
+  onCloseDrawer: () => void;
 }): JSX.Element {
+  const detailsScrollRef = useRef<HTMLDivElement>(null);
+  const detailsTitleRef = useRef<HTMLHeadingElement>(null);
   const request =
     scope?.type === 'request'
       ? view?.requests.find((item) => item.requestId === scope.id) ?? null
@@ -735,18 +804,45 @@ function DetailsPanel({
       ? view?.deliveryGroups.find((item) => item.id === scope.id) ?? null
       : null;
   const stageIndex = view?.nodes.findIndex((node) => node.id === selectedNode?.id) ?? -1;
+  const gateSelected = gate !== null && selectedNode?.id === DEMO_GATE_NODE_ID[gate];
+
+  useEffect(() => {
+    const scroller = detailsScrollRef.current;
+    if (scroller) scroller.scrollTop = 0;
+    if (navigationRequest.focusTitle) {
+      detailsTitleRef.current?.focus({ preventScroll: true });
+    }
+  }, [navigationRequest]);
 
   return (
-    <aside className="details-panel" aria-label="节点详情">
+    <aside
+      id="node-details-panel"
+      className={`details-panel${drawerOpen ? ' is-gate-drawer' : ''}`}
+      aria-label="节点详情"
+    >
       <div className="details-heading">
         <div>
           <span className="eyebrow">INSPECTOR</span>
-          <h2>节点详情</h2>
+          <h2 ref={detailsTitleRef} tabIndex={-1}>
+            节点详情
+          </h2>
         </div>
-        <span className="readonly-label">只读</span>
+        <div className="details-heading-actions">
+          <span className="readonly-label">只读</span>
+          <button
+            type="button"
+            className="drawer-close"
+            aria-label="关闭节点详情抽屉"
+            onClick={onCloseDrawer}
+          >
+            <span aria-hidden="true">×</span>
+            关闭
+          </button>
+        </div>
       </div>
 
-      <div className="details-scroll">
+      <div ref={detailsScrollRef} className="details-scroll">
+        {gateSelected ? <GateActionCard gate={gate} onAction={onGateAction} /> : null}
         {selectedNode ? (
           <section className="node-detail-card">
             <div className="node-detail-topline">
@@ -806,39 +902,19 @@ function DemoControls({
   onTogglePlay,
   onNext,
   onReset,
-  onConfirmDocument,
-  onConfirmCode,
-  onRetry,
+  onViewGate,
 }: {
   state: DemoState;
   onTogglePlay: () => void;
   onNext: () => void;
   onReset: () => void;
-  onConfirmDocument: () => void;
-  onConfirmCode: () => void;
-  onRetry: () => void;
+  onViewGate: () => void;
 }): JSX.Element {
   const gate = getDemoGate(state);
   const complete = isDemoStepComplete(state);
   const progressEnabled = isDemoProgressEnabled(state);
   const frameIndex = getDemoStepIndex(state);
   const actionLabel = state.playing ? '暂停' : complete ? '重播' : '播放';
-  const gateTitle =
-    gate === 'document'
-      ? '等待文档人工确认'
-      : gate === 'code'
-        ? '等待代码人工确认'
-        : gate === 'retry'
-          ? '固定检查失败'
-          : null;
-  const gateCopy =
-    gate === 'document'
-      ? '只有显式模拟确认才能越过文档合并关口。播放、下一步、计时器和节点选择均不会代做确认。'
-      : gate === 'code'
-        ? '只有显式模拟确认才能越过代码合并关口。确认前不会开始候选构建。'
-        : gate === 'retry'
-          ? '首轮失败已记录并保留产物。只有显式模拟重试才会回到 Worker 开始第二次尝试。'
-          : null;
 
   return (
     <section className="demo-controls-shell" aria-label="单一全流程演示">
@@ -886,36 +962,22 @@ function DemoControls({
           >
             下一步
           </button>
+          <button
+            type="button"
+            className="demo-action gate-jump"
+            onClick={onViewGate}
+            disabled={!gate}
+            aria-controls="node-details-panel"
+            title={gate ? '打开当前待处理节点详情' : '当前没有待处理节点'}
+          >
+            {gate ? '查看待处理节点' : '节点详情'}
+          </button>
           <button type="button" className="demo-action" onClick={onReset}>
             <span aria-hidden="true">↺</span>
             重置
           </button>
         </div>
       </div>
-
-      {gate ? (
-        <div className={`demo-gate demo-gate-${gate}`} role="status" aria-live="polite">
-          <div>
-            <strong>{gateTitle}</strong>
-            <span>{gateCopy}</span>
-          </div>
-          {gate === 'document' ? (
-            <button type="button" className="gate-action" onClick={onConfirmDocument}>
-              模拟确认文档合并
-            </button>
-          ) : null}
-          {gate === 'code' ? (
-            <button type="button" className="gate-action" onClick={onConfirmCode}>
-              模拟确认代码合并
-            </button>
-          ) : null}
-          {gate === 'retry' ? (
-            <button type="button" className="gate-action retry" onClick={onRetry}>
-              模拟重试当前阶段
-            </button>
-          ) : null}
-        </div>
-      ) : null}
     </section>
   );
 }
@@ -1009,6 +1071,12 @@ export function App(): JSX.Element {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [followCurrentNode, setFollowCurrentNode] = useState(true);
   const [canvasFocused, setCanvasFocused] = useState(false);
+  const [gateDrawerOpen, setGateDrawerOpen] = useState(false);
+  const [detailNavigationRequest, setDetailNavigationRequest] = useState({
+    sequence: 0,
+    focusTitle: false,
+  });
+  const lastDemoGate = useRef<DemoGate | null>(null);
   const hasUsableSnapshot = useRef(false);
 
   useEffect(() => {
@@ -1072,6 +1140,9 @@ export function App(): JSX.Element {
     };
   }, [demoMode]);
 
+  const activeGate = demoMode ? getDemoGate(demoState) : null;
+  const activeGateNodeId = activeGate ? DEMO_GATE_NODE_ID[activeGate] : null;
+
   useEffect(() => {
     if (!demoMode || !demoState.playing || !isDemoProgressEnabled(demoState)) return;
     const timer = window.setTimeout(() => dispatchDemo({ type: 'TICK' }), 1500);
@@ -1124,6 +1195,23 @@ export function App(): JSX.Element {
     setSelectedNodeId((nodes.find((node) => node.current) ?? nodes[0])?.id ?? null);
   }, [demoMode, followCurrentNode, nodes, selectedNodeId, view]);
 
+  useEffect(() => {
+    if (lastDemoGate.current === activeGate) return;
+    lastDemoGate.current = activeGate;
+
+    if (!activeGate || !activeGateNodeId) {
+      setGateDrawerOpen(false);
+      return;
+    }
+
+    setSelectedNodeId(activeGateNodeId);
+    setGateDrawerOpen(true);
+    setDetailNavigationRequest((current) => ({
+      sequence: current.sequence + 1,
+      focusTitle: false,
+    }));
+  }, [activeGate, activeGateNodeId]);
+
   const selectNode = useCallback((nodeId: string) => {
     setFollowCurrentNode(false);
     setSelectedNodeId(nodeId);
@@ -1148,6 +1236,7 @@ export function App(): JSX.Element {
     setSelectedNodeId(null);
     setFollowCurrentNode(true);
     setCanvasFocused(false);
+    setGateDrawerOpen(false);
     setStateIssue(null);
     setFetchState(nextDemoMode ? 'live' : realView ? 'live' : 'loading');
   };
@@ -1160,6 +1249,7 @@ export function App(): JSX.Element {
     if (isDemoStepComplete(demoState)) {
       dispatchDemo({ type: 'REPLAY' });
       setFollowCurrentNode(true);
+      setGateDrawerOpen(false);
       return;
     }
     dispatchDemo({ type: 'PLAY' });
@@ -1169,12 +1259,24 @@ export function App(): JSX.Element {
     dispatchDemo({ type: 'RESET' });
     setFollowCurrentNode(true);
     setSelectedNodeId(null);
+    setGateDrawerOpen(false);
   };
 
   const stepDemo = () => dispatchDemo({ type: 'NEXT' });
-  const confirmDocument = () => dispatchDemo({ type: 'CONFIRM_DOCUMENT' });
-  const confirmCode = () => dispatchDemo({ type: 'CONFIRM_CODE' });
-  const retryCheck = () => dispatchDemo({ type: 'RETRY_CHECK' });
+  const handleGateAction = (gate: DemoGate) => {
+    if (gate === 'document') dispatchDemo({ type: 'CONFIRM_DOCUMENT' });
+    if (gate === 'code') dispatchDemo({ type: 'CONFIRM_CODE' });
+    if (gate === 'retry') dispatchDemo({ type: 'RETRY_CHECK' });
+  };
+  const viewPendingGate = () => {
+    if (!activeGate || !activeGateNodeId) return;
+    setSelectedNodeId(activeGateNodeId);
+    setGateDrawerOpen(true);
+    setDetailNavigationRequest((current) => ({
+      sequence: current.sequence + 1,
+      focusTitle: true,
+    }));
+  };
   const toggleTheme = () => {
     const nextTheme = theme === 'dark' ? 'light' : 'dark';
     setFollowsSystemTheme(false);
@@ -1279,7 +1381,11 @@ export function App(): JSX.Element {
         controllerOnline={connectionControllerOnline}
       />
 
-      <main className={`workspace-shell${canvasFocused ? ' is-canvas-focused' : ''}`}>
+      <main
+        className={`workspace-shell${canvasFocused ? ' is-canvas-focused' : ''}${
+          gateDrawerOpen ? ' has-gate-drawer' : ''
+        }`}
+      >
         <Sidebar
           view={view}
           scope={effectiveScope}
@@ -1323,9 +1429,7 @@ export function App(): JSX.Element {
               onTogglePlay={toggleDemoPlayback}
               onNext={stepDemo}
               onReset={resetDemo}
-              onConfirmDocument={confirmDocument}
-              onConfirmCode={confirmCode}
-              onRetry={retryCheck}
+              onViewGate={viewPendingGate}
             />
           ) : null}
 
@@ -1361,6 +1465,11 @@ export function App(): JSX.Element {
           demoMode={demoMode}
           demoState={demoState}
           demoEvidence={demoEvidence}
+          gate={activeGate}
+          drawerOpen={gateDrawerOpen}
+          navigationRequest={detailNavigationRequest}
+          onGateAction={handleGateAction}
+          onCloseDrawer={() => setGateDrawerOpen(false)}
         />
       </main>
     </div>
