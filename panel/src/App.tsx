@@ -2,19 +2,36 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type JSX,
   type ReactNode,
 } from 'react';
 import {
-  DEMO_SCENARIOS,
-  buildDemoView,
-  getDemoScenario,
-  getScenarioFrameLabel,
-  type DemoScenarioKey,
+  DEMO_STORY,
+  buildDemoEvidence,
+  buildDemoScene,
+  getDemoArtifactLabels,
+  getDemoStepLabel,
+  type DemoEvidence,
 } from './demo';
+import {
+  DEMO_STEP_SEQUENCE,
+  createInitialDemoState,
+  demoReducer,
+  getDemoGate,
+  getDemoStepIndex,
+  isDemoProgressEnabled,
+  isDemoStepComplete,
+  type DemoState,
+} from './demo-state';
 import { FlowCanvas, STATUS_TEXT } from './flow';
+import {
+  buildRealFlowDefinition,
+  type FlowDefinition,
+  type FlowNodeDefinition,
+} from './flow-model';
 import type {
   DeliveryDeployStatus,
   LinkBasis,
@@ -242,11 +259,14 @@ function RequestItem({
   request,
   selected,
   onSelect,
+  demoState,
 }: {
   request: PanelRequest;
   selected: boolean;
   onSelect: () => void;
+  demoState: DemoState | null;
 }): JSX.Element {
+  const demoLabels = demoState ? getDemoArtifactLabels(demoState) : null;
   return (
     <button
       type="button"
@@ -262,7 +282,15 @@ function RequestItem({
         {request.summary ?? `${request.targetReqId} 文档变更`}
       </span>
       <span className="workspace-item-meta">
-        <span>{request.prNumber ? `文档 PR #${request.prNumber}` : '文档 PR 未记录'}</span>
+        <span>
+          {demoState
+            ? demoLabels?.documentPr
+              ? `文档 ${demoLabels.documentPr}`
+              : '文档 PR 未执行'
+            : request.prNumber
+              ? `文档 PR #${request.prNumber}`
+              : '文档 PR 未记录'}
+        </span>
         <span>{formatDateTime(request.updatedAt)}</span>
       </span>
     </button>
@@ -273,12 +301,15 @@ function DeliveryItem({
   delivery,
   selected,
   onSelect,
+  demoState,
 }: {
   delivery: PanelDeliveryGroup;
   selected: boolean;
   onSelect: () => void;
+  demoState: DemoState | null;
 }): JSX.Element {
   const latest = delivery.attempts.find((attempt) => attempt.isLatest) ?? delivery.attempts.at(-1);
+  const demoLabels = demoState ? getDemoArtifactLabels(demoState) : null;
   return (
     <button
       type="button"
@@ -294,8 +325,17 @@ function DeliveryItem({
         代码交付 · {delivery.attempts.length} 次尝试
       </span>
       <span className="workspace-item-meta">
-        <span>{LINK_BASIS_TEXT[delivery.linkBasis]}</span>
-        <span>spec {shortSha(delivery.specHash)}</span>
+        {demoState ? (
+          <>
+            <span>{demoLabels?.task ?? '开发任务未生成'}</span>
+            <span>{demoLabels?.codePr ?? '代码 PR 未生成'}</span>
+          </>
+        ) : (
+          <>
+            <span>{LINK_BASIS_TEXT[delivery.linkBasis]}</span>
+            <span>spec {shortSha(delivery.specHash)}</span>
+          </>
+        )}
       </span>
     </button>
   );
@@ -309,10 +349,14 @@ function Sidebar({
   view,
   scope,
   onSelectScope,
+  demoMode,
+  demoState,
 }: {
   view: PanelView | null;
   scope: Scope;
   onSelectScope: (next: Scope) => void;
+  demoMode: boolean;
+  demoState: DemoState;
 }): JSX.Element {
   const requests = useMemo(() => sortNewestFirst(view?.requests ?? []), [view?.requests]);
   const deliveries = useMemo(
@@ -349,7 +393,7 @@ function Sidebar({
         </span>
         <span>
           <strong>全链路总览</strong>
-          <small>查看当前控制器快照</small>
+          <small>{demoMode ? '查看单一合成故事' : '查看当前控制器快照'}</small>
         </span>
       </button>
 
@@ -362,6 +406,7 @@ function Sidebar({
                 request={request}
                 selected={scope?.type === 'request' && scope.id === request.requestId}
                 onSelect={() => onSelectScope({ type: 'request', id: request.requestId })}
+                demoState={demoMode ? demoState : null}
               />
             ))
           ) : (
@@ -377,6 +422,7 @@ function Sidebar({
                 delivery={delivery}
                 selected={scope?.type === 'delivery' && scope.id === delivery.id}
                 onSelect={() => onSelectScope({ type: 'delivery', id: delivery.id })}
+                demoState={demoMode ? demoState : null}
               />
             ))
           ) : (
@@ -395,6 +441,7 @@ function Sidebar({
                 request={request}
                 selected={scope?.type === 'request' && scope.id === request.requestId}
                 onSelect={() => onSelectScope({ type: 'request', id: request.requestId })}
+                demoState={demoMode ? demoState : null}
               />
             ))}
             {historicalDeliveries.map((delivery) => (
@@ -403,6 +450,7 @@ function Sidebar({
                 delivery={delivery}
                 selected={scope?.type === 'delivery' && scope.id === delivery.id}
                 onSelect={() => onSelectScope({ type: 'delivery', id: delivery.id })}
+                demoState={demoMode ? demoState : null}
               />
             ))}
           </WorkspaceListSection>
@@ -556,14 +604,120 @@ function OverviewContext({ view }: { view: PanelView | null }): JSX.Element {
   );
 }
 
+function DemoEvidenceContext({ evidence }: { evidence: DemoEvidence }): JSX.Element {
+  return (
+    <section className="context-card demo-evidence-card">
+      <div className="context-heading">
+        <div>
+          <span className="eyebrow">SYNTHETIC EVIDENCE</span>
+          <h3>{evidence.title}</h3>
+        </div>
+        <span className="history-tag">合成</span>
+      </div>
+      <p className="context-title">{evidence.summary}</p>
+      <dl className="context-list">
+        {evidence.rows.map((row) => (
+          <DetailRow key={`${row.label}-${row.value}`} label={row.label}>
+            <span className={row.tone ? `evidence-value evidence-${row.tone}` : undefined}>
+              {row.value}
+            </span>
+          </DetailRow>
+        ))}
+      </dl>
+    </section>
+  );
+}
+
+function DemoStoryContext({
+  state,
+  view,
+}: {
+  state: DemoState;
+  view: PanelView | null;
+}): JSX.Element {
+  const labels = getDemoArtifactLabels(state);
+  return (
+    <section className="context-card demo-story-card">
+      <div className="context-heading">
+        <div>
+          <span className="eyebrow">DEMO DELIVERY</span>
+          <h3>单一故事证据</h3>
+        </div>
+        <span className="readonly-label">只读</span>
+      </div>
+      <dl className="context-list">
+        <DetailRow label="故事">{DEMO_STORY.title}</DetailRow>
+        <DetailRow label="文档 PR">{labels.documentPr ?? '未生成'}</DetailRow>
+        <DetailRow label="开发任务">{labels.task ?? '未生成'}</DetailRow>
+        <DetailRow label="代码 PR">{labels.codePr ?? '未生成'}</DetailRow>
+        <DetailRow label="文档确认">
+          <span className={state.confirmedGates.includes('document') ? 'evidence-success' : 'evidence-waiting'}>
+            {state.confirmedGates.includes('document') ? '已模拟确认' : '未确认'}
+          </span>
+        </DetailRow>
+        <DetailRow label="代码确认">
+          <span className={state.confirmedGates.includes('code') ? 'evidence-success' : 'evidence-waiting'}>
+            {state.confirmedGates.includes('code') ? '已模拟确认' : '未确认'}
+          </span>
+        </DetailRow>
+        <DetailRow label="尝试记录">{state.attempts.length} 次</DetailRow>
+        <DetailRow label="文档 SHA">
+          <span className="mono-value" title={labels.documentMainSha ?? undefined}>
+            {shortSha(labels.documentMainSha)}
+          </span>
+        </DetailRow>
+        <DetailRow label="当前 main">
+          <span className="mono-value" title={view?.cursorMainSha ?? undefined}>
+            {shortSha(view?.cursorMainSha ?? null)}
+          </span>
+        </DetailRow>
+        <DetailRow label="当前预览">
+          <span className="mono-value" title={view?.deploy.activeSha ?? undefined}>
+            {shortSha(view?.deploy.activeSha ?? null)}
+          </span>
+        </DetailRow>
+      </dl>
+      <div className="demo-attempt-stack">
+        {state.attempts.length > 0 ? (
+          state.attempts.map((attempt) => (
+            <article key={attempt.number} className={`demo-attempt status-${attempt.status}`}>
+              <span>Attempt {attempt.number}</span>
+              <StatusBadge
+                status={
+                  attempt.status === 'running'
+                    ? 'running'
+                    : attempt.status === 'failed'
+                      ? 'failed'
+                      : 'succeeded'
+                }
+                compact
+              />
+            </article>
+          ))
+        ) : (
+          <p className="list-empty">Worker 尚未创建 attempt</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function DetailsPanel({
   view,
   scope,
   selectedNode,
+  selectedFlowNode,
+  demoMode,
+  demoState,
+  demoEvidence,
 }: {
   view: PanelView | null;
   scope: Scope;
   selectedNode: PanelNode | null;
+  selectedFlowNode: FlowNodeDefinition | null;
+  demoMode: boolean;
+  demoState: DemoState;
+  demoEvidence: DemoEvidence | null;
 }): JSX.Element {
   const request =
     scope?.type === 'request'
@@ -590,9 +744,10 @@ function DetailsPanel({
           <section className="node-detail-card">
             <div className="node-detail-topline">
               <span className="node-detail-index">
-                {stageIndex >= 0 ? String(stageIndex + 1).padStart(2, '0') : '—'}
+                {selectedFlowNode?.indexLabel ?? (stageIndex >= 0 ? String(stageIndex + 1) : '—')}
               </span>
               <StatusBadge status={selectedNode.status} />
+              {selectedFlowNode?.dormant ? <span className="history-tag">未触发</span> : null}
               {selectedNode.current ? <span className="current-detail-tag">当前节点</span> : null}
             </div>
             <h3>{selectedNode.label}</h3>
@@ -602,8 +757,12 @@ function DetailsPanel({
               <p>{STATUS_GUIDANCE[selectedNode.status]}</p>
             </div>
             <dl className="context-list node-facts">
-              <DetailRow label="阶段位置">
-                {stageIndex >= 0 ? `第 ${stageIndex + 1} / 8 阶段` : '未记录'}
+              <DetailRow label={demoMode ? '剧情位置' : '阶段位置'}>
+                {selectedFlowNode
+                  ? selectedFlowNode.indexLabel
+                  : stageIndex >= 0
+                    ? String(stageIndex + 1)
+                    : '未记录'}
               </DetailRow>
               <DetailRow label="当前焦点">{selectedNode.current ? '是' : '否'}</DetailRow>
               <DetailRow label="观测时间">{formatDateTime(view?.observedAt)}</DetailRow>
@@ -618,80 +777,138 @@ function DetailsPanel({
           </section>
         )}
 
-        {request ? <RequestContext request={request} /> : null}
-        {delivery ? <DeliveryContext delivery={delivery} /> : null}
-        {!request && !delivery ? <OverviewContext view={view} /> : null}
+        {demoMode ? (
+          <>
+            {demoEvidence ? <DemoEvidenceContext evidence={demoEvidence} /> : null}
+            <DemoStoryContext state={demoState} view={view} />
+          </>
+        ) : (
+          <>
+            {request ? <RequestContext request={request} /> : null}
+            {delivery ? <DeliveryContext delivery={delivery} /> : null}
+            {!request && !delivery ? <OverviewContext view={view} /> : null}
+          </>
+        )}
       </div>
     </aside>
   );
 }
 
 function DemoControls({
-  scenarioKey,
-  frameIndex,
-  playing,
-  onScenarioChange,
+  state,
   onTogglePlay,
+  onNext,
   onReset,
+  onConfirmDocument,
+  onConfirmCode,
+  onRetry,
 }: {
-  scenarioKey: DemoScenarioKey;
-  frameIndex: number;
-  playing: boolean;
-  onScenarioChange: (key: DemoScenarioKey) => void;
+  state: DemoState;
   onTogglePlay: () => void;
+  onNext: () => void;
   onReset: () => void;
+  onConfirmDocument: () => void;
+  onConfirmCode: () => void;
+  onRetry: () => void;
 }): JSX.Element {
-  const scenario = getDemoScenario(scenarioKey);
-  const atLastFrame = frameIndex >= scenario.frames.length - 1;
+  const gate = getDemoGate(state);
+  const complete = isDemoStepComplete(state);
+  const progressEnabled = isDemoProgressEnabled(state);
+  const frameIndex = getDemoStepIndex(state);
+  const actionLabel = state.playing ? '暂停' : complete ? '重播' : '播放';
+  const gateTitle =
+    gate === 'document'
+      ? '等待文档人工确认'
+      : gate === 'code'
+        ? '等待代码人工确认'
+        : gate === 'retry'
+          ? '固定检查失败'
+          : null;
+  const gateCopy =
+    gate === 'document'
+      ? '只有显式模拟确认才能越过文档合并关口。播放、下一步、计时器和节点选择均不会代做确认。'
+      : gate === 'code'
+        ? '只有显式模拟确认才能越过代码合并关口。确认前不会开始候选构建。'
+        : gate === 'retry'
+          ? '首轮失败已记录并保留产物。只有显式模拟重试才会回到 Worker 开始第二次尝试。'
+          : null;
 
   return (
-    <section className="demo-controls" aria-label="演示时间线">
-      <div className="demo-controls-copy">
-        <div className="demo-controls-heading">
-          <strong>合成时间线</strong>
-          <span>
-            帧 {frameIndex + 1} / {scenario.frames.length}
-          </span>
+    <section className="demo-controls-shell" aria-label="单一全流程演示">
+      <div className="demo-controls">
+        <div className="demo-controls-copy">
+          <div className="demo-controls-heading">
+            <strong>{DEMO_STORY.title}</strong>
+            <span>
+              {frameIndex + 1} / {DEMO_STEP_SEQUENCE.length}
+            </span>
+          </div>
+          <p>{getDemoStepLabel(state)} · 单一合成故事，从文档草稿到部署回执</p>
         </div>
-        <p>{scenario.description}</p>
-      </div>
 
-      <label className="scenario-field">
-        <span>演示场景</span>
-        <select
-          value={scenarioKey}
-          onChange={(event) => onScenarioChange(event.target.value as DemoScenarioKey)}
+        <div
+          className="timeline-track"
+          aria-label={`剧情进度：${getDemoStepLabel(state)}`}
         >
-          {DEMO_SCENARIOS.map((item) => (
-            <option key={item.key} value={item.key}>
-              {item.label}
-            </option>
+          {DEMO_STEP_SEQUENCE.map((step, index) => (
+            <span
+              key={step}
+              className={`timeline-step${index <= frameIndex ? ' passed' : ''}${
+                index === frameIndex ? ' current' : ''
+              }`}
+              title={`${index + 1}. ${step}`}
+            />
           ))}
-        </select>
-      </label>
+        </div>
 
-      <div className="timeline-track" aria-label={`当前：${getScenarioFrameLabel(scenarioKey, frameIndex)}`}>
-        {scenario.frames.map((frame, index) => (
-          <span
-            key={`${scenario.key}-${index}`}
-            className={`timeline-step${index <= frameIndex ? ' passed' : ''}${
-              index === frameIndex ? ' current' : ''
-            }`}
-            title={`${index + 1}. ${frame.label}`}
-          />
-        ))}
+        <div className="demo-actions">
+          <button
+            type="button"
+            className="demo-action primary"
+            onClick={onTogglePlay}
+            disabled={gate !== null || (complete && state.playing)}
+          >
+            <span aria-hidden="true">{state.playing ? 'Ⅱ' : complete ? '↺' : '▶'}</span>
+            {gate ? '等待人工动作' : actionLabel}
+          </button>
+          <button
+            type="button"
+            className="demo-action"
+            onClick={onNext}
+            disabled={!progressEnabled}
+          >
+            下一步
+          </button>
+          <button type="button" className="demo-action" onClick={onReset}>
+            <span aria-hidden="true">↺</span>
+            重置
+          </button>
+        </div>
       </div>
 
-      <div className="demo-actions">
-        <button type="button" className="demo-action primary" onClick={onTogglePlay}>
-          <span aria-hidden="true">{playing ? 'Ⅱ' : '▶'}</span>
-          {playing ? '暂停' : atLastFrame ? '重播' : '播放'}
-        </button>
-        <button type="button" className="demo-action" onClick={onReset}>
-          <span aria-hidden="true">↺</span>
-          重置
-        </button>
-      </div>
+      {gate ? (
+        <div className={`demo-gate demo-gate-${gate}`} role="status" aria-live="polite">
+          <div>
+            <strong>{gateTitle}</strong>
+            <span>{gateCopy}</span>
+          </div>
+          {gate === 'document' ? (
+            <button type="button" className="gate-action" onClick={onConfirmDocument}>
+              模拟确认文档合并
+            </button>
+          ) : null}
+          {gate === 'code' ? (
+            <button type="button" className="gate-action" onClick={onConfirmCode}>
+              模拟确认代码合并
+            </button>
+          ) : null}
+          {gate === 'retry' ? (
+            <button type="button" className="gate-action retry" onClick={onRetry}>
+              模拟重试当前阶段
+            </button>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -767,11 +984,11 @@ function NoticeBanner({
 
 export function App(): JSX.Element {
   const [demoMode, setDemoMode] = useState(false);
-  const [demoScenario, setDemoScenario] = useState<DemoScenarioKey>('running');
-  const [demoFrame, setDemoFrame] = useState(
-    () => getDemoScenario('running').frames.length - 1,
+  const [demoState, dispatchDemo] = useReducer(
+    demoReducer,
+    undefined,
+    () => createInitialDemoState(),
   );
-  const [demoPlaying, setDemoPlaying] = useState(false);
   const [realView, setRealView] = useState<PanelView | null>(null);
   const [fetchState, setFetchState] = useState<FetchState>('loading');
   const [lastRefreshAt, setLastRefreshAt] = useState<Date | null>(null);
@@ -779,6 +996,7 @@ export function App(): JSX.Element {
   const [scope, setScope] = useState<Scope>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [followCurrentNode, setFollowCurrentNode] = useState(true);
+  const [canvasFocused, setCanvasFocused] = useState(false);
   const hasUsableSnapshot = useRef(false);
 
   useEffect(() => {
@@ -834,23 +1052,13 @@ export function App(): JSX.Element {
   }, [demoMode]);
 
   useEffect(() => {
-    if (!demoMode || !demoPlaying) return;
-    const scenario = getDemoScenario(demoScenario);
-    if (demoFrame >= scenario.frames.length - 1) {
-      setDemoPlaying(false);
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      setDemoFrame((current) => Math.min(current + 1, scenario.frames.length - 1));
-    }, 1500);
+    if (!demoMode || !demoState.playing || !isDemoProgressEnabled(demoState)) return;
+    const timer = window.setTimeout(() => dispatchDemo({ type: 'TICK' }), 1500);
     return () => window.clearTimeout(timer);
-  }, [demoFrame, demoMode, demoPlaying, demoScenario]);
+  }, [demoMode, demoState]);
 
-  const demoView = useMemo(
-    () => buildDemoView(demoScenario, demoFrame),
-    [demoFrame, demoScenario],
-  );
-  const view = demoMode ? demoView : realView;
+  const demoScene = useMemo(() => buildDemoScene(demoState), [demoState]);
+  const view = demoMode ? demoScene.view : realView;
   const nodes = useMemo(() => scopeNodes(view, scope), [scope, view]);
   const selectedNode =
     nodes.find((node) => node.id === selectedNodeId) ??
@@ -858,6 +1066,14 @@ export function App(): JSX.Element {
     nodes[0] ??
     null;
   const currentNode = nodes.find((node) => node.current) ?? null;
+  const realFlow = useMemo(() => buildRealFlowDefinition(nodes), [nodes]);
+  const flowDefinition = demoMode ? demoScene.flow : realFlow;
+  const selectedFlowNode =
+    flowDefinition.nodes.find((node) => node.id === selectedNode?.id) ?? null;
+  const demoEvidence = useMemo(
+    () => (demoMode ? buildDemoEvidence(demoState, selectedNode?.id ?? null) : null),
+    [demoMode, demoState, selectedNode?.id],
+  );
 
   const effectiveScope = useMemo<Scope>(() => {
     if (!view || !scope) return null;
@@ -906,45 +1122,41 @@ export function App(): JSX.Element {
   const switchMode = (nextDemoMode: boolean) => {
     if (nextDemoMode === demoMode) return;
     setDemoMode(nextDemoMode);
-    setDemoPlaying(false);
+    dispatchDemo({ type: nextDemoMode ? 'RESET' : 'PAUSE' });
     setScope(null);
     setSelectedNodeId(null);
     setFollowCurrentNode(true);
+    setCanvasFocused(false);
     setStateIssue(null);
     setFetchState(nextDemoMode ? 'live' : realView ? 'live' : 'loading');
   };
 
-  const selectDemoScenario = (next: DemoScenarioKey) => {
-    const scenario = getDemoScenario(next);
-    setDemoScenario(next);
-    setDemoFrame(scenario.frames.length - 1);
-    setDemoPlaying(false);
-    setScope(null);
-    setSelectedNodeId(null);
-    setFollowCurrentNode(true);
-  };
-
   const toggleDemoPlayback = () => {
-    if (demoPlaying) {
-      setDemoPlaying(false);
+    if (demoState.playing) {
+      dispatchDemo({ type: 'PAUSE' });
       return;
     }
-    const scenario = getDemoScenario(demoScenario);
-    if (demoFrame >= scenario.frames.length - 1) setDemoFrame(0);
-    setDemoPlaying(true);
+    if (isDemoStepComplete(demoState)) {
+      dispatchDemo({ type: 'REPLAY' });
+      setFollowCurrentNode(true);
+      return;
+    }
+    dispatchDemo({ type: 'PLAY' });
   };
 
   const resetDemo = () => {
-    setDemoPlaying(false);
-    setDemoFrame(0);
+    dispatchDemo({ type: 'RESET' });
     setFollowCurrentNode(true);
-    const firstFrameView = buildDemoView(demoScenario, 0);
-    const firstNode =
-      firstFrameView.nodes.find((node) => node.current) ?? firstFrameView.nodes[0];
-    setSelectedNodeId(firstNode?.id ?? null);
+    setSelectedNodeId(null);
   };
 
+  const stepDemo = () => dispatchDemo({ type: 'NEXT' });
+  const confirmDocument = () => dispatchDemo({ type: 'CONFIRM_DOCUMENT' });
+  const confirmCode = () => dispatchDemo({ type: 'CONFIRM_CODE' });
+  const retryCheck = () => dispatchDemo({ type: 'RETRY_CHECK' });
+
   const scopeTitle = useMemo(() => {
+    if (demoMode) return `演示：${DEMO_STORY.title}`;
     if (effectiveScope?.type === 'request') {
       const request = view?.requests.find((item) => item.requestId === effectiveScope.id);
       return request?.summary ?? `${request?.targetReqId ?? '需求'} 文档变更`;
@@ -954,7 +1166,7 @@ export function App(): JSX.Element {
       return delivery ? `${delivery.reqId} 代码交付` : '代码交付';
     }
     return '当前全链路';
-  }, [effectiveScope, view]);
+  }, [demoMode, effectiveScope, view]);
 
   const connectionControllerOnline =
     demoMode || !view ? null : view.controllerOnline;
@@ -1024,39 +1236,58 @@ export function App(): JSX.Element {
         controllerOnline={connectionControllerOnline}
       />
 
-      <main className="workspace-shell">
-        <Sidebar view={view} scope={effectiveScope} onSelectScope={selectScope} />
+      <main className={`workspace-shell${canvasFocused ? ' is-canvas-focused' : ''}`}>
+        <Sidebar
+          view={view}
+          scope={effectiveScope}
+          onSelectScope={selectScope}
+          demoMode={demoMode}
+          demoState={demoState}
+        />
 
-        <section className="canvas-column" aria-label="固定流程画布">
+        <section className="canvas-column" aria-label="只读流程画布">
           <div className="canvas-heading">
             <div className="canvas-title-block">
               <span className="eyebrow">FLOW MAP</span>
               <h1>{scopeTitle}</h1>
               <p>
                 {view?.repo ? `${view.repo} · ` : ''}
-                八阶段流程仅展示状态证据
+                {demoMode
+                  ? '单一故事 · 主路径与异常回路 · 两次人工确认暂停'
+                  : '八阶段流程仅展示状态证据'}
               </p>
             </div>
-            <div className="canvas-focus">
-              <span>当前阶段</span>
-              <strong>{currentNode?.label ?? '尚未取得'}</strong>
-              {currentNode ? <StatusBadge status={currentNode.status} compact /> : null}
+            <div className="canvas-heading-actions">
+              <div className="canvas-focus">
+                <span>当前阶段</span>
+                <strong>{currentNode?.label ?? '尚未取得'}</strong>
+                {currentNode ? <StatusBadge status={currentNode.status} compact /> : null}
+              </div>
+              <button
+                type="button"
+                className="focus-toggle"
+                aria-pressed={canvasFocused}
+                onClick={() => setCanvasFocused((current) => !current)}
+              >
+                {canvasFocused ? '退出专注' : '专注画布'}
+              </button>
             </div>
           </div>
 
           {demoMode ? (
             <DemoControls
-              scenarioKey={demoScenario}
-              frameIndex={demoFrame}
-              playing={demoPlaying}
-              onScenarioChange={selectDemoScenario}
+              state={demoState}
               onTogglePlay={toggleDemoPlayback}
+              onNext={stepDemo}
               onReset={resetDemo}
+              onConfirmDocument={confirmDocument}
+              onConfirmCode={confirmCode}
+              onRetry={retryCheck}
             />
           ) : null}
 
           <FlowCanvas
-            nodes={nodes}
+            definition={flowDefinition}
             selectedNodeId={selectedNode?.id ?? null}
             onSelectNode={selectNode}
           />
@@ -1070,11 +1301,23 @@ export function App(): JSX.Element {
                 </span>
               ),
             )}
+            <span>
+              <i className="legend-dot legend-dormant" />
+              未触发分支
+            </span>
             <span className="canvas-hint">滚轮平移 · 拖动画布 · 控件缩放 · 键盘聚焦节点</span>
           </div>
         </section>
 
-        <DetailsPanel view={view} scope={effectiveScope} selectedNode={selectedNode} />
+        <DetailsPanel
+          view={view}
+          scope={effectiveScope}
+          selectedNode={selectedNode}
+          selectedFlowNode={selectedFlowNode}
+          demoMode={demoMode}
+          demoState={demoState}
+          demoEvidence={demoEvidence}
+        />
       </main>
     </div>
   );

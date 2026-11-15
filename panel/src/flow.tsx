@@ -2,74 +2,46 @@ import { memo, type JSX } from 'react';
 import {
   Background,
   BackgroundVariant,
+  BaseEdge,
   Controls,
+  EdgeLabelRenderer,
   Handle,
   MarkerType,
   MiniMap,
   Position,
   ReactFlow,
+  getSmoothStepPath,
   type Edge,
+  type EdgeProps,
   type Node,
   type NodeProps,
 } from '@xyflow/react';
-import type { CSSProperties } from 'react';
-import type { PanelNode, PanelStatus } from './types';
+import {
+  FLOW_EDGE_COLORS,
+  FLOW_STATUS_COLORS,
+  type FlowDefinition,
+  type FlowEdgeDefinition,
+  type FlowEdgeKind,
+  type FlowNodeDefinition,
+  type FlowNodeKind,
+  type FlowPoint,
+} from './flow-model';
+import type { PanelStatus } from './types';
 
-type StageNodeData = {
-  node: PanelNode;
-  index: number;
+type FlowNodeData = {
+  node: FlowNodeDefinition;
   onSelect: (nodeId: string) => void;
 } & Record<string, unknown>;
 
-type StageFlowNode = Node<StageNodeData, 'stage'>;
+type StageFlowNode = Node<FlowNodeData, 'stage'>;
 
-const STATUS_COLORS: Record<PanelStatus, string> = {
-  pending: '#607087',
-  running: '#22d3c5',
-  waiting: '#f4b84a',
-  succeeded: '#35d39a',
-  failed: '#f26d78',
-  stale: '#a78bfa',
-  unknown: '#8490a4',
-};
+type RoutedEdgeData = {
+  route?: FlowEdgeDefinition['route'];
+  color: string;
+  kind: FlowEdgeKind;
+} & Record<string, unknown>;
 
-// Static read-only nodes need initial bounds so React Flow can draw the MiniMap
-// before controlled node measurement changes are fed back into the parent.
-const NODE_WIDTH = 220;
-const NODE_HEIGHT = 128;
-
-const NODE_POSITIONS: Readonly<Record<number, { x: number; y: number }>> = {
-  0: { x: 0, y: 0 },
-  1: { x: 252, y: 0 },
-  2: { x: 504, y: 0 },
-  3: { x: 756, y: 0 },
-  4: { x: 756, y: 198 },
-  5: { x: 504, y: 198 },
-  6: { x: 252, y: 198 },
-  7: { x: 0, y: 198 },
-};
-
-const TARGET_HANDLES: Readonly<Record<number, { id: string; position: Position }>> = {
-  0: { id: 'target-left', position: Position.Left },
-  1: { id: 'target-left', position: Position.Left },
-  2: { id: 'target-left', position: Position.Left },
-  3: { id: 'target-left', position: Position.Left },
-  4: { id: 'target-top', position: Position.Top },
-  5: { id: 'target-right', position: Position.Right },
-  6: { id: 'target-right', position: Position.Right },
-  7: { id: 'target-right', position: Position.Right },
-};
-
-const SOURCE_HANDLES: Readonly<Record<number, { id: string; position: Position }>> = {
-  0: { id: 'source-right', position: Position.Right },
-  1: { id: 'source-right', position: Position.Right },
-  2: { id: 'source-right', position: Position.Right },
-  3: { id: 'source-bottom', position: Position.Bottom },
-  4: { id: 'source-left', position: Position.Left },
-  5: { id: 'source-left', position: Position.Left },
-  6: { id: 'source-left', position: Position.Left },
-  7: { id: 'source-left', position: Position.Left },
-};
+type FlowEdge = Edge<RoutedEdgeData, 'routed'>;
 
 const ALL_HANDLES = [
   { id: 'left', position: Position.Left },
@@ -88,7 +60,17 @@ const STATUS_TEXT: Record<PanelStatus, string> = {
   unknown: '未知',
 };
 
-function StageIcon({ id }: { id: string }): JSX.Element {
+const KIND_TEXT: Record<FlowNodeKind, string> = {
+  document: '文档与 PR',
+  execution: '执行阶段',
+  human: '人工关口',
+  decision: '检查与决策',
+  deployment: '部署阶段',
+  terminal: '完成节点',
+  branch: '未触发分支',
+};
+
+function StageIcon({ node }: { node: FlowNodeDefinition }): JSX.Element {
   const common = {
     width: 18,
     height: 18,
@@ -101,78 +83,87 @@ function StageIcon({ id }: { id: string }): JSX.Element {
     'aria-hidden': true,
   };
 
-  switch (id) {
-    case 'receive':
-      return (
-        <svg {...common}>
-          <path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5z" />
-          <path d="m4 7.5 8 4.5 8-4.5M12 12v9" />
-        </svg>
-      );
-    case 'docs-pr':
-      return (
-        <svg {...common}>
-          <path d="M6 3h8l4 4v14H6z" />
-          <path d="M14 3v5h5M9 12h6M9 16h6" />
-        </svg>
-      );
-    case 'docs-confirm':
-      return (
-        <svg {...common}>
-          <circle cx="12" cy="8" r="4" />
-          <path d="M5 21a7 7 0 0 1 12.5-4.2M17 17l2 2 3-4" />
-        </svg>
-      );
-    case 'sync-task':
-      return (
-        <svg {...common}>
-          <path d="M4 7h12l-3-3M20 17H8l3 3" />
-          <path d="M18 5v4h-4M6 19v-4h4" />
-        </svg>
-      );
-    case 'code-verify':
-      return (
-        <svg {...common}>
-          <path d="m8 8-4 4 4 4M16 8l4 4-4 4M14 4l-4 16" />
-        </svg>
-      );
-    case 'code-confirm':
-      return (
-        <svg {...common}>
-          <path d="M5 3h10l4 4v14H5z" />
-          <path d="M15 3v5h5M8 13l2 2 4-5M8 18h7" />
-        </svg>
-      );
-    case 'build-deploy':
-      return (
-        <svg {...common}>
-          <path d="M12 3v10M8 9l4 4 4-4" />
-          <path d="M5 14v5h14v-5" />
-        </svg>
-      );
-    default:
-      return (
-        <svg {...common}>
-          <path d="M3 12h4l2-5 4 10 2-5h6" />
-        </svg>
-      );
+  if (node.kind === 'document') {
+    return (
+      <svg {...common}>
+        <path d="M6 3h8l4 4v14H6z" />
+        <path d="M14 3v5h5M9 12h6M9 16h6" />
+      </svg>
+    );
   }
+
+  if (node.kind === 'human') {
+    return (
+      <svg {...common}>
+        <circle cx="12" cy="8" r="4" />
+        <path d="M5 21a7 7 0 0 1 12.5-4.2M17 17l2 2 3-4" />
+      </svg>
+    );
+  }
+
+  if (node.kind === 'decision') {
+    return (
+      <svg {...common}>
+        <path d="m12 3 9 9-9 9-9-9z" />
+        <path d="m8.5 12 2.2 2.2 4.8-5" />
+      </svg>
+    );
+  }
+
+  if (node.kind === 'deployment') {
+    return (
+      <svg {...common}>
+        <path d="M12 3v10M8 9l4 4 4-4" />
+        <path d="M5 14v5h14v-5" />
+      </svg>
+    );
+  }
+
+  if (node.kind === 'branch') {
+    return (
+      <svg {...common}>
+        <path d="M6 5v4c0 3 3 4 6 4s6 1 6 4v2" />
+        <path d="m15 16 3 3 3-3M3 16l3 3 3-3" />
+      </svg>
+    );
+  }
+
+  if (node.kind === 'terminal') {
+    return (
+      <svg {...common}>
+        <circle cx="12" cy="12" r="9" />
+        <path d="m8 12 2.5 2.5L16 9" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg {...common}>
+      <path d="M4 7h12l-3-3M20 17H8l3 3" />
+      <path d="M18 5v4h-4M6 19v-4h4" />
+    </svg>
+  );
 }
 
 const StageNodeCard = memo(function StageNodeCard({
   data,
   selected,
 }: NodeProps<StageFlowNode>): JSX.Element {
-  const { node, index, onSelect } = data;
-  const target = TARGET_HANDLES[index];
-  const source = SOURCE_HANDLES[index];
+  const { node, onSelect } = data;
+  const statusText = node.dormant
+    ? '未触发'
+    : (node.stateLabel ?? STATUS_TEXT[node.status]);
 
   return (
     <div
-      className={`stage-node status-${node.status}${node.current ? ' is-current' : ''}${
-        selected ? ' is-selected' : ''
+      className={`stage-node kind-${node.kind} status-${node.status}${
+        node.current ? ' is-current' : ''
+      }${selected ? ' is-selected' : ''}${node.dormant ? ' is-dormant' : ''}${
+        node.compact ? ' is-compact' : ''
       }`}
       data-status={node.status}
+      data-kind={node.kind}
+      style={{ width: node.width, minHeight: node.height }}
     >
       {ALL_HANDLES.map((handle) => (
         <Handle
@@ -181,7 +172,7 @@ const StageNodeCard = memo(function StageNodeCard({
           type="target"
           position={handle.position}
           isConnectable={false}
-          className={target?.id === `target-${handle.id}` ? 'stage-handle is-used' : 'stage-handle'}
+          className="stage-handle is-used"
         />
       ))}
       {ALL_HANDLES.map((handle) => (
@@ -191,7 +182,7 @@ const StageNodeCard = memo(function StageNodeCard({
           type="source"
           position={handle.position}
           isConnectable={false}
-          className={source?.id === `source-${handle.id}` ? 'stage-handle is-used' : 'stage-handle'}
+          className="stage-handle is-used"
         />
       ))}
 
@@ -199,17 +190,15 @@ const StageNodeCard = memo(function StageNodeCard({
         type="button"
         className="stage-node-button"
         aria-pressed={selected}
-        aria-label={`${node.label}，第 ${index + 1} 阶段，${STATUS_TEXT[node.status]}，${
-          node.detail
-        }`}
+        aria-label={`${node.label}，${KIND_TEXT[node.kind]}，${statusText}，${node.detail}`}
         onClick={(event) => {
           event.stopPropagation();
           onSelect(node.id);
         }}
       >
-        <span className="stage-index">{String(index + 1).padStart(2, '0')}</span>
+        <span className="stage-index">{node.indexLabel}</span>
         <span className="stage-icon">
-          <StageIcon id={node.id} />
+          <StageIcon node={node} />
         </span>
         <span className="stage-copy">
           <span className="stage-title">{node.label}</span>
@@ -217,7 +206,7 @@ const StageNodeCard = memo(function StageNodeCard({
         </span>
         <span className="stage-state">
           <span className="state-dot" />
-          {STATUS_TEXT[node.status]}
+          {statusText}
         </span>
         {node.current ? <span className="current-marker">当前</span> : null}
       </button>
@@ -229,105 +218,190 @@ const NODE_TYPES = {
   stage: StageNodeCard,
 };
 
+function pointDistance(a: FlowPoint, b: FlowPoint): number {
+  return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+function routePath(points: FlowPoint[]): { path: string; label: FlowPoint } {
+  const path = points
+    .map((point, index) => `${index === 0 ? 'M' : 'L'}${point.x},${point.y}`)
+    .join(' ');
+  let longest = { length: -1, start: points[0]!, end: points[1] ?? points[0]! };
+
+  for (let index = 1; index < points.length; index += 1) {
+    const start = points[index - 1]!;
+    const end = points[index]!;
+    const length = pointDistance(start, end);
+    if (length > longest.length) longest = { length, start, end };
+  }
+
+  return {
+    path,
+    label: {
+      x: (longest.start.x + longest.end.x) / 2,
+      y: (longest.start.y + longest.end.y) / 2,
+    },
+  };
+}
+
+function RoutedEdge({
+  sourceX,
+  sourceY,
+  sourcePosition,
+  targetX,
+  targetY,
+  targetPosition,
+  data,
+  label,
+  markerEnd,
+  style,
+  interactionWidth,
+}: EdgeProps<FlowEdge>): JSX.Element {
+  const routed = data?.route
+    ? routePath([
+        { x: sourceX, y: sourceY },
+        ...data.route.waypoints,
+        { x: targetX, y: targetY },
+      ])
+    : null;
+  const [smoothPath, smoothLabelX, smoothLabelY] = getSmoothStepPath({
+    sourceX,
+    sourceY,
+    sourcePosition,
+    targetX,
+    targetY,
+    targetPosition,
+    borderRadius: 8,
+    offset: 16,
+  });
+  const path = routed?.path ?? smoothPath;
+  const labelPosition = data?.route?.labelPosition ?? routed?.label ?? {
+    x: smoothLabelX,
+    y: smoothLabelY,
+  };
+
+  return (
+    <>
+      <BaseEdge
+        path={path}
+        markerEnd={markerEnd}
+        style={{ ...style, strokeLinecap: 'round', strokeLinejoin: 'round' }}
+        interactionWidth={interactionWidth}
+      />
+      {label ? (
+        <EdgeLabelRenderer>
+          <span
+            className="flow-edge-label"
+            style={{
+              color: data?.color,
+              transform: `translate(-50%, -50%) translate(${labelPosition.x}px, ${labelPosition.y}px)`,
+            }}
+          >
+            {label}
+          </span>
+        </EdgeLabelRenderer>
+      ) : null}
+    </>
+  );
+}
+
+const EDGE_TYPES = {
+  routed: RoutedEdge,
+};
+
 function toFlowNodes(
-  nodes: PanelNode[],
+  definition: FlowDefinition,
   selectedNodeId: string | null,
   onSelectNode: (nodeId: string) => void,
 ): StageFlowNode[] {
-  return nodes.slice(0, 8).map((node, index) => ({
+  return definition.nodes.map((node) => ({
     id: node.id,
     type: 'stage',
-    position: NODE_POSITIONS[index] ?? { x: 0, y: 0 },
-    initialWidth: NODE_WIDTH,
-    initialHeight: NODE_HEIGHT,
-    data: { node, index, onSelect: onSelectNode },
+    position: node.position,
+    initialWidth: node.width,
+    initialHeight: node.height,
+    style: { width: node.width, height: node.height },
+    data: { node, onSelect: onSelectNode },
     selected: node.id === selectedNodeId,
     draggable: false,
     connectable: false,
     deletable: false,
-    ariaLabel: `${node.label}，${STATUS_TEXT[node.status]}，${node.detail}`,
+    ariaLabel: `${node.label}，${KIND_TEXT[node.kind]}，${
+      node.dormant ? '未触发' : (node.stateLabel ?? STATUS_TEXT[node.status])
+    }，${node.detail}`,
   }));
 }
 
-function edgeKind(source: PanelNode, target: PanelNode): 'done' | 'active' | 'failed' | 'pending' {
-  if (target.status === 'failed') return 'failed';
-  if (
-    target.current &&
-    (target.status === 'running' || target.status === 'waiting')
-  ) {
-    return 'active';
-  }
-  if (source.status === 'succeeded' && target.status === 'succeeded') return 'done';
-  return 'pending';
-}
-
-function toFlowEdges(nodes: PanelNode[]): Edge[] {
-  return nodes.slice(0, -1).flatMap((source, index) => {
-    const target = nodes[index + 1];
-    if (!target) return [];
-    const sourceHandle = SOURCE_HANDLES[index];
-    const targetHandle = TARGET_HANDLES[index + 1];
-    if (!sourceHandle || !targetHandle) return [];
-
-    const kind = edgeKind(source, target);
-    const color =
-      kind === 'failed' ? '#f26d78' : kind === 'active' ? '#22d3c5' : kind === 'done' ? '#35d39a' : '#425168';
-    const style: CSSProperties = {
-      stroke: color,
-      strokeWidth: kind === 'pending' ? 1.5 : 2,
-      strokeDasharray: kind === 'failed' ? '6 5' : undefined,
-    };
-
-    return [
-      {
-        id: `${source.id}-${target.id}`,
-        source: source.id,
-        target: target.id,
-        sourceHandle: sourceHandle.id,
-        targetHandle: targetHandle.id,
-        type: 'smoothstep',
-        animated: kind === 'active',
-        className: `flow-edge edge-${kind}`,
-        style,
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          color,
-          width: 14,
-          height: 14,
-        },
+function toFlowEdges(definition: FlowDefinition): FlowEdge[] {
+  return definition.edges.map((edge) => {
+    const color = FLOW_EDGE_COLORS[edge.kind];
+    return {
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      sourceHandle: edge.sourceHandle,
+      targetHandle: edge.targetHandle,
+      type: 'routed',
+      animated: edge.animated,
+      className: `flow-edge edge-${edge.kind}${edge.kind === 'dormant' ? ' edge-dormant' : ''}`,
+      label: edge.label,
+      data: {
+        route: edge.route,
+        color: edge.kind === 'dormant' ? '#698094' : color,
+        kind: edge.kind,
       },
-    ];
+      style: {
+        stroke: color,
+        strokeWidth: edge.kind === 'pending' || edge.kind === 'dormant' ? 1.25 : 1.8,
+        strokeDasharray:
+          edge.kind === 'failed'
+            ? '6 5'
+            : edge.kind === 'retry'
+              ? '3 4'
+              : edge.kind === 'dormant'
+                ? '2 5'
+                : undefined,
+      },
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color,
+        width: 12,
+        height: 12,
+      },
+    } satisfies FlowEdge;
   });
 }
 
 function minimapColor(node: Node): string {
-  const data = node.data as StageNodeData | undefined;
-  return data?.node ? STATUS_COLORS[data.node.status] : STATUS_COLORS.unknown;
+  const data = node.data as FlowNodeData | undefined;
+  if (data?.node?.dormant) return '#26384a';
+  return data?.node ? FLOW_STATUS_COLORS[data.node.status] : FLOW_STATUS_COLORS.unknown;
 }
 
 interface FlowCanvasProps {
-  nodes: PanelNode[];
+  definition: FlowDefinition;
   selectedNodeId: string | null;
   onSelectNode: (nodeId: string) => void;
 }
 
 export function FlowCanvas({
-  nodes,
+  definition,
   selectedNodeId,
   onSelectNode,
 }: FlowCanvasProps): JSX.Element {
-  const flowNodes = toFlowNodes(nodes, selectedNodeId, onSelectNode);
-  const flowEdges = toFlowEdges(nodes);
+  const flowNodes = toFlowNodes(definition, selectedNodeId, onSelectNode);
+  const flowEdges = toFlowEdges(definition);
 
   return (
-    <div className="flow-canvas" aria-label="八阶段只读流程画布">
-      <ReactFlow<StageFlowNode, Edge>
+    <div className="flow-canvas" aria-label={`${definition.nodes.length} 节点只读流程画布`}>
+      <ReactFlow<StageFlowNode, FlowEdge>
         nodes={flowNodes}
         edges={flowEdges}
         nodeTypes={NODE_TYPES}
+        edgeTypes={EDGE_TYPES}
         fitView
-        fitViewOptions={{ padding: 0.16 }}
-        minZoom={0.42}
+        fitViewOptions={{ padding: 0.12 }}
+        minZoom={0.32}
         maxZoom={1.35}
         nodesDraggable={false}
         nodesConnectable={false}
@@ -356,7 +430,7 @@ export function FlowCanvas({
           zoomable
           nodeColor={minimapColor}
           nodeStrokeColor="rgba(255,255,255,0.2)"
-          nodeBorderRadius={4}
+          nodeBorderRadius={3}
           maskColor="rgba(4, 11, 22, 0.72)"
         />
       </ReactFlow>
@@ -364,4 +438,4 @@ export function FlowCanvas({
   );
 }
 
-export { STATUS_COLORS, STATUS_TEXT };
+export { FLOW_STATUS_COLORS as STATUS_COLORS, STATUS_TEXT };
