@@ -1,4 +1,4 @@
-import { memo, type JSX } from 'react';
+import { memo, useCallback, useEffect, useRef, type JSX } from 'react';
 import {
   Background,
   BackgroundVariant,
@@ -15,6 +15,7 @@ import {
   type EdgeProps,
   type Node,
   type NodeProps,
+  type ReactFlowInstance,
 } from '@xyflow/react';
 import {
   FLOW_EDGE_COLORS,
@@ -42,6 +43,11 @@ type RoutedEdgeData = {
 } & Record<string, unknown>;
 
 type FlowEdge = Edge<RoutedEdgeData, 'routed'>;
+
+const FIT_VIEW_OPTIONS = {
+  padding: 0.12,
+  maxZoom: 1.35,
+};
 
 const ALL_HANDLES = [
   { id: 'left', position: Position.Left },
@@ -389,18 +395,97 @@ export function FlowCanvas({
   selectedNodeId,
   onSelectNode,
 }: FlowCanvasProps): JSX.Element {
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const flowRef = useRef<ReactFlowInstance<StageFlowNode, FlowEdge> | null>(null);
+  const fitFrameRef = useRef<number | null>(null);
   const flowNodes = toFlowNodes(definition, selectedNodeId, onSelectNode);
   const flowEdges = toFlowEdges(definition);
+  const topologySignature = [
+    definition.sequenceTotal,
+    ...definition.nodes.map((node) => [
+      node.id,
+      node.kind,
+      node.position.x,
+      node.position.y,
+      node.width,
+      node.height,
+    ].join(':')),
+    ...definition.edges.map((edge) => [
+      edge.source,
+      edge.target,
+      edge.sourceHandle,
+      edge.targetHandle,
+      edge.route?.waypoints.map((point) => `${point.x},${point.y}`).join(';') ?? '',
+      edge.route?.labelPosition
+        ? `${edge.route.labelPosition.x},${edge.route.labelPosition.y}`
+        : '',
+    ].join(':')),
+  ].join('|');
+
+  const requestFit = useCallback(() => {
+    if (fitFrameRef.current !== null) window.cancelAnimationFrame(fitFrameRef.current);
+
+    fitFrameRef.current = window.requestAnimationFrame(() => {
+      fitFrameRef.current = window.requestAnimationFrame(() => {
+        fitFrameRef.current = null;
+        const instance = flowRef.current;
+        const canvas = canvasRef.current;
+        if (!instance || !canvas) return;
+        const { width, height } = canvas.getBoundingClientRect();
+        if (width < 1 || height < 1) return;
+        void instance.fitView(FIT_VIEW_OPTIONS);
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    requestFit();
+  }, [requestFit, topologySignature]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    let previous = { width: 0, height: 0 };
+    const observer = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect;
+      if (!rect) return;
+      const width = Math.round(rect.width * 100) / 100;
+      const height = Math.round(rect.height * 100) / 100;
+      if (width < 1 || height < 1) return;
+      if (
+        Math.abs(width - previous.width) < 0.5 &&
+        Math.abs(height - previous.height) < 0.5
+      ) {
+        return;
+      }
+      previous = { width, height };
+      requestFit();
+    });
+
+    observer.observe(canvas);
+    return () => {
+      observer.disconnect();
+      if (fitFrameRef.current !== null) {
+        window.cancelAnimationFrame(fitFrameRef.current);
+        fitFrameRef.current = null;
+      }
+    };
+  }, [requestFit]);
 
   return (
-    <div className="flow-canvas" aria-label={`${definition.nodes.length} 节点只读流程画布`}>
+    <div
+      ref={canvasRef}
+      className="flow-canvas"
+      aria-label={`${definition.nodes.length} 节点只读流程画布`}
+    >
       <ReactFlow<StageFlowNode, FlowEdge>
         nodes={flowNodes}
         edges={flowEdges}
         nodeTypes={NODE_TYPES}
         edgeTypes={EDGE_TYPES}
         fitView
-        fitViewOptions={{ padding: 0.12 }}
+        fitViewOptions={FIT_VIEW_OPTIONS}
         minZoom={0.32}
         maxZoom={1.35}
         nodesDraggable={false}
@@ -414,6 +499,10 @@ export function FlowCanvas({
         multiSelectionKeyCode={null}
         zoomOnDoubleClick={false}
         panOnScroll
+        onInit={(instance) => {
+          flowRef.current = instance;
+          requestFit();
+        }}
         onNodeClick={(_event, node) => onSelectNode(node.id)}
         proOptions={{ hideAttribution: false }}
       >

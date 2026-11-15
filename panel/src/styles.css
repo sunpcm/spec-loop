@@ -89,6 +89,7 @@ a {
   position: relative;
   z-index: 5;
   display: grid;
+  grid-row: 1;
   grid-template-columns: minmax(220px, 1fr) auto auto;
   align-items: center;
   gap: 24px;
@@ -332,6 +333,7 @@ a {
 
 .notice-banner {
   display: flex;
+  grid-row: 2;
   align-items: center;
   gap: 10px;
   min-height: 34px;
@@ -368,6 +370,7 @@ a {
 
 .workspace-shell {
   display: grid;
+  grid-row: 3;
   grid-template-columns: 228px minmax(0, 1fr) 296px;
   gap: 12px;
   min-width: 0;
@@ -1965,6 +1968,10 @@ a {
     min-height: auto;
   }
 
+  .workspace-shell.is-canvas-focused {
+    grid-template-areas: "canvas";
+  }
+
   .canvas-column {
     grid-area: canvas;
     height: 650px;
@@ -2006,7 +2013,8 @@ a {
   }
 
   .canvas-column {
-    height: 690px;
+    height: auto;
+    min-height: 690px;
   }
 
   .canvas-heading {
