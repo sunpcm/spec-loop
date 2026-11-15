@@ -246,6 +246,7 @@ async function applyRemotePRState(deps: SpecIntakeDeps, req: SpecRequest, pr: Ma
         target.stage = 'pr-merged';
         target.prNumber = pr.number;
         target.prUrl = pr.url ?? prUrl(deps, pr.number);
+        if (pr.mergeCommitSha) target.mergedMainSha = pr.mergeCommitSha;
         target.labelsSynced = true;
         target.error = undefined;
         target.failureStage = undefined;

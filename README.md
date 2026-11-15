@@ -124,6 +124,7 @@ npm run demo
 | [飞书需求入口计划](docs/development/feishu-intake-plan.md) | 入口范围、阶段恢复与验收要求 |
 | [飞书受控确认合并 PR](docs/development/feishu-merge-plan.md) | 用户预检、二次确认、受管 PR 边界与恢复 |
 | [Vercel 静态前端](docs/development/vercel-setup.md) | 静态站配置与云端发布边界 |
+| [本机只读流程面板](docs/development/local-panel.md) | React Flow 流程视图、请求与交付证据、合成演示边界 |
 | [需求与验收](docs/development/requirements.md) | 编排系统的需求与验收设计，含后置范围 |
 | [架构与运行契约](docs/development/architecture.md) | 角色隔离、版本管理与故障恢复设计，含目标设计 |
 

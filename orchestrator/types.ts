@@ -111,6 +111,8 @@ export interface SpecRequest {
   commitSHA?: string;
   prNumber?: number;
   prUrl?: string;
+  /** 文档 PR 合并后落盘的 merge commit SHA；用于面板把文档请求与代码 job 严格关联，不参与调度/合并/恢复语义。 */
+  mergedMainSha?: string;
   /** spec-patch 标签是否已经由控制器确认。false 时可从远端幂等补齐。 */
   labelsSynced?: boolean;
   error?: string;
