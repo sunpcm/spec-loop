@@ -21,6 +21,18 @@
 
 当前 Vercel CLI 不进入 Demo 主链路，控制器不调用 Vercel。仓库 `.gitignore` 忽略本地 `.vercel/` 链接目录。
 
+## 自定义域名
+
+生产入口使用 `https://spec-loop.biubiuniu.com/`，原 `https://spec-loop-three.vercel.app/` 保留用于排障；两个域名指向同一个 Vercel Production 部署。
+
+- Vercel 项目 `spec-loop` 绑定 `spec-loop.biubiuniu.com`，不指定 Preview 分支或重定向。
+- `biubiuniu.com` 的权威 DNS 继续由 Cloudflare 管理；只为 `spec-loop` 添加 CNAME，不迁移 nameserver。
+- CNAME 目标使用 Vercel 为该项目推荐的值；2026-11-15 为 `f902b05b6eee94d6.vercel-dns-017.com`，后续调整先重新查询项目域名配置。
+- Cloudflare 记录设置为 DNS only（灰云），TTL 300 秒，不启用该记录的 CNAME flattening。HTTPS 证书由 Vercel 管理。
+- Vercel Authentication 使用 **All Deployments**；Standard Protection 不保护自定义生产域名。验收必须分别检查未登录访问被要求认证，以及认证后页面和 `/version.json` 正常。
+
+新增域名不会把本地控制器、Pi Worker 或飞书长连接迁移到云上，也不会发布本地尚未推送的提交。
+
 ## 版本与健康标识
 
 `vite.config.ts` 写入 `__APP_VERSION__`，并在构建产物生成格式固定的 `dist/version.json`：
@@ -46,7 +58,7 @@
 Vercel production URL 确定后，只在本地 `.env.local` 增加非秘密配置：
 
 ```dotenv
-SPEC_LOOP_PUBLIC_URL=https://spec-loop.vercel.app
+SPEC_LOOP_PUBLIC_URL=https://spec-loop.biubiuniu.com/
 ```
 
 加载配置时会校验 URL：非空值必须使用 `https`，且不得包含用户名或口令；无效值会让控制器在启动时明确失败。
@@ -55,10 +67,12 @@ SPEC_LOOP_PUBLIC_URL=https://spec-loop.vercel.app
 
 ```text
 🚀 本地已部署：<SHA>（健康检查通过）
-公网入口（Vercel独立发布）：https://spec-loop.vercel.app/
+公网入口（Vercel独立发布）：https://spec-loop.biubiuniu.com/
 ```
 
 `status:done` 的判定仍是本地发布健康检查，不代表 Vercel 已部署或 Ready 当前 SHA。Vercel URL 缺失或无法访问不会改变本地部署结果，URL 存在也不会把本地部署失败改成成功。
+
+`SPEC_LOOP_PUBLIC_URL` 在控制器启动时读取；修改 `.env.local` 后，需要在当前作业结束后安全重启才能让后续回执使用新地址。控制器未运行时，下次正常启动即可加载。
 
 ## 运行边界
 

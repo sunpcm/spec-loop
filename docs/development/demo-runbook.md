@@ -39,7 +39,7 @@ SPEC_LOOP_HTTP_PORT=4000
 SPEC_LOOP_PREVIEW_PORT=5173
 SPEC_LOOP_DEV_PORT=5174
 # Vercel 独立静态站正式入口；当前需账号登录
-SPEC_LOOP_PUBLIC_URL=https://spec-loop-three.vercel.app/
+SPEC_LOOP_PUBLIC_URL=https://spec-loop.biubiuniu.com/
 ```
 加载配置的进程必须显式指定文件。每个运行 `demo:*` 的终端都执行：
 ```bash
