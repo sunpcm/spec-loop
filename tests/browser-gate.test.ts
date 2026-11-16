@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { dirname, join, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -611,7 +611,12 @@ test('runBrowserGate 冻结副本与源套件修改隔离，且同 job 不读旧
       assert.equal(readFileSync(join(opts.cwd, 'tests', 'e2e', 'counter.spec.ts'), 'utf8'), "test('E2E-CNT-001 x', () => {});\n");
       assert.equal(opts.cliArgs[5], join(opts.cwd, 'playwright.config.ts'));
       assert.equal(opts.spec.writableDirs.length, 1);
-      assert.ok(opts.cwd !== jobTmp && !opts.cwd.startsWith(`${jobTmp}${sep}`));
+      const normalizedCwd = realpathSync(resolve(opts.cwd));
+      for (const writableDir of opts.spec.writableDirs) {
+        const normalizedWritable = realpathSync(resolve(writableDir));
+        const rel = relative(normalizedWritable, normalizedCwd);
+        assert.ok(rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+      }
       writeFileSync(sourceSuitePath, "test('E2E-CNT-001 changed', () => {});\n", 'utf8');
       assert.equal(readFileSync(join(opts.cwd, 'tests', 'e2e', 'counter.spec.ts'), 'utf8'), "test('E2E-CNT-001 x', () => {});\n");
       const reportDir = opts.env.SPEC_LOOP_E2E_REPORT_DIR;

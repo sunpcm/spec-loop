@@ -399,6 +399,40 @@ test('code-confirm 节点 detail 与状态一致，不出现“已成功但未�
   assert.equal(pendingNode.detail, '尚未执行');
 });
 
+test('satisfied 面板保留待补回执，不误报部署或回执完成', () => {
+  const raw = realWorldState();
+  raw.jobs = {
+    'job-satisfied': job({
+      jobId: 'job-satisfied',
+      status: 'satisfied',
+      candidateTreeSha: 'a'.repeat(40),
+      resumeAction: 'sync-satisfied-receipt',
+      prNumber: undefined,
+    }),
+  };
+  raw.deploy = { activeSha: null, releaseDir: null, deployedPRs: [], deployFailedPRs: [] };
+  const view = viewOf(raw);
+  const node = (id: string) => view.deliveryGroups[0]!.nodes.find((item) => item.id === id);
+  assert.equal(node('code-confirm')?.status, 'waiting');
+  assert.match(node('code-confirm')?.detail ?? '', /回执待补/);
+  assert.match(node('build-deploy')?.detail ?? '', /无需部署/);
+  assert.equal(node('health-receipt')?.status, 'pending');
+  assert.match(node('health-receipt')?.detail ?? '', /回执待补/);
+  assert.equal(view.deliveryGroups[0]?.attempts[0]?.deployStatus, 'none');
+
+  raw.jobs = {
+    'job-satisfied': job({
+      jobId: 'job-satisfied',
+      status: 'satisfied',
+      candidateTreeSha: 'a'.repeat(40),
+      prNumber: undefined,
+    }),
+  };
+  const receiptDone = viewOf(raw).deliveryGroups[0]!.nodes;
+  assert.equal(receiptDone.find((item) => item.id === 'health-receipt')?.status, 'pending');
+  assert.doesNotMatch(receiptDone.find((item) => item.id === 'health-receipt')?.detail ?? '', /回执待补/);
+});
+
 test('parsePanelArgs：--port 等于 --control-port 且开启探测时拒绝，--no-control 允许', () => {
   assert.throws(() => parsePanelArgs(['--port', '4000', '--control-port', '4000']), /相同|不同端口|no-control/);
   assert.doesNotThrow(() => parsePanelArgs(['--port', '4000', '--control-port', '4000', '--no-control']));

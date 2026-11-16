@@ -86,6 +86,64 @@ test.describe('REQ-CNT-01 计数器真实浏览器验收', () => {
     await expect(page.locator('#error-panel')).toBeVisible();
     await expect(page.locator('#counter-value')).toHaveText('0');
   });
+
+  test('E2E-CNT-007 正数 7 重置为 0 并保留步长', async ({ page }) => {
+    await page.locator('#step-input').fill('7');
+    await increment(page);
+    await expect(page.locator('#counter-value')).toHaveText('7');
+
+    await expectResetKeepsStep(page, '7');
+    await increment(page);
+    await expect(page.locator('#counter-value')).toHaveText('7');
+  });
+
+  test('E2E-CNT-008 负数 -5 重置为 0 并保留步长', async ({ page }) => {
+    await page.locator('#step-input').fill('5');
+    await page.locator('#decrement-button').click();
+    await expect(page.locator('#counter-value')).toHaveText('-5');
+
+    await expectResetKeepsStep(page, '5');
+    await page.locator('#decrement-button').click();
+    await expect(page.locator('#counter-value')).toHaveText('-5');
+  });
+
+  test('E2E-CNT-009 当前值为 0 时重置仍为 0 并保留步长', async ({ page }) => {
+    await page.locator('#step-input').fill('4');
+    await expect(page.locator('#counter-value')).toHaveText('0');
+
+    await expectResetKeepsStep(page, '4');
+    await increment(page);
+    await expect(page.locator('#counter-value')).toHaveText('4');
+  });
+
+  test('E2E-CNT-010 翻倍得到非 0 后重置为 0 并保留步长', async ({ page }) => {
+    await page.locator('#step-input').fill('5');
+    await increment(page);
+    await page.locator('#double-button').click();
+    await expect(page.locator('#counter-value')).toHaveText('10');
+
+    await expectResetKeepsStep(page, '5');
+    await increment(page);
+    await expect(page.locator('#counter-value')).toHaveText('5');
+  });
+
+  test('E2E-CNT-011 非法步长后重置为 0 并保留输入', async ({ page }) => {
+    await page.locator('#step-input').fill('3');
+    await increment(page);
+    await expect(page.locator('#counter-value')).toHaveText('3');
+
+    await page.locator('#step-input').fill('not-a-number');
+    await increment(page);
+    await expect(page.locator('#error-panel')).toBeVisible();
+    await expect(page.locator('#counter-value')).toHaveText('3');
+
+    await page.locator('#reset-button').click();
+    await expect(page.locator('#counter-value')).toHaveText('0');
+    await expect(page.locator('#step-input')).toHaveValue('not-a-number');
+    await increment(page);
+    await expect(page.locator('#error-panel')).toBeVisible();
+    await expect(page.locator('#counter-value')).toHaveText('0');
+  });
 });
 
 async function openCounter(page: Page): Promise<void> {
@@ -98,4 +156,10 @@ async function openCounter(page: Page): Promise<void> {
 
 async function increment(page: Page): Promise<void> {
   await page.locator('#counter-form button[type="submit"]').click();
+}
+
+async function expectResetKeepsStep(page: Page, step: string): Promise<void> {
+  await page.locator('#reset-button').click();
+  await expect(page.locator('#counter-value')).toHaveText('0');
+  await expect(page.locator('#step-input')).toHaveValue(step);
 }

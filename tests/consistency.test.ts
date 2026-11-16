@@ -664,6 +664,58 @@ test('R2 重试：经 retryWorker 生命周期成功后新 job 与 PR 状态可�
   }
 });
 
+test('R2 重试：satisfied 成功无 PR/部署，重试及待补回执不重跑 Worker', async () => {
+  const h1 = hashOf(specDoc(REQ_A, 'v1'));
+  const { dir, store } = makeStore(stateWith({
+    requirements: { [REQ_A]: requirement(12, h1) },
+    jobs: {
+      j1: job({
+        jobId: 'j1',
+        issueNumber: 12,
+        status: 'failed',
+        failureStage: 'verify',
+        resumeAction: 'worker',
+        specHash: h1,
+      }),
+    },
+  }));
+  try {
+    let retryCalls = 0;
+    const deps = commandDeps(
+      store,
+      { readSpecSnapshot: async () => ({ 'docs/specs/a.md': specDoc(REQ_A, 'v1') }) },
+      deployFixture(store, []).ctx,
+      async () => {
+        retryCalls += 1;
+        return { status: 'satisfied', candidateTreeSha: 'a'.repeat(40) };
+      },
+    );
+    const retried = await createCommands(deps).retry(12);
+    assert.match(retried, /已验收无需代码变更/);
+    assert.match(retried, /未创建代码 PR/);
+    assert.match(retried, /未部署/);
+    assert.equal(retryCalls, 1);
+    assert.equal(store.snapshot().deploy.activeSha, null);
+
+    await store.update((s) => {
+      const current = s.jobs.j1;
+      assert.ok(current);
+      current.status = 'satisfied';
+      current.candidateTreeSha = 'a'.repeat(40);
+      current.resumeAction = 'sync-satisfied-receipt';
+      return undefined;
+    });
+    const pendingReceipt = await createCommands(deps).retry(12);
+    assert.match(pendingReceipt, /未创建代码 PR/);
+    assert.match(pendingReceipt, /未部署/);
+    assert.match(pendingReceipt, /回执待补/);
+    assert.equal(retryCalls, 1);
+    assert.equal(store.snapshot().deploy.activeSha, null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('R2 重试：retryWorker 未接线时明确拒绝，不进入旧重跑路径', async () => {
   const h1 = hashOf(specDoc(REQ_A, 'v1'));
   const { dir, store } = makeStore(stateWith({

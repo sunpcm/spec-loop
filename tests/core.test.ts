@@ -161,6 +161,27 @@ test('pickWorkerTargets 旧 revision 高 attempt 不遮盖新 revision 的首次
   assert.equal(targets[0]?.sourceMainSha, 's2');
 });
 
+test('pickWorkerTargets 跳过 satisfied 作业，禁止重复处理同 revision', () => {
+  const state = makeState(
+    { 'REQ-A-01': { issueNumber: 1, specHash: 'h1', specPath: 'docs/specs/REQ-A-01.md', sourceMainSha: 's1' } },
+    {
+      sat: {
+        jobId: 'sat',
+        reqId: 'REQ-A-01',
+        issueNumber: 1,
+        specHash: 'h1',
+        sourceMainSha: 's1',
+        attempt: 1,
+        status: 'satisfied',
+        candidateTreeSha: 'a'.repeat(40),
+        startedAt: '',
+        updatedAt: '',
+      },
+    },
+  );
+  assert.deepEqual(pickWorkerTargets(state, [spec('REQ-A-01', 'h1')]), []);
+});
+
 test('checkReleaseHttp 校验版本、首页与资源', async () => {
   const ok = await checkReleaseHttp('http://x', 'sha1', async (url) => {
     if (url.endsWith('/__version')) return { status: 200, body: JSON.stringify({ version: 'sha1' }) };
@@ -1003,6 +1024,260 @@ test('runWorkerJob 浏览器成功后再核对需求版本，fresh check 漂移�
   assert.equal(outcome.status, 'stale');
   assert.equal(checkCount, 2);
   assert.match(outcome.error ?? '', /版本已变化/);
+  assert.ok(!calls.includes('commit'));
+  assert.ok(!calls.includes('push'));
+  assert.ok(!calls.includes('createPR'));
+});
+
+test('runWorkerJob 无代码变更返回 satisfied：不提交不推送不建 PR，仍走验证/浏览器/fresh 校验', async () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'spec-loop-worker-'));
+  const repoDir = mkdtempSync(join(tmpdir(), 'spec-loop-repo-'));
+  const calls: string[] = [];
+  let checkCount = 0;
+  let verifyCount = 0;
+  const git = {
+    async createWorktree(): Promise<void> {},
+    async add(): Promise<void> {},
+    async diffNameOnly(): Promise<string[]> {
+      return [];
+    },
+    async reset(): Promise<void> {},
+    async writeTree(): Promise<string> {
+      return 'tree-no-change';
+    },
+    async archive(): Promise<void> {},
+    async commit(): Promise<void> {
+      calls.push('commit');
+    },
+    async revParse(): Promise<string> {
+      return '5'.repeat(40);
+    },
+    async push(): Promise<void> {
+      calls.push('push');
+    },
+    async removeWorktree(): Promise<void> {},
+    async fetch(): Promise<void> {},
+  } as unknown as GitClient;
+  const github = {
+    async createPR(): Promise<number> {
+      calls.push('createPR');
+      return 99;
+    },
+  } as unknown as GithubClient;
+
+  const outcome = await runWorkerJob(
+    {
+      repoDir,
+      runDir,
+      git,
+      github,
+      logger: silentLogger,
+      runPi: async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        output: { files: [] },
+        durationMs: 0,
+        timedOut: false,
+      }),
+      verify: async (): Promise<VerificationResult[]> => {
+        verifyCount += 1;
+        return [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }];
+      },
+      checkCurrent: async () => {
+        checkCount += 1;
+        return true;
+      },
+      checkSatisfiedRevisionCurrent: async () => {
+        checkCount += 1;
+        return true;
+      },
+      runBrowserGate: okBrowserGate,
+    },
+    {
+      jobId: 'job-satisfied',
+      reqId: 'REQ-A-01',
+      issueNumber: 1,
+      spec: spec('REQ-A-01'),
+      sourceMainSha: 's1',
+      attempt: 1,
+    },
+  );
+
+  assert.deepEqual(outcome, { status: 'satisfied', candidateTreeSha: 'tree-no-change', piAttempts: 1 });
+  assert.equal(verifyCount, 1);
+  assert.equal(checkCount, 2);
+  assert.ok(!calls.includes('commit'));
+  assert.ok(!calls.includes('push'));
+  assert.ok(!calls.includes('createPR'));
+});
+
+test('runWorkerJob 无代码变更但浏览器验收失败仍返回 failed，不伪造 satisfied', async () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'spec-loop-worker-'));
+  const repoDir = mkdtempSync(join(tmpdir(), 'spec-loop-repo-'));
+  const calls: string[] = [];
+  const git = {
+    async createWorktree(): Promise<void> {},
+    async add(): Promise<void> {},
+    async diffNameOnly(): Promise<string[]> {
+      return [];
+    },
+    async reset(): Promise<void> {
+      calls.push('reset');
+    },
+    async writeTree(): Promise<string> {
+      return 'tree-no-change';
+    },
+    async archive(): Promise<void> {},
+    async commit(): Promise<void> {
+      calls.push('commit');
+    },
+    async revParse(): Promise<string> {
+      return '6'.repeat(40);
+    },
+    async push(): Promise<void> {
+      calls.push('push');
+    },
+    async removeWorktree(): Promise<void> {},
+    async fetch(): Promise<void> {},
+  } as unknown as GitClient;
+  const github = {
+    async createPR(): Promise<number> {
+      calls.push('createPR');
+      return 99;
+    },
+  } as unknown as GithubClient;
+
+  const outcome = await runWorkerJob(
+    {
+      repoDir,
+      runDir,
+      git,
+      github,
+      logger: silentLogger,
+      runPi: async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        output: { files: [] },
+        durationMs: 0,
+        timedOut: false,
+      }),
+      verify: async (): Promise<VerificationResult[]> => [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }],
+      checkSatisfiedRevisionCurrent: async () => true,
+      runBrowserGate: async () => ({
+        ok: false,
+        detail: '浏览器验收失败',
+        reportDir: '/tmp/report',
+        reportPath: '/tmp/report/results.json',
+        stdoutLogPath: '/tmp/report/playwright.stdout.txt',
+        stderrLogPath: '/tmp/report/playwright.stderr.txt',
+      }),
+    },
+    {
+      jobId: 'job-satisfied-gate-fail',
+      reqId: 'REQ-A-01',
+      issueNumber: 1,
+      spec: spec('REQ-A-01'),
+      sourceMainSha: 's1',
+      attempt: 1,
+    },
+  );
+
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.failureStage, 'verify');
+  assert.match(outcome.error ?? '', /浏览器验收失败/);
+  assert.ok(!calls.includes('commit'));
+  assert.ok(!calls.includes('push'));
+  assert.ok(!calls.includes('createPR'));
+});
+
+test('runWorkerJob 无代码变更但 fresh check 漂移返回 stale，不伪造 satisfied', async () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'spec-loop-worker-'));
+  const repoDir = mkdtempSync(join(tmpdir(), 'spec-loop-repo-'));
+  const calls: string[] = [];
+  let checkCount = 0;
+  let gateStarted = false;
+  const git = {
+    async createWorktree(): Promise<void> {},
+    async add(): Promise<void> {},
+    async diffNameOnly(): Promise<string[]> {
+      return [];
+    },
+    async reset(): Promise<void> {
+      calls.push('reset');
+    },
+    async writeTree(): Promise<string> {
+      return 'tree-no-change';
+    },
+    async archive(): Promise<void> {},
+    async commit(): Promise<void> {
+      calls.push('commit');
+    },
+    async revParse(): Promise<string> {
+      return '7'.repeat(40);
+    },
+    async push(): Promise<void> {
+      calls.push('push');
+    },
+    async removeWorktree(): Promise<void> {},
+    async fetch(): Promise<void> {},
+  } as unknown as GitClient;
+  const github = {
+    async createPR(): Promise<number> {
+      calls.push('createPR');
+      return 99;
+    },
+  } as unknown as GithubClient;
+
+  const outcome = await runWorkerJob(
+    {
+      repoDir,
+      runDir,
+      git,
+      github,
+      logger: silentLogger,
+      runPi: async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        output: { files: [] },
+        durationMs: 0,
+        timedOut: false,
+      }),
+      verify: async (): Promise<VerificationResult[]> => [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }],
+      checkSatisfiedRevisionCurrent: async () => {
+        checkCount += 1;
+        return !gateStarted;
+      },
+      runBrowserGate: async () => {
+        gateStarted = true;
+        return {
+          ok: true,
+          detail: '浏览器验收通过',
+          reportDir: '/tmp/report',
+          reportPath: '/tmp/report/results.json',
+          stdoutLogPath: '/tmp/report/playwright.stdout.txt',
+          stderrLogPath: '/tmp/report/playwright.stderr.txt',
+        };
+      },
+    },
+    {
+      jobId: 'job-satisfied-stale',
+      reqId: 'REQ-A-01',
+      issueNumber: 1,
+      spec: spec('REQ-A-01'),
+      sourceMainSha: 's1',
+      attempt: 1,
+    },
+  );
+
+  assert.equal(outcome.status, 'stale');
+  assert.equal(checkCount, 2);
+  assert.match(outcome.error ?? '', /来源主线或候选树已漂移/);
   assert.ok(!calls.includes('commit'));
   assert.ok(!calls.includes('push'));
   assert.ok(!calls.includes('createPR'));
