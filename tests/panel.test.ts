@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 
-import { createPanelServer, resolveStaticAsset } from '../orchestrator/panel-server.ts';
+import { createPanelServer, parseByteRange, resolveStaticAsset } from '../orchestrator/panel-server.ts';
 import {
   buildPanelView,
   normalizeState,
@@ -15,6 +15,7 @@ import {
 } from '../orchestrator/panel-view.ts';
 import { parsePanelArgs } from '../orchestrator/panel.ts';
 import { parseSpecs } from '../orchestrator/specs.ts';
+import { createManualTestRunRecord, createTestEvidenceStore, writeTestRunRecord } from '../orchestrator/test-evidence.ts';
 
 const DOC = '### [REQ-CNT-01] 计数器\n\n实现一个递增计数器。\n';
 const NEW_HASH = parseSpecs({ 'docs/specs/counter.md': DOC }).specs[0]!.hash;
@@ -425,6 +426,23 @@ test('resolveStaticAsset：白名单仅 index.html 与 assets/*.(js|css)', () =>
   assert.equal(resolveStaticAsset('/assets/%2e%2e/secret'), null);
 });
 
+test('parseByteRange 合法范围/后缀/越界裁剪/非法/多段返回对应结果', () => {
+  assert.deepEqual(parseByteRange(undefined, 10), { kind: 'none' });
+  assert.deepEqual(parseByteRange('bytes=0-1', 10), { kind: 'range', start: 0, end: 1 });
+  assert.deepEqual(parseByteRange('bytes=0-0', 10), { kind: 'range', start: 0, end: 0 });
+  assert.deepEqual(parseByteRange('bytes=-2', 10), { kind: 'range', start: 8, end: 9 });
+  assert.deepEqual(parseByteRange('bytes=5-', 10), { kind: 'range', start: 5, end: 9 });
+  assert.deepEqual(parseByteRange('bytes=5-999', 10), { kind: 'range', start: 5, end: 9 });
+  assert.deepEqual(parseByteRange('bytes=-999', 10), { kind: 'range', start: 0, end: 9 });
+  assert.deepEqual(parseByteRange('bytes=10-', 10), { kind: 'invalid' });
+  assert.deepEqual(parseByteRange('bytes=5-4', 10), { kind: 'invalid' });
+  assert.deepEqual(parseByteRange('bytes=0-1,3-4', 10), { kind: 'invalid' });
+  assert.deepEqual(parseByteRange('bytes=', 10), { kind: 'invalid' });
+  assert.deepEqual(parseByteRange('bytes=-0', 10), { kind: 'invalid' });
+  assert.deepEqual(parseByteRange('items=0-1', 10), { kind: 'invalid' });
+  assert.deepEqual(parseByteRange('bytes=0-1', 0), { kind: 'invalid' });
+});
+
 async function localListenAllowed(): Promise<boolean> {
   const server = http.createServer();
   try {
@@ -447,6 +465,7 @@ function httpRequest(opts: {
   path: string;
   host?: string;
   origin?: string;
+  range?: string;
 }): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolveRequest, reject) => {
     const req = http.request(
@@ -458,6 +477,7 @@ function httpRequest(opts: {
         headers: {
           ...(opts.host ? { Host: opts.host } : {}),
           ...(opts.origin !== undefined ? { Origin: opts.origin } : {}),
+          ...(opts.range ? { Range: opts.range } : {}),
         },
       },
       (res) => {
@@ -526,6 +546,86 @@ test('面板 HTTP：GET/白名单/拒绝POST/Host/Origin/资产/符号链接/CSP
     assert.equal((await httpRequest({ port, path: '/api/panel', origin: 'http://127.0.0.1:9999' })).status, 403);
     assert.equal((await httpRequest({ port, path: '/api/panel', origin: `http://localhost:${port}` })).status, 403);
     assert.equal((await httpRequest({ port, path: '/api/panel', origin: `http://127.0.0.1:${port}` })).status, 200);
+  } finally {
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+  }
+});
+
+test('面板 HTTP Range：合法 206 / 非法 416 / HEAD 无 body（SPEC_LOOP_VERIFY 门控）', async (t) => {
+  if (process.env.SPEC_LOOP_VERIFY !== '1') {
+    t.skip('真实 HTTP Range 测试仅在 SPEC_LOOP_VERIFY=1 主验收执行');
+    return;
+  }
+  if (!(await localListenAllowed())) {
+    t.skip('当前沙箱禁止 127.0.0.1 listen（EPERM），保留真实 HTTP 测试但不降级为 mock');
+    return;
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'spec-loop-panel-range-'));
+  mkdirSync(join(dir, 'assets'), { recursive: true });
+  writeFileSync(join(dir, 'index.html'), '<html></html>', 'utf8');
+
+  const root = mkdtempSync(join(tmpdir(), 'spec-loop-evidence-range-'));
+  const record = createManualTestRunRecord({
+    id: 'manual-run-1',
+    stage: 'manual',
+    runner: 'playwright',
+    ok: true,
+    cases: [
+      {
+        id: 'A',
+        title: 'a',
+        status: 'passed',
+        durationMs: null,
+        error: null,
+        artifacts: [{ id: 'vid-1', kind: 'video', name: 'clip.webm', href: '' }],
+      },
+    ],
+  });
+  writeTestRunRecord(root, record);
+  writeFileSync(join(root, 'manual-run-1', 'vid-1'), '0123456789', 'utf8');
+  const store = createTestEvidenceStore({ rootDir: root });
+
+  const server = createPanelServer({
+    readView: async () => buildPanelView(null, meta({ stateKind: 'missing', controllerOnline: false })),
+    assetsDir: dir,
+    testEvidence: store,
+  });
+  const port = await new Promise<number>((resolveListen, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      resolveListen(typeof address === 'object' && address ? address.port : 0);
+    });
+  });
+
+  const artifactPath = '/api/test-runs/manual-run-1/artifacts/vid-1';
+  try {
+    const full = await httpRequest({ port, path: artifactPath });
+    assert.equal(full.status, 200);
+    assert.equal(full.body, '0123456789');
+    assert.equal(full.headers['accept-ranges'], 'bytes');
+
+    const range = await httpRequest({ port, path: artifactPath, range: 'bytes=0-1' });
+    assert.equal(range.status, 206);
+    assert.equal(range.body, '01');
+    assert.equal(range.headers['content-range'], 'bytes 0-1/10');
+    assert.equal(range.headers['content-length'], '2');
+
+    const suffix = await httpRequest({ port, path: artifactPath, range: 'bytes=-2' });
+    assert.equal(suffix.status, 206);
+    assert.equal(suffix.body, '89');
+    assert.equal(suffix.headers['content-range'], 'bytes 8-9/10');
+
+    const invalid = await httpRequest({ port, path: artifactPath, range: 'bytes=10-' });
+    assert.equal(invalid.status, 416);
+    assert.equal(invalid.headers['content-range'], 'bytes */10');
+    assert.equal(invalid.body, '');
+
+    const head = await httpRequest({ port, path: artifactPath, method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(head.body, '');
+    assert.equal(head.headers['content-length'], '10');
   } finally {
     await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
   }

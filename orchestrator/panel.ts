@@ -1,8 +1,9 @@
 import { readFileSync, statSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { createPanelServer } from './panel-server.ts';
 import { buildPanelView, parsePanelState, type PanelView } from './panel-view.ts';
+import { createTestEvidenceStore } from './test-evidence.ts';
 
 const DEFAULT_PORT = 4001;
 const DEFAULT_CONTROL_PORT = 4000;
@@ -157,9 +158,14 @@ async function main(): Promise<void> {
   }
 
   const assetsDir = resolve(process.cwd(), '.orchestrator/panel-dist');
+  const stateRoot = dirname(args.stateFile);
+  const testEvidence = createTestEvidenceStore({
+    rootDir: resolve(stateRoot, '.orchestrator', 'test-runs'),
+  });
   const server = createPanelServer({
     readView: createReader(args),
     assetsDir,
+    testEvidence,
   });
 
   try {

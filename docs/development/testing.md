@@ -52,6 +52,13 @@ npm run test:e2e:panel    # 等价 node orchestrator/browser-gate-cli.ts panel
 
 用户直接执行 `npm run test:e2e*` 也必须经过 `orchestrator/browser-gate-cli.ts` → `runBrowserGate` 的同一 sandbox-exec 门禁；脚本不裸调 Playwright。
 
+浏览器验收默认只在失败时保留录屏（`SPEC_LOOP_E2E_VIDEO=retain-on-failure`）。需要显式保留成功录屏时加 `--record`，等价 `SPEC_LOOP_E2E_VIDEO=on`；CLI 只接受 `--record`，未知参数直接拒绝。该模式由受控参数注入，父进程任意环境变量都不能悄悄改变它。
+
+```bash
+npm run test:e2e -- --record        # counter 成功也保留录屏
+npm run test:e2e:panel -- --record  # panel 成功也保留录屏
+```
+
 ## 4. 隔离边界
 
 门禁沙箱 profile 关键约束：
@@ -59,7 +66,7 @@ npm run test:e2e:panel    # 等价 node orchestrator/browser-gate-cli.ts panel
 - `deny network*`，随后仅放行 `(allow network-outbound (remote tcp4 "localhost:<port>"))` 唯一本机端口。写法必须是 `tcp4` + `localhost` + 固定端口；`127.0.0.1` 或 `remote tcp "127.0.0.1:port"` 会编译失败（host 必须为 `*` 或 `localhost`）。
 - 浏览器缓存目录精确放行读取，不放开整个真实 `HOME`；源/测试/配置只读，仅作业临时目录可写。
 - 所有 `runDir/suiteDir/HOME/TMPDIR/profile` 与返回日志路径统一经 `resolveSeatbeltPath` 落到真实路径；macOS 下 `os.tmpdir()` 返回 `/var/folders/...` 别名时必须匹配 `/private/var/folders/...`，不放开父目录、不移除隔离、不重用原 HOME。
-- 环境白名单仅 `PATH/LANG/LC_ALL/NO_COLOR`，注入 `SPEC_LOOP_E2E_BASE_URL`、`SPEC_LOOP_E2E_VERSION`、`SPEC_LOOP_E2E_REPORT_DIR`、`PLAYWRIGHT_BROWSERS_PATH`；不带 GitHub/模型凭据、代理变量或 `.env`。
+- 环境白名单仅 `PATH/LANG/LC_ALL/NO_COLOR`，注入 `SPEC_LOOP_E2E_BASE_URL`、`SPEC_LOOP_E2E_VERSION`、`SPEC_LOOP_E2E_REPORT_DIR`、`SPEC_LOOP_E2E_VIDEO`（取值固定为 `retain-on-failure` 或 `on`）、`PLAYWRIGHT_BROWSERS_PATH`；不带 GitHub/模型凭据、代理变量或 `.env`，父进程同名环境变量不能覆盖这些受控注入值。
 - 静态服务只暴露当前候选 `artifactDir`，拒绝兄弟 `release` 目录与 symlink 逃逸；Host 固定本机，不提供控制器 API。
 
 ## 5. 验收契约与报告
@@ -72,6 +79,10 @@ npm run test:e2e:panel    # 等价 node orchestrator/browser-gate-cli.ts panel
 - 每次实际运行写 `browser-gate-receipt.json`，绑定 `project`、`reqId/specHash`（可得时）、`displayVersion`、套件指纹、Node/platform、结果与报告/日志路径。`displayVersion` 只表示构建展示版本，不代替候选代码 `candidateTreeSha` 或 `sourceMainSha`。
 - Worker 在浏览器成功后、`commit/push/createPR` 前再做一次 fresh `checkCurrent`；浏览器执行期间 `origin/main` 漂移会返回 `stale`，不发布过期代码。
 - Worker 的浏览器证据放在独立持久目录 `runDir/browser/worker/<jobId>`，成功清理临时作业后报告、回执和冻结套件仍可读；PR 验证项包含 `browser`，并带该报告路径。独立 Worker 证据 `browser-gate.json` 保留 `candidateTreeSha` 与 `sourceMainSha`。临时 `HOME/TMPDIR`、模型 agent 目录与缓存仍随作业清理。
+- 固定 `node:test` 与浏览器门禁还会向 `runDir/test-runs`（或面板状态文件目录旁的 `.orchestrator/test-runs`）写入受控 `test-run.json` 证据索引，供本机面板只读展示。记录仅包含索引、摘要、SHA、用例和附件入口；附件按文件名扩展名归类为 `screenshot`、`video`、`trace`、`json`，不读取业务日志或任意外部路径。
+- 证据索引与附件有硬性容量/扫描边界：索引最多保留 100 条运行记录、扫描最多 2000 条目录项且深度最多 8 层、单个附件最大 512MiB、单次运行附件预算 1GiB、每个 run 最多 1000 条用例、每份附件列表最多 256 项。附件必须来自本次 report 目录内的普通文件（拒绝 symlink 逃逸与越界路径），复制失败不会留下可点击死链。
+- `node:test` 摘要同时支持 Node 24 spec reporter 的 Unicode `ℹ tests/pass/fail/...` 统计块与可选 TAP `#` 统计块，包括 `duration_ms`；只在同一 formatter 的连续 footer 块内读取六个计数，不跨截断或混合块拼凑。计数必须为安全非负整数并满足 `total = pass + fail + cancelled + skipped + todo`；缺字段、零实际用例、unsafe 值或解析失败保持 `unknown`，不得伪补 0 或猜绿。记录索引保留生产者的 unknown，扫描边界内按记录时间选最近项后再应用展示数量。
+- 浏览器门禁失败时 `runBrowserGate` 会在 summary 解析前返回；失败详情改从该 attempt 自己的 `results.json` 读取，不依赖不存在的 `gateResult.summary`。门禁的非零退出、缺报告、校验失败和超时仍判失败，同时尽可能写出对应 `test-run.json`。
 
 ## 6. 独立测试基线维护与恢复
 

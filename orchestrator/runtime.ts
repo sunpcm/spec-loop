@@ -38,6 +38,8 @@ import {
   verificationPassed,
   type CommandRunner,
 } from './validate.ts';
+import { createNodeTestRunRecord } from './test-evidence-node.ts';
+import { writeTestRunRecord } from './test-evidence.ts';
 import { runWorkerJob, type WorkerDeps, type WorkerInput, type WorkerOutcome } from './worker.ts';
 import {
   reconcileSpecRequests,
@@ -231,6 +233,29 @@ export function createBuild(
           jobTmp,
         ),
       );
+      const buildTestResult = results.find((item) => item.name === 'test');
+      if (buildTestResult) {
+        try {
+          writeTestRunRecord(
+            join(config.runDir, 'test-runs'),
+            createNodeTestRunRecord({
+              stage: 'build',
+              version: sha,
+              startedAt: null,
+              finishedAt: new Date().toISOString(),
+              jobId: null,
+              reqId: null,
+              specHash: null,
+              sourceMainSha: sha,
+              candidateTreeSha: null,
+              ok: buildTestResult.ok,
+              stdout: `${buildTestResult.stdout}\n${buildTestResult.stderr}`,
+            }),
+          );
+        } catch (error) {
+          createLogger('BUILD').warn(`写入 build node:test 摘要失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       if (!verificationPassed(results)) {
         return {
           ok: false,
@@ -255,6 +280,9 @@ export function createBuild(
         agentDir: join(config.runDir, 'jobs'),
         logger: createLogger('BROWSER-GATE'),
         timeoutMs: browserGateTimeoutMs(),
+        testRunsRoot: join(config.runDir, 'test-runs'),
+        evidenceStage: 'build',
+        sourceMainSha: sha,
       });
       if (!gateResult.ok) {
         return { ok: false, detail: `浏览器验收失败：${gateResult.detail}` };

@@ -1,4 +1,4 @@
-import { defineConfig, devices } from '@playwright/test';
+import { defineConfig, devices, type PlaywrightWorkerOptions } from '@playwright/test';
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -24,6 +24,12 @@ function localBaseURL(): string {
     throw new Error('SPEC_LOOP_E2E_BASE_URL 必须是无凭据的 IPv4 本机 HTTP URL');
   }
   return url.toString();
+}
+
+function videoMode(): PlaywrightWorkerOptions['video'] {
+  const value = process.env.SPEC_LOOP_E2E_VIDEO?.trim() || 'retain-on-failure';
+  if (value === 'on' || value === 'retain-on-failure') return value;
+  throw new Error('SPEC_LOOP_E2E_VIDEO 仅允许 on 或 retain-on-failure');
 }
 
 const baseURL = localBaseURL();
@@ -54,6 +60,7 @@ export default defineConfig({
     headless: true,
     actionTimeout: 5_000,
     navigationTimeout: 10_000,
+    video: videoMode(),
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
@@ -70,7 +77,7 @@ export default defineConfig({
     },
     {
       name: 'panel',
-      testMatch: /panel\.spec\.ts/,
+      testMatch: /panel(?:-evidence)?\.spec\.ts/,
       outputDir: `${reportDir}/artifacts/panel`,
       use: {
         ...devices['Desktop Chrome'],

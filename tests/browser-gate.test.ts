@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
@@ -14,6 +14,7 @@ import {
   createCandidateStaticServer,
   extractCaseId,
   freezeE2eSuite,
+  materializeBrowserEvidence,
   matchCaseIds,
   parseE2eContract,
   resolveSeatbeltPath,
@@ -27,6 +28,7 @@ import {
 } from '../orchestrator/browser-gate.ts';
 import { buildIsolationPaths, buildSandboxProfile } from '../orchestrator/sandbox.ts';
 import { parseSpecs } from '../orchestrator/specs.ts';
+import { createTestEvidenceStore } from '../orchestrator/test-evidence.ts';
 import type { Logger } from '../orchestrator/log.ts';
 
 const silentLogger: Logger = {
@@ -298,6 +300,7 @@ test('buildBrowserGateEnv 白名单环境且不带凭据/代理，注入 E2E 接
       baseUrl: 'http://127.0.0.1:4321/',
       version: 'abc123',
       browserCacheDir: '/browsers',
+      video: 'retain-on-failure',
     });
     assert.equal(env.GH_TOKEN, undefined);
     assert.equal(env.HTTPS_PROXY, undefined);
@@ -305,6 +308,7 @@ test('buildBrowserGateEnv 白名单环境且不带凭据/代理，注入 E2E 接
     assert.equal(env.SPEC_LOOP_E2E_BASE_URL, 'http://127.0.0.1:4321/');
     assert.equal(env.SPEC_LOOP_E2E_VERSION, 'abc123');
     assert.equal(env.SPEC_LOOP_E2E_REPORT_DIR, '/job/report');
+    assert.equal(env.SPEC_LOOP_E2E_VIDEO, 'retain-on-failure');
     assert.equal(env.PLAYWRIGHT_BROWSERS_PATH, '/browsers');
     assert.equal(env.HOME, '/job/home');
     assert.equal(env.TMPDIR, '/job/tmp');
@@ -314,6 +318,108 @@ test('buildBrowserGateEnv 白名单环境且不带凭据/代理，注入 E2E 接
       else process.env[key] = value;
     }
   }
+});
+
+test('buildBrowserGateEnv 注入 SPEC_LOOP_E2E_VIDEO 且父进程非法值不能污染', () => {
+  const prev = process.env.SPEC_LOOP_E2E_VIDEO;
+  process.env.SPEC_LOOP_E2E_VIDEO = 'bogus-from-parent';
+  try {
+    const on = buildBrowserGateEnv({
+      jobTmp: '/job',
+      reportDir: '/job/report',
+      baseUrl: 'http://127.0.0.1:4321/',
+      version: 'abc123',
+      browserCacheDir: '/browsers',
+      video: 'on',
+    });
+    assert.equal(on.SPEC_LOOP_E2E_VIDEO, 'on');
+
+    const failure = buildBrowserGateEnv({
+      jobTmp: '/job',
+      reportDir: '/job/report',
+      baseUrl: 'http://127.0.0.1:4321/',
+      version: 'abc123',
+      browserCacheDir: '/browsers',
+      video: 'retain-on-failure',
+    });
+    assert.equal(failure.SPEC_LOOP_E2E_VIDEO, 'retain-on-failure');
+  } finally {
+    if (prev === undefined) delete process.env.SPEC_LOOP_E2E_VIDEO;
+    else process.env.SPEC_LOOP_E2E_VIDEO = prev;
+  }
+});
+
+test('materializeBrowserEvidence 复制真实附件并生成不透明 ID，拒绝越界与 symlink 逃逸', () => {
+  const reportDir = mkdtempSync(join(tmpdir(), 'spec-loop-report-'));
+  const managed = mkdtempSync(join(tmpdir(), 'spec-loop-managed-'));
+  writeFileSync(join(reportDir, 'video.webm'), 'webm-bytes', 'utf8');
+  writeFileSync(join(reportDir, 'shot.png'), 'png-bytes', 'utf8');
+  writeFileSync(join(reportDir, 'trace.zip'), 'zip-bytes', 'utf8');
+  writeFileSync(join(reportDir, 'results.json'), '{"stats":{}}', 'utf8');
+
+  const outside = join(reportDir, '..', 'outside.webm');
+  writeFileSync(outside, 'outside-bytes', 'utf8');
+  symlinkSync(outside, join(reportDir, 'leak.webm'));
+
+  const raw = {
+    suites: [
+      {
+        title: 'counter.spec.ts',
+        file: 'counter.spec.ts',
+        specs: [
+          {
+            title: 'E2E-CNT-001 a',
+            ok: true,
+            tests: [
+              {
+                expectedStatus: 'passed',
+                projectName: 'counter',
+                status: 'expected',
+                results: [
+                  {
+                    status: 'passed',
+                    retry: 0,
+                    duration: 1,
+                    attachments: [
+                      { name: 'video', contentType: 'video/webm', path: join(reportDir, 'video.webm') },
+                      { name: 'screenshot', contentType: 'image/png', path: join(reportDir, 'shot.png') },
+                      { name: 'trace', contentType: 'application/zip', path: join(reportDir, 'trace.zip') },
+                      { name: 'leak', contentType: 'video/webm', path: join(reportDir, 'leak.webm') },
+                      { name: 'outside', contentType: 'video/webm', path: outside },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const result = materializeBrowserEvidence({
+    raw,
+    project: 'counter',
+    reportPath: join(reportDir, 'results.json'),
+    reportDir,
+    managedRunDir: managed,
+  });
+
+  assert.equal(result.cases.length, 1);
+  const caseArtifacts = result.cases[0]!.artifacts;
+  assert.equal(caseArtifacts.length, 3);
+  assert.deepEqual(caseArtifacts.map((artifact) => artifact.kind).sort(), ['screenshot', 'trace', 'video']);
+  for (const artifact of caseArtifacts) {
+    assert.match(artifact.id, /^artifact-/);
+    assert.ok(existsSync(join(managed, artifact.id)));
+  }
+
+  // 越界与 symlink 源未复制；受管目录仅含 3 个 case 附件 + 1 个原始 results.json。
+  assert.equal(readdirSync(managed).length, 4);
+  assert.equal(result.runArtifacts.length, 1);
+  assert.equal(result.runArtifacts[0]!.kind, 'json');
+  assert.equal(result.runArtifacts[0]!.name, 'results.json');
+  assert.ok(existsSync(join(managed, result.runArtifacts[0]!.id)));
 });
 
 test('buildBrowserGateSandboxSpec 放行浏览器缓存且网络只允许本机固定端口', () => {
@@ -649,4 +755,86 @@ test('runBrowserGate 非零退出时返回报告/日志定位与有界尾部', a
   assert.ok(existsSync(result.stdoutLogPath));
   assert.ok(existsSync(result.stderrLogPath));
   assert.ok(existsSync(result.receiptPath!));
+});
+
+test('runBrowserGate 将附件与 jobId 写入 test-runs 受管记录，href 与文件一致', async (t) => {
+  if (process.env.SPEC_LOOP_VERIFY !== '1') {
+    t.skip('真实浏览器门禁集成仅在 SPEC_LOOP_VERIFY=1 主验收执行，避免 Worker verifier 尝试 listen');
+    return;
+  }
+  if (!(await localListenAllowed())) {
+    t.skip('当前沙箱禁止 127.0.0.1 listen（EPERM），保留真实门禁测试但不降级为 mock');
+    return;
+  }
+
+  const repoDir = mkdtempSync(join(tmpdir(), 'spec-loop-repo-'));
+  const e2eRoot = mkdtempSync(join(tmpdir(), 'spec-loop-e2e-'));
+  const browserCache = mkdtempSync(join(tmpdir(), 'spec-loop-browsers-'));
+  const artifactDir = mkdtempSync(join(tmpdir(), 'spec-loop-dist-'));
+  const testRunsRoot = mkdtempSync(join(tmpdir(), 'spec-loop-test-runs-'));
+  writeFileSync(join(artifactDir, 'index.html'), '<main>ok</main>', 'utf8');
+  const { files, contract } = counterSpec();
+  mkdirSync(join(repoDir, 'docs', 'specs'), { recursive: true });
+  writeFileSync(join(repoDir, 'docs', 'specs', 'counter.md'), files['docs/specs/counter.md']!, 'utf8');
+  setupE2eRoot(e2eRoot, contract);
+
+  let videoPath = '';
+  const result = await runBrowserGate({
+    repoDir,
+    e2eRoot,
+    artifactDir,
+    mountPath: '/',
+    version: 'abc',
+    project: 'counter',
+    reqId: 'REQ-CNT-01',
+    specFiles: files,
+    jobTmp: join(repoDir, '.orchestrator', 'browser', 'job-evidence'),
+    browserCacheDir: browserCache,
+    logger: silentLogger,
+    execBin: process.execPath,
+    testRunsRoot,
+    evidenceStage: 'worker',
+    jobId: 'job-123',
+    sourceMainSha: '1'.repeat(40),
+    candidateTreeSha: '2'.repeat(40),
+    video: 'on',
+    runner: async (opts) => {
+      const reportDir = opts.env.SPEC_LOOP_E2E_REPORT_DIR!;
+      mkdirSync(reportDir, { recursive: true });
+      videoPath = join(reportDir, 'video.webm');
+      writeFileSync(videoPath, 'webm-bytes', 'utf8');
+      const report = makeReport(['E2E-CNT-001 a', 'E2E-CNT-002 b'], (spec) => {
+        const testRecord = (spec.tests as unknown[])[0] as Record<string, unknown>;
+        const resultRecord = (testRecord.results as unknown[])[0] as Record<string, unknown>;
+        resultRecord.attachments = [{ name: 'video', contentType: 'video/webm', path: videoPath }];
+      });
+      writeFileSync(join(reportDir, 'results.json'), JSON.stringify(report), 'utf8');
+      return { code: 0, stdout: 'ok', stderr: '', timedOut: false };
+    },
+  });
+
+  assert.equal(result.ok, true, result.detail);
+  assert.ok(result.testRunRecord);
+  const record = result.testRunRecord;
+  assert.equal(record.jobId, 'job-123');
+  assert.equal(record.sourceMainSha, '1'.repeat(40));
+  assert.equal(record.candidateTreeSha, '2'.repeat(40));
+  assert.equal(record.stage, 'worker');
+
+  const managedDir = join(testRunsRoot, record.id);
+  assert.ok(existsSync(managedDir));
+  const caseArtifacts = record.cases.flatMap((item) => item.artifacts);
+  assert.ok(caseArtifacts.length >= 1);
+  for (const artifact of caseArtifacts) {
+    assert.match(artifact.id, /^artifact-/);
+    assert.ok(existsSync(join(managedDir, artifact.id)));
+  }
+  assert.ok(record.artifacts && record.artifacts.length >= 1);
+  assert.equal(record.artifacts[0]!.kind, 'json');
+  assert.ok(existsSync(join(managedDir, record.artifacts[0]!.id)));
+
+  const store = createTestEvidenceStore({ rootDir: testRunsRoot });
+  const view = store.listRuns();
+  assert.ok(view.runs.some((run) => run.id === record.id));
+  assert.ok(store.readRunArtifact(record.id, record.artifacts[0]!.id));
 });

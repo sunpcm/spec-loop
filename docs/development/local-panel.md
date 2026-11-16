@@ -13,7 +13,7 @@ npm run panel
 
 `npm run panel` 先运行 `build:panel` 生成独立的 `.orchestrator/panel-dist/`，再启动只监听 `127.0.0.1` 的 Node 服务。默认访问地址为 <http://127.0.0.1:4001>。原有计数器前端开发页和构建产物不受影响。
 
-面板服务从显式状态路径读取快照，默认路径为当前目录下的 `.orchestrator-state.json`。可通过 CLI 指定状态文件、面板端口和控制器健康检查端口：
+面板服务从显式状态路径读取快照，默认路径为当前目录下的 `.orchestrator-state.json`。测试证据索引放在状态文件所属运行目录旁的 `.orchestrator/test-runs`，避免面板读取 A 状态却展示 B 目录中的测试记录。可通过 CLI 指定状态文件、面板端口和控制器健康检查端口：
 
 ```bash
 node orchestrator/panel.ts \
@@ -29,8 +29,10 @@ node orchestrator/panel.ts \
 桌面页面分为三栏：
 
 - 左侧列出请求、代码交付和尝试次数；演示模式使用 `DEMO-DOC-PR-001`、`DEMO-TASK-001`、`DEMO-CODE-PR-001` 标识合成产物。
+- 左侧“测试与验收”区域列出本机只读测试运行记录。列表显示来源阶段、运行器、固定摘要与时间；摘要未知或没有实际用例时显示“未知”或“未发现实际用例”，不显示成 0/0 通过。全局最近记录不冒充某个选定交付的结果；演示模式显示“演示模式不展示真实测试记录”。
 - 中间使用 React Flow 绘制后端提供的全部真实节点，或在演示模式绘制单一完整故事。画布支持平移、控件缩放、全图适配、小地图和“专注画布”。
 - 右侧展示选中节点、请求或交付的详情，包括状态说明、PR 记录、SHA、尝试记录、部署结果和回执状态。
+- 右侧选中测试运行记录时显示其来源阶段、运行器、版本、任务、需求、spec 与 SHA、摘要、起止时间及用例。失败用例可查看错误文本和截图/trace/视频附件；通过但未保留附件的用例明确显示“未保留”。
 
 真实模式不假设固定节点数。当前八阶段 DTO 会显示为一条蛇形主路径；其他节点数也按相同的只读规则动态排版。节点不可拖动或连线，键盘可聚焦并通过 `Enter`/空格选择。鼠标滚轮用于平移画布，右下角控件用于缩放和全图适配。面板只展示已有证据；缺失数据标为“未记录”或“未知”，人工等待标为“待人工确认”，未启动阶段标为“未执行”。
 
@@ -58,6 +60,15 @@ node orchestrator/panel.ts \
 
 切回“真实数据”后，合成选择被清除并恢复只读轮询。面板 API 断线时保留上次有效快照；控制器离线只影响运行提示，不会把历史任务自动改写为失败。
 
+## 测试证据只读接口
+
+面板新增两个只读端点，均为 `GET`/`HEAD`，不提供任何写、合并、重试或执行入口：
+
+- `GET /api/test-runs` 返回 `{ schemaVersion: 'test-runs/v1', runs: [...] }`，`runs` 为最近运行记录的摘要列表，按开始/结束时间倒序，含 `id/stage/runner/version/jobId/reqId/specHash/sourceMainSha/candidateTreeSha/suiteFingerprint/ok/summary/cases`。附件的 `href` 由服务端按不透明 ID 生成，不暴露磁盘绝对路径。
+- `GET /api/test-runs/<run-id>/artifacts/<artifact-id>` 下载单个附件，`run-id`/`artifact-id` 只接受不透明 ID，拒绝磁盘路径、任意 URL、路径穿越与 symlink 逃逸。仅 `screenshot`(png) 与 `video`(webm) 可内联播放，`trace`(zip) 与 `json` 强制作为附件下载；原始 Playwright `results.json` 也作为 run 级 json 附件可下载。
+
+证据扫描与附件有硬性上限：索引最多保留 100 条运行、扫描最多 2000 条目录项且深度最多 8 层、单个附件最大 512MiB、单次运行附件预算 1GiB、每条运行最多 1000 条用例、每份附件列表最多 256 项。超出上限或不可读清单会明确降级（不生成可点击死链）。视频通过 `Accept-Ranges`/Range（合法 206、非法 416、HEAD 无 body）保证可播放；CSP 仅放行 `media-src 'self'`，不把整个 `reportDir` 作为 HTTP 共享。
+
 ## 验证边界
 
-`npm run build:panel` 只验证独立面板资源可以生成，`npm run typecheck` 与自动化测试验证类型、状态门禁、产物时序和合成视图契约。真实面板仍需要在本机启动服务后核对状态文件、HTTP 安全边界、控制器健康探测和浏览器交互。Vercel 或其他静态前端发布不代表本机控制器、状态读取或飞书链路已经运行。
+`npm run build:panel` 只验证独立面板资源可以生成，`npm run typecheck` 与自动化测试验证类型、状态门禁、产物时序和合成视图契约。真实面板仍需要在本机启动服务后核对状态文件、HTTP 安全边界、控制器健康探测和浏览器交互。测试附件路由仅允许 GET/HEAD、校验路径与附件清单、拒绝符号链接逃逸，并为视频提供 `Accept-Ranges`/Range 响应；CSP 允许 `media-src 'self'` 以便受管视频播放。Vercel 或其他静态前端发布不代表本机控制器、状态读取或飞书链路已经运行。

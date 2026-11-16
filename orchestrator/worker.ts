@@ -15,6 +15,8 @@ import { preparePiAgentDir, runPi, type PiInvocation, type PiResult } from './pi
 import { WORKER_PROMPT } from './prompts.ts';
 import { buildIsolationPaths, type IsolationPaths, type SandboxProfileSpec } from './sandbox.ts';
 import { parseSpecs } from './specs.ts';
+import { createNodeTestRunRecord } from './test-evidence-node.ts';
+import { writeTestRunRecord } from './test-evidence.ts';
 import {
   buildVerifierEnv,
   defaultVerificationCommands,
@@ -347,6 +349,27 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       );
     });
     const verification = await verify(snapshotDir);
+    const testResult = verification.find((item) => item.name === 'test');
+    if (testResult) {
+      const record = createNodeTestRunRecord({
+        stage: 'worker',
+        version: input.sourceMainSha,
+        startedAt: null,
+        finishedAt: new Date().toISOString(),
+        jobId: input.jobId,
+        reqId: input.reqId,
+        specHash: input.spec.hash,
+        sourceMainSha: input.sourceMainSha,
+        candidateTreeSha: treeSha,
+        ok: testResult.ok,
+        stdout: `${testResult.stdout}\n${testResult.stderr}`,
+      });
+      try {
+        writeTestRunRecord(join(deps.runDir, 'test-runs'), record);
+      } catch (error) {
+        logger.warn(`写入 node:test 摘要失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     if (!verificationPassed(verification)) {
       await deps.git.reset(workDir);
       return {
@@ -387,6 +410,11 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       agentDir,
       logger,
       timeoutMs: deps.browserGateTimeoutMs,
+      testRunsRoot: join(deps.runDir, 'test-runs'),
+      evidenceStage: 'worker',
+      jobId: input.jobId,
+      sourceMainSha: input.sourceMainSha,
+      candidateTreeSha: treeSha,
     });
     writeBoundedLog(
       browserEvidenceDir,

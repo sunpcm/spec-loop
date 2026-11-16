@@ -26,10 +26,17 @@ function readBuiltVersion(artifactDir: string, fallback: string): string {
 async function main(): Promise<void> {
   const rawProject = process.argv[2] ?? '';
   if (rawProject !== 'counter' && rawProject !== 'panel') {
-    console.error('用法: node orchestrator/browser-gate-cli.ts <counter|panel>');
+    console.error('用法: node orchestrator/browser-gate-cli.ts <counter|panel> [--record]');
     process.exitCode = 2;
     return;
   }
+  const args = process.argv.slice(3);
+  if (args.some((arg) => arg !== '--record')) {
+    console.error('未知参数：仅支持 --record（成功保留录屏）');
+    process.exitCode = 2;
+    return;
+  }
+  const video = args.includes('--record') ? 'on' : 'retain-on-failure';
   const project: E2eProject = rawProject;
   const repoDir = process.cwd();
   const logger = createLogger('BROWSER-GATE');
@@ -58,6 +65,9 @@ async function main(): Promise<void> {
     jobTmp,
     browserCacheDir: resolveBrowserCacheDir(),
     logger,
+    testRunsRoot: join(repoDir, '.orchestrator', 'test-runs'),
+    evidenceStage: 'manual',
+    video,
   });
 
   if (result.ok) {

@@ -1,11 +1,22 @@
-import { createHash } from 'node:crypto';
-import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { homedir } from 'node:os';
-import { dirname, extname, join, normalize, sep } from 'node:path';
+import { basename, dirname, extname, join, normalize, sep } from 'node:path';
 import type { Logger } from './log.ts';
 import { buildIsolationPaths, runSandboxed, sandboxExecAvailable, sandboxExecBin, type IsolationPaths, type SandboxProfileSpec } from './sandbox.ts';
 import { parseSpecs } from './specs.ts';
+import {
+  artifactKindFromName,
+  createManualTestRunRecord,
+  writeTestRunRecord,
+  type TestArtifactSummary,
+  type TestCaseSummary,
+  type TestArtifactKind,
+  type TestRunRecord,
+  type TestRunStatus,
+  type TestRunSummaryDetail,
+} from './test-evidence.ts';
 
 export type E2eProject = 'counter' | 'panel';
 
@@ -35,6 +46,8 @@ export interface E2eReportSummary {
 const CASE_ID_RE = /^\s*([A-Za-z0-9][A-Za-z0-9_-]*)/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 export const DEFAULT_BROWSER_GATE_TIMEOUT_MS = 180_000;
+const MAX_ATTACHMENT_BYTES = 512 * 1024 * 1024;
+const MAX_RUN_ATTACHMENT_BYTES = 1024 * 1024 * 1024;
 
 /** 进程内单调序号，配合时间戳保证每次执行目录唯一，同时不删除历史 attempt 证据。 */
 let gateRunSeq = 0;
@@ -242,6 +255,9 @@ export function matchCaseIds(contractCaseIds: string[], executedCaseIds: string[
 interface RawTestResult {
   status?: unknown;
   retry?: unknown;
+  duration?: unknown;
+  error?: unknown;
+  attachments?: unknown;
 }
 
 interface RawTest {
@@ -670,6 +686,7 @@ export interface BrowserGateEnvOptions {
   baseUrl: string;
   version: string;
   browserCacheDir: string;
+  video: 'retain-on-failure' | 'on';
 }
 
 export function buildBrowserGateEnv(opts: BrowserGateEnvOptions): Record<string, string> {
@@ -684,6 +701,7 @@ export function buildBrowserGateEnv(opts: BrowserGateEnvOptions): Record<string,
   env.SPEC_LOOP_E2E_BASE_URL = opts.baseUrl;
   env.SPEC_LOOP_E2E_VERSION = opts.version;
   env.SPEC_LOOP_E2E_REPORT_DIR = opts.reportDir;
+  env.SPEC_LOOP_E2E_VIDEO = opts.video;
   env.PLAYWRIGHT_BROWSERS_PATH = opts.browserCacheDir;
   return env;
 }
@@ -735,6 +753,12 @@ export interface BrowserGateOptions {
   execBin?: string;
   timeoutMs?: number;
   runner?: BrowserGateRunner;
+  testRunsRoot?: string;
+  evidenceStage?: 'worker' | 'build' | 'manual';
+  video?: 'retain-on-failure' | 'on';
+  jobId?: string;
+  sourceMainSha?: string;
+  candidateTreeSha?: string;
 }
 
 export interface BrowserGateResult {
@@ -750,6 +774,7 @@ export interface BrowserGateResult {
   summary?: E2eReportSummary;
   suiteFingerprint?: string;
   specHash?: string;
+  testRunRecord?: TestRunRecord | null;
 }
 
 export interface BrowserGateReceipt {
@@ -805,6 +830,298 @@ function writeBrowserGateReceipt(
   writeFileSync(path, `${JSON.stringify(full, null, 2)}\n`, 'utf8');
 }
 
+const ATTACHMENT_KIND_EXT: Record<TestArtifactKind, string> = {
+  screenshot: '.png',
+  video: '.webm',
+  trace: '.zip',
+  json: '.json',
+};
+
+export function artifactKindFor(contentType: string | undefined, sourcePath: string | undefined): TestArtifactKind | null {
+  const ct = (contentType ?? '').toLowerCase().split(';')[0]?.trim() ?? '';
+  const kind =
+    ct === 'video/webm'
+      ? 'video'
+      : ct === 'image/png'
+        ? 'screenshot'
+        : ct === 'application/zip' || ct === 'application/x-zip-compressed'
+          ? 'trace'
+          : ct === 'application/json' || ct === 'text/json'
+            ? 'json'
+            : null;
+  if (kind) {
+    const suffix = sourcePath ? extname(sourcePath).toLowerCase() : '';
+    if (suffix && suffix !== ATTACHMENT_KIND_EXT[kind]) return null;
+    return kind;
+  }
+  if (sourcePath) return artifactKindFromName(sourcePath);
+  return null;
+}
+
+function attachmentDisplayName(kind: TestArtifactKind, source: string): string {
+  const base = basename(source).trim();
+  return base || `${kind}${ATTACHMENT_KIND_EXT[kind]}`;
+}
+
+function stringifyPlaywrightError(value: unknown): string | null {
+  if (!value) return null;
+  if (typeof value === 'string') return value.trim().slice(0, 800) || null;
+  if (typeof value === 'object') {
+    const message = (value as Record<string, unknown>).message;
+    if (typeof message === 'string' && message.trim()) return message.trim().slice(0, 800);
+  }
+  return String(value).slice(0, 800);
+}
+
+function playwrightResultStatus(status: unknown): TestRunStatus {
+  if (status === 'passed') return 'passed';
+  if (status === 'failed' || status === 'timedOut' || status === 'interrupted') return 'failed';
+  return 'unknown';
+}
+
+interface RawPlaywrightAttachment {
+  kind: TestArtifactKind;
+  contentType: string;
+  source: string;
+  name: string;
+}
+
+interface RawPlaywrightCase {
+  id: string;
+  title: string;
+  status: TestRunStatus;
+  durationMs: number | null;
+  error: string | null;
+  attachments: RawPlaywrightAttachment[];
+}
+
+function collectRawAttachments(value: unknown): RawPlaywrightAttachment[] {
+  if (!Array.isArray(value)) return [];
+  const attachments: RawPlaywrightAttachment[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const raw = value[index];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const record = raw as Record<string, unknown>;
+    const source = typeof record.path === 'string' && record.path.trim() ? record.path.trim() : null;
+    const contentType = typeof record.contentType === 'string' ? record.contentType : undefined;
+    const kind = artifactKindFor(contentType, source ?? undefined);
+    if (!kind || !source) continue;
+    attachments.push({ kind, contentType: contentType ?? '', source, name: attachmentDisplayName(kind, source) });
+  }
+  return attachments;
+}
+
+function collectRawPlaywrightCases(raw: unknown, project: E2eProject): RawPlaywrightCase[] {
+  if (!raw || typeof raw !== 'object' || !Array.isArray((raw as Record<string, unknown>).suites)) return [];
+  const specs: RawSpec[] = [];
+  collectSpecs((raw as Record<string, unknown>).suites, specs);
+  const cases: RawPlaywrightCase[] = [];
+  for (const spec of specs) {
+    const title = typeof spec.title === 'string' ? spec.title.trim() : '';
+    const caseId = extractCaseId(title) ?? 'unknown';
+    const tests = Array.isArray(spec.tests) ? spec.tests : [];
+    for (const testRaw of tests) {
+      if (!testRaw || typeof testRaw !== 'object') continue;
+      const test = testRaw as RawTest;
+      if (test.projectName !== project) continue;
+      const results = Array.isArray(test.results) ? test.results : [];
+      for (const resultRaw of results) {
+        if (!resultRaw || typeof resultRaw !== 'object') continue;
+        const result = resultRaw as RawTestResult;
+        cases.push({
+          id: caseId,
+          title,
+          status: playwrightResultStatus(result.status),
+          durationMs:
+            typeof result.duration === 'number' && Number.isFinite(result.duration) ? result.duration : null,
+          error: stringifyPlaywrightError(result.error),
+          attachments: collectRawAttachments(result.attachments),
+        });
+      }
+    }
+  }
+  return cases;
+}
+
+function isSafeAttachmentSource(root: string, source: string): boolean {
+  let rootReal: string;
+  let sourceReal: string;
+  let stat: import('node:fs').Stats;
+  try {
+    rootReal = realpathSync(root);
+    sourceReal = realpathSync(source);
+    stat = lstatSync(source);
+  } catch {
+    return false;
+  }
+  if (sourceReal !== rootReal && !sourceReal.startsWith(`${rootReal}${sep}`)) return false;
+  if (!stat.isFile() || stat.isSymbolicLink()) return false;
+  return stat.size <= MAX_ATTACHMENT_BYTES;
+}
+
+export function materializeBrowserEvidence(opts: {
+  raw: unknown;
+  project: E2eProject;
+  reportPath: string;
+  reportDir: string;
+  managedRunDir: string;
+}): { cases: TestCaseSummary[]; runArtifacts: TestArtifactSummary[] } {
+  const rawCases = collectRawPlaywrightCases(opts.raw, opts.project);
+  const cases: TestCaseSummary[] = [];
+  const runArtifacts: TestArtifactSummary[] = [];
+  let totalBytes = 0;
+  let artifactSeq = 0;
+  const nextArtifactId = (): string =>
+    `artifact-${Date.now().toString(36)}-${(++artifactSeq).toString(36)}-${randomBytes(4).toString('hex')}`;
+
+  for (const rawCase of rawCases) {
+    const caseArtifacts: TestArtifactSummary[] = [];
+    for (const attachment of rawCase.attachments) {
+      if (totalBytes >= MAX_RUN_ATTACHMENT_BYTES) break;
+      let size = 0;
+      try {
+        if (!isSafeAttachmentSource(opts.reportDir, attachment.source)) continue;
+        size = lstatSync(attachment.source).size;
+      } catch {
+        continue;
+      }
+      if (totalBytes + size > MAX_RUN_ATTACHMENT_BYTES) continue;
+      const artifactId = nextArtifactId();
+      try {
+        copyFileSync(attachment.source, join(opts.managedRunDir, artifactId));
+      } catch {
+        continue;
+      }
+      totalBytes += size;
+      caseArtifacts.push({ id: artifactId, kind: attachment.kind, name: attachment.name, href: '' });
+    }
+    cases.push({
+      id: rawCase.id,
+      title: rawCase.title,
+      status: rawCase.status,
+      durationMs: rawCase.durationMs,
+      error: rawCase.error,
+      artifacts: caseArtifacts,
+    });
+  }
+
+  if (opts.raw && existsSync(opts.reportPath)) {
+    try {
+      if (isSafeAttachmentSource(opts.reportDir, opts.reportPath)) {
+        const size = lstatSync(opts.reportPath).size;
+        if (totalBytes + size <= MAX_RUN_ATTACHMENT_BYTES) {
+          const artifactId = nextArtifactId();
+          copyFileSync(opts.reportPath, join(opts.managedRunDir, artifactId));
+          totalBytes += size;
+          runArtifacts.push({ id: artifactId, kind: 'json', name: 'results.json', href: '' });
+        }
+      }
+    } catch {
+      // 原始报告附件复制失败不影响门禁结果，只影响面板下载。
+    }
+  }
+
+  return { cases, runArtifacts };
+}
+
+function summaryFromPlaywright(raw: unknown, project: E2eProject): TestRunSummaryDetail {
+  try {
+    const parsed = summarizePlaywrightReport(raw, project);
+    return {
+      runner: 'playwright',
+      specCount: parsed.specCount,
+      targetTestCount: parsed.targetTestCount,
+      resultCount: parsed.resultCount,
+      skipped: parsed.skipped,
+      flaky: parsed.flaky,
+      unexpected: parsed.unexpected,
+      errorCount: parsed.errorCount,
+      failedResultCount: parsed.failedResultCount,
+      retriedCount: parsed.retriedCount,
+      unknown: false,
+    };
+  } catch {
+    return {
+      runner: 'playwright',
+      specCount: null,
+      targetTestCount: null,
+      resultCount: null,
+      skipped: null,
+      flaky: null,
+      unexpected: null,
+      errorCount: null,
+      failedResultCount: null,
+      retriedCount: null,
+      unknown: true,
+    };
+  }
+}
+
+function makeBrowserTestRunRecord(opts: {
+  project: E2eProject;
+  reqId?: string;
+  specHash?: string;
+  sourceMainSha?: string;
+  candidateTreeSha?: string;
+  jobId?: string;
+  version: string;
+  suiteFingerprint: string | null;
+  ok: boolean;
+  startedAt: string;
+  reportPath: string;
+  reportDir: string;
+  testRunsRoot: string;
+  stage: 'worker' | 'build' | 'manual';
+}): TestRunRecord | null {
+  const id = `browser-${opts.project}-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+  const managedRunDir = join(opts.testRunsRoot, id);
+  let raw: unknown = null;
+  try {
+    if (existsSync(opts.reportPath)) raw = readJsonFile(opts.reportPath);
+  } catch {
+    raw = null;
+  }
+  const summary = raw ? summaryFromPlaywright(raw, opts.project) : {
+    runner: 'playwright',
+    specCount: null,
+    targetTestCount: null,
+    resultCount: null,
+    skipped: null,
+    flaky: null,
+    unexpected: null,
+    errorCount: null,
+    failedResultCount: null,
+    retriedCount: null,
+    unknown: true,
+  } as const;
+  mkdirSync(managedRunDir, { recursive: true });
+  const materialized = materializeBrowserEvidence({
+    raw,
+    project: opts.project,
+    reportPath: opts.reportPath,
+    reportDir: opts.reportDir,
+    managedRunDir,
+  });
+  return createManualTestRunRecord({
+    id,
+    stage: opts.stage,
+    runner: 'playwright',
+    version: opts.version,
+    startedAt: opts.startedAt,
+    finishedAt: new Date().toISOString(),
+    jobId: opts.jobId ?? null,
+    reqId: opts.reqId ?? null,
+    specHash: opts.specHash ?? null,
+    sourceMainSha: opts.sourceMainSha ?? null,
+    candidateTreeSha: opts.candidateTreeSha ?? null,
+    suiteFingerprint: opts.suiteFingerprint ?? null,
+    ok: opts.ok,
+    summary,
+    cases: materialized.cases,
+    artifacts: materialized.runArtifacts,
+  });
+}
+
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => server.close(() => resolve()));
 }
@@ -825,6 +1142,40 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
   const stderrLogPath = join(runDir, 'playwright.stderr.txt');
   const receiptPath = join(runDir, 'browser-gate-receipt.json');
   const startedAt = new Date().toISOString();
+  const evidenceStage = opts.evidenceStage ?? 'manual';
+  const testRunsRoot = opts.testRunsRoot;
+  const writeEvidence = (
+    ok: boolean,
+    reportPath = join(reportDir, 'results.json'),
+    currentSuiteFingerprint = '',
+    currentSpecHash: string | undefined = undefined,
+  ): TestRunRecord | null => {
+    if (!testRunsRoot) return null;
+    const record = makeBrowserTestRunRecord({
+      project: opts.project,
+      reqId: opts.reqId,
+      specHash: currentSpecHash,
+      sourceMainSha: opts.sourceMainSha,
+      candidateTreeSha: opts.candidateTreeSha,
+      jobId: opts.jobId,
+      version: opts.version,
+      suiteFingerprint: currentSuiteFingerprint || null,
+      ok,
+      startedAt,
+      reportPath,
+      reportDir,
+      testRunsRoot,
+      stage: evidenceStage,
+    });
+    if (!record) return null;
+    try {
+      writeTestRunRecord(testRunsRoot, record);
+      return record;
+    } catch (error) {
+      logger.warn(`写入 test-runs 记录失败：${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  };
 
   const fail = (
     detail: string,
@@ -841,14 +1192,20 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
   });
 
   if (!sandboxExecAvailable(execBin)) {
-    return fail(`fail-closed: sandbox-exec 不可用（${execBin}），拒绝无隔离浏览器验收`);
+    const result = fail(`fail-closed: sandbox-exec 不可用（${execBin}），拒绝无隔离浏览器验收`);
+    result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'));
+    return result;
   }
   if (!existsSync(browserCacheDir)) {
-    return fail(`fail-closed: Playwright 浏览器缓存目录缺失（${browserCacheDir}），拒绝运行`);
+    const result = fail(`fail-closed: Playwright 浏览器缓存目录缺失（${browserCacheDir}），拒绝运行`);
+    result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'));
+    return result;
   }
   const cliPath = join(e2eRoot, 'node_modules', '@playwright', 'test', 'cli.js');
   if (!existsSync(cliPath)) {
-    return fail(`fail-closed: 缺少 @playwright/test CLI（${cliPath}）`);
+    const result = fail(`fail-closed: 缺少 @playwright/test CLI（${cliPath}）`);
+    result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'));
+    return result;
   }
 
   // 一次性读取并冻结套件字节（config + tests/e2e，含 contracts）到唯一只读副本，
@@ -861,29 +1218,40 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
     suiteFiles = frozen.files;
     suiteFingerprint = frozen.fingerprint;
   } catch (error) {
-    return fail(`fail-closed: 冻结验收套件失败: ${error instanceof Error ? error.message : String(error)}`);
+    const result = fail(`fail-closed: 冻结验收套件失败: ${error instanceof Error ? error.message : String(error)}`);
+    result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'));
+    return result;
   }
   if (suiteFiles['playwright.config.ts'] === undefined) {
-    return fail(`fail-closed: 缺少 playwright.config.ts（${join(e2eRoot, 'playwright.config.ts')}）`);
+    const result = fail(`fail-closed: 缺少 playwright.config.ts（${join(e2eRoot, 'playwright.config.ts')}）`);
+    result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'));
+    return result;
   }
 
   const contractRel = `tests/e2e/contracts/${opts.project}.json`;
   const contractRaw = suiteFiles[contractRel];
   if (contractRaw === undefined) {
-    return fail(`fail-closed: 缺少验收契约（${contractRel}）`);
+    const result = fail(`fail-closed: 缺少验收契约（${contractRel}）`);
+    result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint);
+    return result;
   }
   let contract: E2eContract;
   try {
     contract = parseE2eContract(JSON.parse(contractRaw) as unknown, opts.project);
   } catch (error) {
-    return fail(`验收契约解析失败: ${error instanceof Error ? error.message : String(error)}`);
+    const result = fail(`验收契约解析失败: ${error instanceof Error ? error.message : String(error)}`);
+    result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint);
+    return result;
   }
 
   let specHash: string | undefined;
   if (opts.project === 'counter') {
     const check = verifyCounterContract(contract, opts.specFiles, opts.reqId);
     if (!check.ok) {
-      return fail(`验收基线待独立维护：${check.detail}`, { contract, specHash: check.specHash });
+      specHash = check.specHash;
+      const result = fail(`验收基线待独立维护：${check.detail}`, { contract, specHash: check.specHash });
+      result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint, specHash);
+      return result;
     }
     specHash = check.specHash;
   }
@@ -915,6 +1283,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
       baseUrl,
       version: opts.version,
       browserCacheDir,
+      video: opts.video ?? 'retain-on-failure',
     });
 
     const runner = opts.runner ?? defaultBrowserGateRunner();
@@ -950,7 +1319,9 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
         },
         startedAt,
       );
-      return fail(`浏览器验收超时（${timeoutMs}ms）`, { contract, specHash, suiteFingerprint });
+      const gateResult = fail(`浏览器验收超时（${timeoutMs}ms）`, { contract, specHash, suiteFingerprint });
+      gateResult.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint, specHash);
+      return gateResult;
     }
     if (result.code !== 0) {
       const tail = (result.stderr || result.stdout || '').trim().slice(-500);
@@ -974,10 +1345,12 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
         },
         startedAt,
       );
-      return fail(
+      const gateResult = fail(
         detail,
         { contract, specHash, suiteFingerprint },
       );
+      gateResult.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint, specHash);
+      return gateResult;
     }
 
     const reportPath = join(reportDir, 'results.json');
@@ -1001,7 +1374,9 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
         },
         startedAt,
       );
-      return fail('缺少 Playwright JSON 报告（results.json）', { contract, specHash, suiteFingerprint });
+      const gateResult = fail('缺少 Playwright JSON 报告（results.json）', { contract, specHash, suiteFingerprint });
+      gateResult.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint, specHash);
+      return gateResult;
     }
 
     let summary: E2eReportSummary;
@@ -1028,11 +1403,13 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
         },
         startedAt,
       );
-      return fail(detail, {
+      const gateResult = fail(detail, {
         contract,
         specHash,
         suiteFingerprint,
       });
+      gateResult.testRunRecord = writeEvidence(false, reportPath, suiteFingerprint, specHash);
+      return gateResult;
     }
 
     const validation = validateE2eReport(summary, contract.caseIds);
@@ -1057,7 +1434,15 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
         },
         startedAt,
       );
-      return fail(validation.detail, { contract, summary, executedCaseIds: summary.caseIds, specHash, suiteFingerprint });
+      const gateResult = fail(validation.detail, {
+        contract,
+        summary,
+        executedCaseIds: summary.caseIds,
+        specHash,
+        suiteFingerprint,
+      });
+      gateResult.testRunRecord = writeEvidence(false, reportPath, suiteFingerprint, specHash);
+      return gateResult;
     }
 
     writeBrowserGateReceipt(
@@ -1084,7 +1469,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
     logger.info(
       `浏览器验收通过：${opts.project} ${summary.specCount} 用例，指纹 ${suiteFingerprint.slice(0, 12)}，报告 ${reportDir}`,
     );
-    return {
+    const gateResult: BrowserGateResult = {
       ok: true,
       detail: '浏览器验收通过',
       reportDir,
@@ -1098,6 +1483,8 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
       suiteFingerprint,
       specHash,
     };
+    gateResult.testRunRecord = writeEvidence(true, reportPath, suiteFingerprint, specHash);
+    return gateResult;
   } catch (error) {
     const detail = `浏览器验收异常: ${error instanceof Error ? error.message : String(error)}`;
     try {
@@ -1123,11 +1510,13 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
     } catch {
       // 诊断回执失败不改变原错误。
     }
-    return fail(detail, {
+    const gateResult = fail(detail, {
       contract,
       specHash,
       suiteFingerprint,
     });
+    gateResult.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint, specHash);
+    return gateResult;
   } finally {
     await closeServer(server);
   }
