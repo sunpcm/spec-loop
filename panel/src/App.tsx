@@ -51,6 +51,9 @@ import type {
   PanelStatus,
   PanelView,
   Scope,
+  TestRunStatus,
+  TestRunSummary,
+  TestRunsResponse,
 } from './types';
 
 type FetchState = 'loading' | 'live' | 'stale' | 'offline';
@@ -115,6 +118,26 @@ const STATUS_GUIDANCE: Record<PanelStatus, string> = {
   unknown: '现有记录不足以支持确定状态。',
 };
 
+const TEST_STATUS_TEXT: Record<TestRunStatus, string> = {
+  passed: '通过',
+  failed: '失败',
+  unknown: '未知',
+};
+
+const TEST_STAGE_TEXT = {
+  worker: 'Worker 验证',
+  build: '构建验证',
+  manual: '手动记录',
+  browser: '浏览器验收',
+} as const;
+
+const TEST_RUNNER_TEXT = {
+  'node:test': 'node:test',
+  playwright: 'Playwright',
+  manual: '手动',
+  unknown: '未知',
+} as const;
+
 const DEMO_GATE_NODE_ID: Record<DemoGate, string> = {
   document: 'docs-confirm',
   retry: 'check-retry',
@@ -173,6 +196,25 @@ async function fetchPanelView(signal: AbortSignal): Promise<PanelView> {
   return payload;
 }
 
+function isTestRunsResponse(value: unknown): value is TestRunsResponse {
+  if (!isRecord(value)) return false;
+  if (value.schemaVersion !== 'test-runs/v1') return false;
+  return Array.isArray(value.runs);
+}
+
+async function fetchTestRuns(signal: AbortSignal): Promise<TestRunSummary[]> {
+  const response = await fetch('/api/test-runs', {
+    method: 'GET',
+    cache: 'no-store',
+    headers: { Accept: 'application/json' },
+    signal,
+  });
+  if (!response.ok) throw new Error('Test-runs API rejected the request');
+  const payload: unknown = await response.json();
+  if (!isTestRunsResponse(payload)) throw new Error('Test-runs API returned an invalid view');
+  return payload.runs;
+}
+
 function formatDateTime(value: string | null | undefined): string {
   if (!value) return '未记录';
   const date = new Date(value);
@@ -195,6 +237,39 @@ function formatClock(value: Date | null): string {
     second: '2-digit',
     hour12: false,
   }).format(value);
+}
+
+function testSummaryText(run: TestRunSummary): string {
+  if (!run.summary) return '摘要未记录';
+  if (run.summary.runner === 'node:test') {
+    if (run.summary.unknown) return 'node:test 摘要未知或计数不一致';
+    const failed = run.summary.failed ?? 0;
+    const skipped = run.summary.skipped ?? 0;
+    const cancelled = run.summary.cancelled ?? 0;
+    const todo = run.summary.todo ?? 0;
+    if (run.summary.total === 0) return 'node:test · 未发现实际用例';
+    const rest = [failed ? `${failed} 失败` : '', skipped ? `${skipped} 跳过` : '', cancelled ? `${cancelled} 取消` : '', todo ? `${todo} 待办` : '']
+      .filter(Boolean)
+      .join(' · ');
+    return `node:test · ${run.summary.passed ?? 0}/${run.summary.total ?? 0} 通过${rest ? ` · ${rest}` : ''}`;
+  }
+  if (run.summary.unknown) return 'Playwright 摘要未知或不可解析';
+  const failed = run.summary.failedResultCount ?? 0;
+  if (run.summary.targetTestCount === 0) return 'Playwright · 未发现目标用例';
+  return `Playwright · ${run.summary.specCount ?? 0} 用例${failed ? ` · ${failed} 失败` : ''}`;
+}
+
+function testRunStatus(run: TestRunSummary): TestRunStatus {
+  if (run.ok === false) return 'failed';
+  if (run.ok !== true) return 'unknown';
+  if (!run.summary || run.summary.unknown) return 'unknown';
+  if (run.summary.runner === 'node:test' && run.summary.failed !== null && run.summary.failed > 0) return 'failed';
+  if (run.summary.runner === 'playwright' && run.summary.failedResultCount !== null && run.summary.failedResultCount > 0) {
+    return 'failed';
+  }
+  if (run.summary.runner === 'node:test' && run.summary.total === 0) return 'unknown';
+  if (run.summary.runner === 'playwright' && run.summary.targetTestCount === 0) return 'unknown';
+  return 'passed';
 }
 
 function shortSha(value: string | null): string {
@@ -386,12 +461,20 @@ function Sidebar({
   onSelectScope,
   demoMode,
   demoState,
+  testRuns,
+  selectedTestRunId,
+  testRunsIssue,
+  onSelectTestRun,
 }: {
   view: PanelView | null;
   scope: Scope;
   onSelectScope: (next: Scope) => void;
   demoMode: boolean;
   demoState: DemoState;
+  testRuns: TestRunSummary[];
+  selectedTestRunId: string | null;
+  testRunsIssue: string | null;
+  onSelectTestRun: (id: string) => void;
 }): JSX.Element {
   const requests = useMemo(() => sortNewestFirst(view?.requests ?? []), [view?.requests]);
   const deliveries = useMemo(
@@ -490,6 +573,28 @@ function Sidebar({
             ))}
           </WorkspaceListSection>
         ) : null}
+
+        <WorkspaceListSection title="测试与验收" count={testRuns.length}>
+          {demoMode ? (
+            <p className="list-empty">演示模式不展示真实测试记录</p>
+          ) : testRunsIssue ? (
+            <>
+              <p className="list-empty">测试记录暂时不可用</p>
+              <p className="list-empty">暂无测试运行记录</p>
+            </>
+          ) : testRuns.length > 0 ? (
+            testRuns.map((run) => (
+              <TestRunItem
+                key={run.id}
+                run={run}
+                selected={selectedTestRunId === run.id}
+                onSelect={() => onSelectTestRun(run.id)}
+              />
+            ))
+          ) : (
+            <p className="list-empty">暂无测试运行记录</p>
+          )}
+        </WorkspaceListSection>
       </div>
     </aside>
   );
@@ -531,6 +636,173 @@ function AttemptCard({ attempt }: { attempt: PanelDeliveryAttempt }): JSX.Elemen
         <span>更新 {formatDateTime(attempt.updatedAt)}</span>
       </div>
     </article>
+  );
+}
+
+function TestRunItem({
+  run,
+  selected,
+  onSelect,
+}: {
+  run: TestRunSummary;
+  selected: boolean;
+  onSelect: () => void;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      className={`workspace-item${selected ? ' selected' : ''}`}
+      aria-pressed={selected}
+      onClick={onSelect}
+    >
+      <span className="workspace-item-topline">
+        <span className="item-target">{run.stage}</span>
+        <span className={`status-badge status-${testRunStatus(run)} compact`}>
+          <span className="status-badge-dot" />
+          {TEST_STATUS_TEXT[testRunStatus(run)]}
+        </span>
+      </span>
+      <span className="workspace-item-title">{testSummaryText(run)}</span>
+      <span className="workspace-item-meta">
+        <span>{TEST_RUNNER_TEXT[run.runner]}</span>
+        <span>{formatDateTime(run.finishedAt ?? run.startedAt)}</span>
+      </span>
+    </button>
+  );
+}
+
+function ArtifactLink({ artifact }: { artifact: TestRunSummary['cases'][number]['artifacts'][number] }): JSX.Element {
+  if (!/^\/api\/test-runs\/[^/]+\/artifacts\/[^/]+$/.test(artifact.href)) {
+    return <span className="artifact-link-missing">附件链接无效</span>;
+  }
+  if (artifact.kind === 'video') {
+    return (
+      <div className="artifact-video">
+        <video controls preload="metadata" src={artifact.href} aria-label={artifact.name} />
+        <a href={artifact.href} download={artifact.name}>下载 {artifact.name}</a>
+      </div>
+    );
+  }
+  if (artifact.kind === 'screenshot') {
+    return (
+      <div className="artifact-image">
+        <img src={artifact.href} alt={artifact.name} loading="lazy" />
+        <a href={artifact.href} target="_blank" rel="noreferrer">打开 {artifact.name}</a>
+      </div>
+    );
+  }
+  return (
+    <a href={artifact.href} download={artifact.name}>
+      下载 {artifact.name}
+    </a>
+  );
+}
+
+function SummaryDetailRows({ run }: { run: TestRunSummary }): JSX.Element | null {
+  if (!run.summary) return null;
+  if (run.summary.unknown) return null;
+  if (run.summary.runner === 'node:test') {
+    return (
+      <>
+        <DetailRow label="总数">{run.summary.total ?? 0}</DetailRow>
+        <DetailRow label="通过">{run.summary.passed ?? 0}</DetailRow>
+        <DetailRow label="失败">{run.summary.failed ?? 0}</DetailRow>
+        <DetailRow label="跳过">{run.summary.skipped ?? 0}</DetailRow>
+        <DetailRow label="取消">{run.summary.cancelled ?? 0}</DetailRow>
+        <DetailRow label="待办">{run.summary.todo ?? 0}</DetailRow>
+        {run.summary.durationMs !== null ? <DetailRow label="耗时">{run.summary.durationMs} ms</DetailRow> : null}
+      </>
+    );
+  }
+  return (
+    <>
+      <DetailRow label="spec 数">{run.summary.specCount ?? 0}</DetailRow>
+      <DetailRow label="结果数">{run.summary.resultCount ?? 0}</DetailRow>
+      <DetailRow label="跳过">{run.summary.skipped ?? 0}</DetailRow>
+      <DetailRow label="flaky">{run.summary.flaky ?? 0}</DetailRow>
+      <DetailRow label="unexpected">{run.summary.unexpected ?? 0}</DetailRow>
+      <DetailRow label="错误">{run.summary.errorCount ?? 0}</DetailRow>
+      <DetailRow label="失败结果">{run.summary.failedResultCount ?? 0}</DetailRow>
+      <DetailRow label="重试">{run.summary.retriedCount ?? 0}</DetailRow>
+    </>
+  );
+}
+
+function TestRunDetails({ run }: { run: TestRunSummary }): JSX.Element {
+  return (
+    <section className="context-card test-run-card">
+      <div className="context-heading">
+        <div>
+          <span className="eyebrow">TEST EVIDENCE</span>
+          <h3>测试与验收</h3>
+        </div>
+        <span className={`status-badge status-${testRunStatus(run)} compact`}>
+          <span className="status-badge-dot" />
+          {TEST_STATUS_TEXT[testRunStatus(run)]}
+        </span>
+      </div>
+      <dl className="context-list">
+        <DetailRow label="来源">{TEST_STAGE_TEXT[run.stage]}</DetailRow>
+        <DetailRow label="运行器">{TEST_RUNNER_TEXT[run.runner]}</DetailRow>
+        <DetailRow label="摘要">{testSummaryText(run)}</DetailRow>
+        <SummaryDetailRows run={run} />
+        <DetailRow label="版本">
+          <span className="mono-value" title={run.version ?? undefined}>{shortSha(run.version)}</span>
+        </DetailRow>
+        <DetailRow label="任务">{run.jobId ? `#${run.jobId}` : '未记录'}</DetailRow>
+        <DetailRow label="需求">{run.reqId ?? '未记录'}</DetailRow>
+        <DetailRow label="spec">
+          <span className="mono-value" title={run.specHash ?? undefined}>{shortSha(run.specHash)}</span>
+        </DetailRow>
+        <DetailRow label="来源 main">
+          <span className="mono-value" title={run.sourceMainSha ?? undefined}>{shortSha(run.sourceMainSha)}</span>
+        </DetailRow>
+        <DetailRow label="候选树">
+          <span className="mono-value" title={run.candidateTreeSha ?? undefined}>{shortSha(run.candidateTreeSha)}</span>
+        </DetailRow>
+        <DetailRow label="套件指纹">
+          <span className="mono-value" title={run.suiteFingerprint ?? undefined}>{shortSha(run.suiteFingerprint)}</span>
+        </DetailRow>
+        <DetailRow label="开始">{formatDateTime(run.startedAt)}</DetailRow>
+        <DetailRow label="结束">{formatDateTime(run.finishedAt)}</DetailRow>
+      </dl>
+      {(run.artifacts ?? []).length > 0 ? (
+        <div className="artifact-stack">
+          {(run.artifacts ?? []).map((artifact) => (
+            <ArtifactLink key={artifact.id} artifact={artifact} />
+          ))}
+        </div>
+      ) : null}
+      {run.cases.length > 0 ? (
+        <div className="test-case-stack">
+          {run.cases.map((item) => (
+            <article key={`${item.id}-${item.title}`} className="test-case-card">
+              <div className="attempt-heading">
+                <strong>{item.id}</strong>
+                <span className={`status-badge status-${item.status} compact`}>
+                  <span className="status-badge-dot" />
+                  {TEST_STATUS_TEXT[item.status]}
+                </span>
+              </div>
+              <p>{item.title}</p>
+              {item.durationMs !== null ? <span>{item.durationMs} ms</span> : null}
+              {item.error ? <pre className="test-error">{item.error}</pre> : null}
+              {item.artifacts.length > 0 ? (
+                <div className="artifact-stack">
+                  {item.artifacts.map((artifact) => (
+                    <ArtifactLink key={artifact.id} artifact={artifact} />
+                  ))}
+                </div>
+              ) : (
+                <p className="list-empty">未保留</p>
+              )}
+            </article>
+          ))}
+        </div>
+      ) : (
+        <p className="list-empty">没有可用的用例附件记录</p>
+      )}
+    </section>
   );
 }
 
@@ -777,6 +1049,8 @@ function DetailsPanel({
   gate,
   drawerOpen,
   navigationRequest,
+  testRuns,
+  selectedTestRunId,
   onGateAction,
   onCloseDrawer,
 }: {
@@ -790,6 +1064,8 @@ function DetailsPanel({
   gate: DemoGate | null;
   drawerOpen: boolean;
   navigationRequest: { sequence: number; focusTitle: boolean };
+  testRuns: TestRunSummary[];
+  selectedTestRunId: string | null;
   onGateAction: (gate: DemoGate) => void;
   onCloseDrawer: () => void;
 }): JSX.Element {
@@ -805,6 +1081,8 @@ function DetailsPanel({
       : null;
   const stageIndex = view?.nodes.findIndex((node) => node.id === selectedNode?.id) ?? -1;
   const gateSelected = gate !== null && selectedNode?.id === DEMO_GATE_NODE_ID[gate];
+  const selectedTestRun =
+    selectedTestRunId ? testRuns.find((run) => run.id === selectedTestRunId) ?? null : null;
 
   useEffect(() => {
     const scroller = detailsScrollRef.current;
@@ -887,9 +1165,10 @@ function DetailsPanel({
           </>
         ) : (
           <>
+            {selectedTestRun ? <TestRunDetails run={selectedTestRun} /> : null}
             {request ? <RequestContext request={request} /> : null}
             {delivery ? <DeliveryContext delivery={delivery} /> : null}
-            {!request && !delivery ? <OverviewContext view={view} /> : null}
+            {!selectedTestRun && !request && !delivery ? <OverviewContext view={view} /> : null}
           </>
         )}
       </div>
@@ -1072,6 +1351,9 @@ export function App(): JSX.Element {
   const [followCurrentNode, setFollowCurrentNode] = useState(true);
   const [canvasFocused, setCanvasFocused] = useState(false);
   const [gateDrawerOpen, setGateDrawerOpen] = useState(false);
+  const [testRuns, setTestRuns] = useState<TestRunSummary[]>([]);
+  const [selectedTestRunId, setSelectedTestRunId] = useState<string | null>(null);
+  const [testRunsIssue, setTestRunsIssue] = useState<string | null>(null);
   const [detailNavigationRequest, setDetailNavigationRequest] = useState({
     sequence: 0,
     focusTitle: false,
@@ -1133,6 +1415,42 @@ export function App(): JSX.Element {
 
     void poll();
 
+    return () => {
+      cancelled = true;
+      if (nextPoll !== undefined) window.clearTimeout(nextPoll);
+      activeController?.abort();
+    };
+  }, [demoMode]);
+
+  useEffect(() => {
+    if (demoMode) {
+      setSelectedTestRunId(null);
+      return;
+    }
+
+    let cancelled = false;
+    let nextPoll: number | undefined;
+    let activeController: AbortController | null = null;
+
+    const poll = async (): Promise<void> => {
+      activeController = new AbortController();
+      const timeout = window.setTimeout(() => activeController?.abort(), 6500);
+      try {
+        const nextRuns = await fetchTestRuns(activeController.signal);
+        if (cancelled) return;
+        setTestRuns(nextRuns);
+        setTestRunsIssue(null);
+      } catch {
+        if (cancelled) return;
+        setTestRunsIssue('测试记录暂时不可用，保留已有记录。');
+      } finally {
+        window.clearTimeout(timeout);
+        activeController = null;
+        if (!cancelled) nextPoll = window.setTimeout(poll, 3000);
+      }
+    };
+
+    void poll();
     return () => {
       cancelled = true;
       if (nextPoll !== undefined) window.clearTimeout(nextPoll);
@@ -1220,6 +1538,7 @@ export function App(): JSX.Element {
   const selectScope = useCallback(
     (next: Scope) => {
       setScope(next);
+      setSelectedTestRunId(null);
       setFollowCurrentNode(true);
       const nextNodes = scopeNodes(view, next);
       const node = nextNodes.find((item) => item.current) ?? nextNodes[0];
@@ -1227,6 +1546,12 @@ export function App(): JSX.Element {
     },
     [view],
   );
+
+  const selectTestRun = useCallback((id: string) => {
+    setScope(null);
+    setSelectedNodeId(null);
+    setSelectedTestRunId(id);
+  }, []);
 
   const switchMode = (nextDemoMode: boolean) => {
     if (nextDemoMode === demoMode) return;
@@ -1237,6 +1562,7 @@ export function App(): JSX.Element {
     setFollowCurrentNode(true);
     setCanvasFocused(false);
     setGateDrawerOpen(false);
+    setSelectedTestRunId(null);
     setStateIssue(null);
     setFetchState(nextDemoMode ? 'live' : realView ? 'live' : 'loading');
   };
@@ -1392,6 +1718,10 @@ export function App(): JSX.Element {
           onSelectScope={selectScope}
           demoMode={demoMode}
           demoState={demoState}
+          testRuns={testRuns}
+          selectedTestRunId={selectedTestRunId}
+          testRunsIssue={testRunsIssue}
+          onSelectTestRun={selectTestRun}
         />
 
         <section className="canvas-column" aria-label="只读流程画布">
@@ -1468,6 +1798,8 @@ export function App(): JSX.Element {
           gate={activeGate}
           drawerOpen={gateDrawerOpen}
           navigationRequest={detailNavigationRequest}
+          testRuns={testRuns}
+          selectedTestRunId={selectedTestRunId}
           onGateAction={handleGateAction}
           onCloseDrawer={() => setGateDrawerOpen(false)}
         />

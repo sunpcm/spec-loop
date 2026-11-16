@@ -1,18 +1,22 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 
 import { GitClient } from '../orchestrator/git.ts';
 import { GithubClient, type GhRunner } from '../orchestrator/github.ts';
 import type { Logger } from '../orchestrator/log.ts';
 import { createPreviewServer } from '../orchestrator/preview.ts';
+import { parseSpecs } from '../orchestrator/specs.ts';
 import {
   createBuild,
   createCore,
   runOneWorkerForInput,
+  syncPendingSatisfiedReceipts,
   syncPendingStatusLabels,
   verifyReleaseOverHttp,
   type Core,
@@ -20,7 +24,15 @@ import {
 import { StateStore } from '../orchestrator/state.ts';
 import type { Config } from '../orchestrator/config.ts';
 import type { ManagedPR, OrchestratorState, Spec } from '../orchestrator/types.ts';
-import type { WorkerDeps, WorkerInput, WorkerOutcome } from '../orchestrator/worker.ts';
+import {
+  checkSatisfiedRevisionCurrent,
+  runWorkerJob,
+  type WorkerDeps,
+  type WorkerInput,
+  type WorkerOutcome,
+} from '../orchestrator/worker.ts';
+
+const execFileAsync = promisify(execFile);
 
 const silentLogger: Logger = {
   info: () => {},
@@ -120,9 +132,11 @@ interface WorkerHarness {
   notifications: string[];
   workerInputs: WorkerInput[];
   setOutcome: (outcome: WorkerOutcome) => void;
+  setIdle: () => void;
   setFailLabel: (label?: string) => void;
   setRemotePRs: (prs: ManagedPR[]) => void;
   setFailApi: (failed: boolean) => void;
+  setFailCommentAfterDelivery: (failed: boolean) => void;
 }
 
 function makeWorkerHarness(options?: { failLabel?: string }): WorkerHarness {
@@ -135,6 +149,7 @@ function makeWorkerHarness(options?: { failLabel?: string }): WorkerHarness {
   let outcome: WorkerOutcome = { status: 'failed', error: '未设置 fake worker 结局' };
   let failLabel: string | undefined = options?.failLabel;
   let failApi = false;
+  let failCommentAfterDelivery = false;
   const remotePRs: ManagedPR[] = [];
 
   const runner: GhRunner = async (args, opts) => {
@@ -152,10 +167,22 @@ function makeWorkerHarness(options?: { failLabel?: string }): WorkerHarness {
       const bodyIndex = args.findIndex((arg) => arg === '--body-file');
       const body = bodyIndex >= 0 ? (await import('node:fs')).readFileSync(args[bodyIndex + 1]!, 'utf8') : '';
       ghCalls.push({ kind: 'comment', body });
+      if (failCommentAfterDelivery) return { stdout: '', stderr: 'fake gh 评论响应丢失', code: 1 };
       return { stdout: '', stderr: '', code: 0 };
     }
     if (args[0] === 'api') {
       if (failApi) return { stdout: '', stderr: 'fake gh api 失败', code: 1 };
+      const path = args[args.length - 1] ?? '';
+      if (path.includes('/comments')) {
+        const bodies = ghCalls
+          .filter((call): call is Extract<GhCall, { kind: 'comment' }> => call.kind === 'comment')
+          .map((call) => call.body);
+        return {
+          stdout: JSON.stringify([bodies.map((body, i) => ({ id: i + 1, body }))]),
+          stderr: '',
+          code: 0,
+        };
+      }
       return { stdout: JSON.stringify([remotePRs]), stderr: '', code: 0 };
     }
     return { stdout: '', stderr: '', code: 0 };
@@ -193,6 +220,9 @@ function makeWorkerHarness(options?: { failLabel?: string }): WorkerHarness {
     setOutcome: (next) => {
       outcome = next;
     },
+    setIdle: () => {
+      outcome = undefined as unknown as WorkerOutcome;
+    },
     setFailLabel: (next) => {
       failLabel = next;
     },
@@ -201,6 +231,9 @@ function makeWorkerHarness(options?: { failLabel?: string }): WorkerHarness {
     },
     setFailApi: (failed) => {
       failApi = failed;
+    },
+    setFailCommentAfterDelivery: (failed) => {
+      failCommentAfterDelivery = failed;
     },
   };
 }
@@ -587,6 +620,294 @@ test('syncPendingStatusLabels 遇过期 revision 只清标记，不污染当前 
   assert.equal(job?.resumeAction, undefined);
 });
 
+test('runOneWorkerForInput satisfied 结局持久化 candidateTreeSha 并同步标签/回执，不部署不关单', async () => {
+  const harness = makeWorkerHarness();
+  harness.setOutcome({ status: 'satisfied', candidateTreeSha: '9'.repeat(40) });
+
+  const outcome = await runOneWorkerForInput(harness.core, input(harness));
+
+  assert.deepEqual(outcome, { status: 'satisfied', candidateTreeSha: '9'.repeat(40) });
+  assert.deepEqual(labelSequence(harness.ghCalls), [
+    'remove:all',
+    'add:pi-task+status:processing',
+    'remove:all',
+    'add:pi-task+status:satisfied',
+  ]);
+  const comments = harness.ghCalls.filter((call): call is Extract<GhCall, { kind: 'comment' }> => call.kind === 'comment');
+  assert.equal(comments.length, 1);
+  assert.match(comments[0]?.body ?? '', /已验收无需代码变更/);
+  assert.match(comments[0]?.body ?? '', new RegExp('9'.repeat(40)));
+  const job = harness.core.state.snapshot().jobs['job-1'];
+  assert.equal(job?.status, 'satisfied');
+  assert.equal(job?.candidateTreeSha, '9'.repeat(40));
+  assert.equal(job?.prNumber, undefined);
+  assert.equal(job?.headSHA, undefined);
+  assert.equal(job?.resumeAction, undefined);
+  assert.equal(harness.core.state.snapshot().deploy.activeSha, null);
+  assert.equal(
+    harness.notifications.some((text) => text.includes('已验收无需代码变更')),
+    true,
+  );
+});
+
+test('runOneWorkerForInput satisfied 回执失败保留 satisfied 状态并标记待补，不重跑 Worker', async () => {
+  const harness = makeWorkerHarness({ failLabel: 'status:satisfied' });
+  harness.setOutcome({ status: 'satisfied', candidateTreeSha: '8'.repeat(40) });
+
+  const outcome = await runOneWorkerForInput(harness.core, input(harness));
+
+  assert.equal(outcome.status, 'satisfied');
+  assert.equal(harness.workerInputs.length, 1);
+  const job = harness.core.state.snapshot().jobs['job-1'];
+  assert.equal(job?.status, 'satisfied');
+  assert.equal(job?.resumeAction, 'sync-satisfied-receipt');
+});
+
+test('satisfied 状态与待回执标志同次落盘，StateStore 重载后补回执且不重跑 Pi', async () => {
+  const harness = makeWorkerHarness();
+  const dir = mkdtempSync(join(tmpdir(), 'spec-loop-satisfied-reload-'));
+  const file = join(dir, 'state.json');
+  const initialState = makeState(requirementSpec());
+  class CrashAfterSatisfiedPersistStore extends StateStore {
+    crashes = 0;
+
+    protected override persist(state: OrchestratorState): void {
+      super.persist(state);
+      const job = state.jobs['job-1'];
+      if (job?.status === 'satisfied' && this.crashes === 0) {
+        this.crashes += 1;
+        throw new Error('模拟成功状态落盘后的进程崩溃');
+      }
+    }
+  }
+  const firstStore = new CrashAfterSatisfiedPersistStore(file, initialState);
+  firstStore.load();
+  await firstStore.update((s) => {
+    s.jobs['job-1'] = {
+      jobId: 'job-1',
+      reqId: 'REQ-A-01',
+      issueNumber: 12,
+      specHash: 'h1',
+      sourceMainSha: sourceSha,
+      attempt: 1,
+      status: 'processing',
+      startedAt: '',
+      updatedAt: '',
+    };
+    return undefined;
+  });
+  harness.core.state = firstStore;
+  harness.setOutcome({ status: 'satisfied', candidateTreeSha: 'a'.repeat(40) });
+  await assert.rejects(
+    () => runOneWorkerForInput(harness.core, input(harness)),
+    /模拟成功状态落盘后的进程崩溃/,
+  );
+  assert.equal(firstStore.crashes, 1);
+
+  const secondStore = new StateStore(file);
+  const persisted = secondStore.load();
+  const job = persisted.jobs['job-1'];
+  assert.equal(job?.status, 'satisfied');
+  assert.equal(job?.resumeAction, 'sync-satisfied-receipt');
+  assert.equal(job?.candidateTreeSha, 'a'.repeat(40));
+  const workerRunsBeforeRecovery = harness.workerInputs.length;
+  assert.equal(workerRunsBeforeRecovery, 1);
+  harness.core.state = secondStore;
+  await syncPendingSatisfiedReceipts(harness.core);
+  assert.equal(harness.workerInputs.length, workerRunsBeforeRecovery);
+  assert.equal(secondStore.load().jobs['job-1']?.resumeAction, undefined);
+  assert.equal(harness.ghCalls.filter((c) => c.kind === 'comment').length, 1);
+});
+
+test('satisfied 评论响应丢失后重试不重复评论，完整 revision 幂等键保持不变', async () => {
+  const harness = makeWorkerHarness();
+  harness.setFailCommentAfterDelivery(true);
+  harness.setOutcome({ status: 'satisfied', candidateTreeSha: 'b'.repeat(40) });
+  await runOneWorkerForInput(harness.core, input(harness));
+  assert.equal(harness.core.state.snapshot().jobs['job-1']?.resumeAction, 'sync-satisfied-receipt');
+  const comment = harness.ghCalls.find((c) => c.kind === 'comment');
+  assert.match(comment?.body ?? '', /回执幂等键/);
+  assert.match(comment?.body ?? '', /h1/);
+  assert.match(comment?.body ?? '', new RegExp(sourceSha));
+  assert.match(comment?.body ?? '', new RegExp('b'.repeat(40)));
+  await syncPendingSatisfiedReceipts(harness.core);
+  assert.equal(harness.workerInputs.length, 1);
+  assert.equal(harness.ghCalls.filter((c) => c.kind === 'comment').length, 1);
+  assert.equal(harness.core.state.snapshot().jobs['job-1']?.resumeAction, undefined);
+});
+
+test('satisfied 非法候选树 fail closed，不发布 succeeded 终态', async () => {
+  const harness = makeWorkerHarness();
+  harness.setOutcome({ status: 'satisfied', candidateTreeSha: 'not-a-tree' });
+  const outcome = await runOneWorkerForInput(harness.core, input(harness));
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.failureStage, 'publish');
+  assert.equal(harness.core.state.snapshot().jobs['job-1']?.status, 'failed');
+  assert.equal(harness.core.state.snapshot().jobs['job-1']?.candidateTreeSha, undefined);
+  assert.equal(harness.ghCalls.some((c) => c.kind === 'comment' && c.body.includes('已验收')), false);
+});
+
+test('真实 Git：same-spec 主线漂移及远端读取失败禁止 satisfied', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'spec-loop-satisfied-git-'));
+  const remote = join(root, 'remote.git');
+  const source = join(root, 'source');
+  const checkout = join(root, 'checkout');
+  const gitEnv = {
+    PATH: process.env.PATH ?? '',
+    HOME: root,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 'Test',
+    GIT_AUTHOR_EMAIL: 'test@example.invalid',
+    GIT_COMMITTER_NAME: 'Test',
+    GIT_COMMITTER_EMAIL: 'test@example.invalid',
+  };
+  const run = async (cwd: string, args: string[]): Promise<string> =>
+    (await execFileAsync('git', args, { cwd, encoding: 'utf8', env: gitEnv })).stdout.trim();
+  try {
+    await run(root, ['init', '--bare', '--initial-branch=main', remote]);
+    mkdirSync(join(source, 'docs', 'specs'), { recursive: true });
+    mkdirSync(join(source, 'src'), { recursive: true });
+    await run(source, ['init', '-b', 'main']);
+    const doc = '### [REQ-CNT-01] 计数器\n\n递增并保留步长。\n';
+    writeFileSync(join(source, 'docs', 'specs', 'counter.md'), doc, 'utf8');
+    writeFileSync(join(source, 'README.md'), 'v1\n', 'utf8');
+    writeFileSync(join(source, 'src', 'main.ts'), 'export const counter = 1;\n', 'utf8');
+    await run(source, ['add', '.']);
+    await run(source, ['commit', '-m', 'source']);
+    await run(source, ['remote', 'add', 'origin', remote]);
+    await run(source, ['push', '-u', 'origin', 'main']);
+    const sourceSha = await run(source, ['rev-parse', 'HEAD']);
+    const sourceTree = await run(source, ['rev-parse', 'HEAD^{tree}']);
+    await run(root, ['clone', remote, checkout]);
+    const git = new GitClient();
+    const parsed = parseSpecs({ 'docs/specs/counter.md': doc }).specs[0]!;
+    await run(root, ['-C', checkout, 'checkout', '-b', 'work', `origin/main`]);
+    assert.equal(await checkSatisfiedRevisionCurrent(git, checkout, 'main', sourceSha, sourceTree), true);
+    assert.equal(await checkSatisfiedRevisionCurrent(git, checkout, 'main', sourceSha, '0'.repeat(40)), false);
+
+    writeFileSync(join(source, 'README.md'), 'v2 same spec\n', 'utf8');
+    await run(source, ['add', 'README.md']);
+    await run(source, ['commit', '-m', 'same-spec drift']);
+    const driftSha = await run(source, ['rev-parse', 'HEAD']);
+    const driftTree = await run(source, ['rev-parse', 'HEAD^{tree}']);
+    await run(source, ['push']);
+    await run(root, ['-C', checkout, 'fetch', 'origin', 'main']);
+    await run(root, ['-C', checkout, 'checkout', '-B', 'work', 'origin/main']);
+    assert.notEqual(driftSha, sourceSha);
+    assert.notEqual(driftTree, sourceTree);
+    assert.equal(
+      parseSpecs({ 'docs/specs/counter.md': readFileSync(join(source, 'docs/specs/counter.md'), 'utf8') })
+        .specs[0]?.hash,
+      parsed.hash,
+    );
+    assert.equal(await checkSatisfiedRevisionCurrent(git, checkout, 'main', sourceSha, sourceTree), false);
+
+    let gateStarted = false;
+    const outcomePromise = runWorkerJob({
+      repoDir: checkout,
+      runDir: join(root, 'run'),
+      git,
+      github: {} as GithubClient,
+      logger: silentLogger,
+      runPi: async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        output: { files: [] },
+        durationMs: 0,
+        timedOut: false,
+      }),
+      verify: async () => [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }],
+      checkCurrent: async () => true,
+      runBrowserGate: async () => {
+        gateStarted = true;
+        writeFileSync(join(source, 'README.md'), 'v3 browser race\n', 'utf8');
+        await run(source, ['add', 'README.md']);
+        await run(source, ['commit', '-m', 'browser race']);
+        await run(source, ['push']);
+        return {
+          ok: true,
+          detail: '浏览器验收通过',
+          reportDir: join(root, 'report'),
+          reportPath: join(root, 'report', 'results.json'),
+          stdoutLogPath: join(root, 'report', 'stdout.txt'),
+          stderrLogPath: join(root, 'report', 'stderr.txt'),
+          suiteFingerprint: 'suite',
+        };
+      },
+    }, {
+      jobId: 'real-git-drift',
+      reqId: 'REQ-CNT-01',
+      issueNumber: 1,
+      spec: { ...parsed, path: 'docs/specs/counter.md' },
+      sourceMainSha: driftSha,
+      attempt: 1,
+    });
+    const outcome = await outcomePromise;
+    assert.equal(gateStarted, true);
+    assert.equal(outcome.status, 'stale');
+    assert.match(outcome.error ?? '', /来源主线或候选树已漂移/);
+
+    await run(checkout, ['remote', 'set-url', 'origin', join(root, 'missing.git')]);
+    await assert.rejects(
+      () => checkSatisfiedRevisionCurrent(git, checkout, 'main', sourceSha, sourceTree),
+      /git fetch/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('syncPendingSatisfiedReceipts 补同步标签与回执且不重复评论', async () => {
+  const harness = makeWorkerHarness({ failLabel: 'status:satisfied' });
+  harness.setOutcome({ status: 'satisfied', candidateTreeSha: '7'.repeat(40) });
+  await runOneWorkerForInput(harness.core, input(harness));
+  const commentsBefore = harness.ghCalls.filter((call) => call.kind === 'comment').length;
+  assert.equal(commentsBefore, 1);
+  harness.setFailLabel(undefined);
+
+  await syncPendingSatisfiedReceipts(harness.core);
+
+  assert.deepEqual(harness.workerInputs.length, 1);
+  const commentsAfter = harness.ghCalls.filter((call) => call.kind === 'comment').length;
+  assert.equal(commentsAfter, 1);
+  const job = harness.core.state.snapshot().jobs['job-1'];
+  assert.equal(job?.status, 'satisfied');
+  assert.equal(job?.resumeAction, undefined);
+  assert.equal(
+    labelSequence(harness.ghCalls).filter((call) => call.startsWith('add:')).at(-1),
+    'add:pi-task+status:satisfied',
+  );
+});
+
+test('syncPendingSatisfiedReceipts 遇旧 revision 只清标记，不污染当前 Issue', async () => {
+  const harness = makeWorkerHarness();
+  await harness.core.state.update((s) => {
+    s.jobs['job-old-sat'] = {
+      jobId: 'job-old-sat',
+      reqId: 'REQ-A-01',
+      issueNumber: 12,
+      specHash: 'old-hash',
+      sourceMainSha: '0'.repeat(40),
+      attempt: 1,
+      status: 'satisfied',
+      candidateTreeSha: '0'.repeat(40),
+      resumeAction: 'sync-satisfied-receipt',
+      startedAt: '',
+      updatedAt: '',
+    };
+    return undefined;
+  });
+
+  await syncPendingSatisfiedReceipts(harness.core);
+
+  assert.deepEqual(harness.ghCalls, []);
+  const job = harness.core.state.snapshot().jobs['job-old-sat'];
+  assert.equal(job?.status, 'satisfied');
+  assert.equal(job?.resumeAction, undefined);
+});
+
 test('createBuild 在沙箱前创建 outDir，注入版本资源 base 且不泄漏凭据 env', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'spec-loop-build-'));
   const sha = '2'.repeat(40);
@@ -611,6 +932,14 @@ test('createBuild 在沙箱前创建 outDir，注入版本资源 base 且不泄�
       runs.push({ cwd: opts.cwd, env: opts.env });
       return { code: 0, stdout: 'ok', stderr: '' };
     },
+    async () => ({
+      ok: true,
+      detail: '浏览器验收通过',
+      reportDir: '/tmp/report',
+      reportPath: '/tmp/report/results.json',
+      stdoutLogPath: '/tmp/report/playwright.stdout.txt',
+      stderrLogPath: '/tmp/report/playwright.stderr.txt',
+    }),
   );
   const result = await build(sha);
 
@@ -624,6 +953,41 @@ test('createBuild 在沙箱前创建 outDir，注入版本资源 base 且不泄�
   assert.equal(runs[0]?.env.GH_TOKEN, undefined);
   assert.equal(runs[0]?.env.PI_PROVIDER, undefined);
   assert.equal(runs[0]?.env.PI_MODEL, undefined);
+});
+
+test('createBuild 浏览器验收失败时返回失败且不继续成功发布', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'spec-loop-build-fail-'));
+  const sha = '3'.repeat(40);
+  const config = {
+    repoDir: dir,
+    runDir: join(dir, '.orchestrator'),
+    buildTimeoutMs: 1000,
+    piAgentDir: join(dir, '.orchestrator', 'agent'),
+  } as Config;
+  const git = {
+    archive: async (_cwd: string, _sha: string, destDir: string) => {
+      mkdirSync(destDir, { recursive: true });
+    },
+  } as unknown as GitClient;
+
+  const build = createBuild(
+    config,
+    git,
+    async () => ({ code: 0, stdout: 'ok', stderr: '' }),
+    async () => ({
+      ok: false,
+      detail: 'Playwright 退出码 1；报告目录 /tmp/report；stdout /tmp/report/stdout；stderr /tmp/report/stderr',
+      reportDir: '/tmp/report',
+      reportPath: '/tmp/report/results.json',
+      stdoutLogPath: '/tmp/report/stdout',
+      stderrLogPath: '/tmp/report/stderr',
+    }),
+  );
+
+  const result = await build(sha);
+  assert.equal(result.ok, false);
+  assert.match(result.detail, /浏览器验收失败/);
+  assert.match(result.detail, /退出码 1/);
 });
 
 test('预览服务当前/历史版本同路径可用，并阻止非法 SHA 与 symlink 逃逸', async (t) => {

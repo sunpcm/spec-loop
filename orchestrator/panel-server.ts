@@ -1,11 +1,13 @@
-import { readFileSync, realpathSync } from 'node:fs';
+import { createReadStream, readFileSync, realpathSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { join, resolve, sep } from 'node:path';
 import { buildPanelView, type PanelView } from './panel-view.ts';
+import { createTestEvidenceStore, type TestEvidenceStore } from './test-evidence.ts';
 
 export interface PanelServerOptions {
   readView: () => Promise<PanelView>;
   assetsDir: string;
+  testEvidence?: TestEvidenceStore;
 }
 
 export interface StaticAsset {
@@ -33,7 +35,7 @@ export function resolveStaticAsset(pathname: string): StaticAsset | null {
 
 // React Flow 运行时通过内联 style 设置节点位置/尺寸，故允许 style 内联；脚本保持 self。
 const CSP =
-  "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+  "default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; media-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; object-src 'none'";
 
 function normalizeHostname(hostname: string): string {
   return hostname.toLowerCase().replace(/^\[|\]$/g, '');
@@ -119,6 +121,71 @@ function realpathOrNull(path: string): string | null {
   }
 }
 
+function decodePathSegment(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return '';
+  }
+}
+
+function safeDownloadName(value: string): string {
+  const sanitized = value.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 120);
+  return sanitized || 'artifact';
+}
+
+function readFileSize(path: string): { size: number } | null {
+  try {
+    const stat = statSync(path);
+    return stat.isFile() ? { size: stat.size } : null;
+  } catch {
+    return null;
+  }
+}
+
+function createArtifactReadStream(path: string, range?: { start: number; end: number }) {
+  return createReadStream(path, range);
+}
+
+type ByteRangeResult =
+  | { kind: 'none' }
+  | { kind: 'invalid' }
+  | { kind: 'range'; start: number; end: number };
+
+export function parseByteRange(value: string | undefined, size: number): ByteRangeResult {
+  if (value === undefined) return { kind: 'none' };
+  const trimmed = value.trim();
+  if (!trimmed) return { kind: 'none' };
+  if (!trimmed.startsWith('bytes=')) return { kind: 'invalid' };
+  const spec = trimmed.slice('bytes='.length);
+  if (spec.includes(',')) return { kind: 'invalid' };
+  const match = /^(\d*)-(\d*)$/.exec(spec);
+  if (!match) return { kind: 'invalid' };
+  const startRaw = match[1] ?? '';
+  const endRaw = match[2] ?? '';
+  if (!startRaw && !endRaw) return { kind: 'invalid' };
+  if (size === 0) return { kind: 'invalid' };
+
+  if (startRaw) {
+    const start = Number(startRaw);
+    if (!Number.isSafeInteger(start) || start < 0) return { kind: 'invalid' };
+    if (start >= size) return { kind: 'invalid' };
+    let end = size - 1;
+    if (endRaw) {
+      const parsedEnd = Number(endRaw);
+      if (!Number.isSafeInteger(parsedEnd) || parsedEnd < 0) return { kind: 'invalid' };
+      if (parsedEnd < start) return { kind: 'invalid' };
+      end = Math.min(parsedEnd, size - 1);
+    }
+    return { kind: 'range', start, end };
+  }
+
+  const suffixLength = Number(endRaw);
+  if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return { kind: 'invalid' };
+  if (suffixLength >= size) return { kind: 'range', start: 0, end: size - 1 };
+  return { kind: 'range', start: size - suffixLength, end: size - 1 };
+}
+
 export function createPanelServer(opts: PanelServerOptions): Server {
   const cache = new Map<string, Buffer>();
   let rootReal: string | null | undefined;
@@ -184,6 +251,74 @@ export function createPanelServer(opts: PanelServerOptions): Server {
 
     if (pathname === '/api/health') {
       sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (pathname === '/api/test-runs') {
+      if (!opts.testEvidence) {
+        sendJson(res, 200, { schemaVersion: 'test-runs/v1', runs: [] });
+        return;
+      }
+      sendJson(res, 200, opts.testEvidence.listRuns());
+      return;
+    }
+
+    const testRunArtifactMatch = /^\/api\/test-runs\/([^/]+)\/artifacts\/([^/]+)$/.exec(pathname);
+    if (testRunArtifactMatch && opts.testEvidence) {
+      const runId = decodePathSegment(testRunArtifactMatch[1] ?? '');
+      const artifactId = decodePathSegment(testRunArtifactMatch[2] ?? '');
+      const artifact = opts.testEvidence.readRunArtifact(runId, artifactId);
+      if (!artifact) {
+        sendText(res, 404, 'not found\n', 'text/plain; charset=utf-8');
+        return;
+      }
+
+      const stat = readFileSize(artifact.path);
+      if (!stat) {
+        sendText(res, 404, 'not found\n', 'text/plain; charset=utf-8');
+        return;
+      }
+
+      res.statusCode = 200;
+      res.setHeader('Content-Type', artifact.contentType);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Accept-Ranges', 'bytes');
+      if (artifact.kind === 'json' || artifact.kind === 'trace') {
+        res.setHeader('Content-Disposition', `attachment; filename="${safeDownloadName(artifact.name)}"`);
+      }
+      const range = parseByteRange(req.headers.range, stat.size);
+      if (range.kind === 'invalid') {
+        res.statusCode = 416;
+        res.setHeader('Content-Range', `bytes */${stat.size}`);
+        res.setHeader('Content-Length', '0');
+        res.end();
+        return;
+      }
+      if (range.kind === 'range') {
+        res.statusCode = 206;
+        res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${stat.size}`);
+        res.setHeader('Content-Length', String(range.end - range.start + 1));
+      } else {
+        res.setHeader('Content-Length', String(stat.size));
+      }
+      if (req.method === 'HEAD') {
+        res.end();
+        return;
+      }
+      const stream = createArtifactReadStream(
+        artifact.path,
+        range.kind === 'range' ? { start: range.start, end: range.end } : undefined,
+      );
+      stream.on('error', () => {
+        if (!res.headersSent) {
+          res.statusCode = 404;
+          res.end('not found\n');
+        } else {
+          res.destroy();
+        }
+      });
+      stream.pipe(res);
       return;
     }
 

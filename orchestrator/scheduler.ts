@@ -12,6 +12,7 @@ export const STATUS_LABELS = [
   'status:in-review',
   'status:done',
   'status:failed',
+  'status:satisfied',
 ];
 
 export interface ReconcileContext {

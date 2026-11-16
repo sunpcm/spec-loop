@@ -30,6 +30,10 @@
 
 实施交付需明确源码范围、实际执行的命令/退出码、失败及未验证外部依赖。主 Agent 独立执行 `npm run typecheck`、`npm test`、`npm run build` 并核对关键权限/版本/恢复路径。
 
+浏览器验收门禁：Worker 在固定 `typecheck`/`node:test`/`build` 通过后、commit/push/PR 前强制跑 `runBrowserGate`；合并构建在固定检查和构建后对同一产物验收，成功才继续 `healthCheck/switchPreview/markDeployed`。门禁在独立 `sandbox-exec` profile 中运行，只放行该次候选的本机固定端口，禁止公网/其他端口/敏感读/源写。真实 HTTP/listen 集成测试用 `SPEC_LOOP_VERIFY=1` 主验收门控，默认 `npm test` 不尝试 listen。`npm run test:e2e*` 必须经 `orchestrator/browser-gate-cli.ts` 的同一受控沙箱，不接受裸跑 `playwright test` 或任意外站 URL。
+
+测试所有权：`tests/e2e/**` 与 `playwright.config.ts` 由独立测试作者维护，契约 `tests/e2e/contracts/counter.json`（`reqId/specPath/specHash/caseIds`）与 `panel.json`（仅 `caseIds`）是其输出；实施节点不改、不读其私有目录，也不代写或刷新预期哈希。可信验收套件来自已部署控制器受管资产（`WorkerDeps.browserE2eRoot`），与候选 `sourceMainSha` 快照分离，避免把测试基线锁死在旧请求 SHA。
+
 没有数据库或外部业务测试库；测试使用临时 Git 仓库及模拟 gh/Pi/飞书。真实 GitHub/Pi/飞书验收由主 Agent 在本任务授权范围执行，人工 Merge 由用户完成。
 
 能力只有在实现合入已部署的主线并完成对应真实验收后才可记录为可用。Vercel Ready 只代表静态前端云端部署，不代表控制器、Pi 或飞书入口运行在云上。评审提示与报告保存在 `.review/`，不被 Git 跟踪；实施时遵循任务说明的文件所有权，不读取其他节点私有评审探针。

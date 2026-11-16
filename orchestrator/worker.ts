@@ -1,5 +1,12 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import {
+  resolveBrowserCacheDir,
+  runBrowserGate,
+  readSpecFilesFromDir,
+  type BrowserGateOptions,
+  type BrowserGateResult,
+} from './browser-gate.ts';
 import { encodeMetaBlock } from './github.ts';
 import type { GitClient } from './git.ts';
 import type { GithubClient } from './github.ts';
@@ -8,6 +15,8 @@ import { preparePiAgentDir, runPi, type PiInvocation, type PiResult } from './pi
 import { WORKER_PROMPT } from './prompts.ts';
 import { buildIsolationPaths, type IsolationPaths, type SandboxProfileSpec } from './sandbox.ts';
 import { parseSpecs } from './specs.ts';
+import { createNodeTestRunRecord } from './test-evidence-node.ts';
+import { writeTestRunRecord } from './test-evidence.ts';
 import {
   buildVerifierEnv,
   defaultVerificationCommands,
@@ -27,6 +36,7 @@ export interface WorkerDeps {
   runPi?: (inv: PiInvocation) => Promise<PiResult>;
   verify?: (cwd: string) => Promise<VerificationResult[]>;
   checkCurrent?: (spec: Spec) => Promise<boolean>;
+  checkSatisfiedRevisionCurrent?: (sourceMainSha: string, candidateTreeSha: string) => Promise<boolean>;
   logger: Logger;
   notify?: (text: string) => Promise<void>;
   mainBranch?: string;
@@ -38,6 +48,11 @@ export interface WorkerDeps {
   piAttempts?: number;
   piTotalBudgetMs?: number;
   verifyTimeoutMs?: number;
+  browserCacheDir?: string;
+  browserGateTimeoutMs?: number;
+  /** 可信验收套件根目录（已部署控制器的受管 tests/e2e + playwright.config.ts），默认取当前控制器工作树。 */
+  browserE2eRoot?: string;
+  runBrowserGate?: (opts: BrowserGateOptions) => Promise<BrowserGateResult>;
 }
 
 export interface WorkerInput {
@@ -49,13 +64,15 @@ export interface WorkerInput {
   attempt: number;
 }
 
-export type WorkerStatus = 'published' | 'failed' | 'stale';
+export type WorkerStatus = 'published' | 'failed' | 'stale' | 'satisfied';
 
 export interface WorkerOutcome {
   status: WorkerStatus;
   prNumber?: number;
   branch?: string;
   headSHA?: string;
+  /** 无代码变更验收时持久化的候选树 SHA，作为 satisfied 终态的可信证据锚点。 */
+  candidateTreeSha?: string;
   error?: string;
   failureStage?: 'plan' | 'write' | 'verify' | 'commit' | 'publish';
   resumeAction?: string;
@@ -87,6 +104,48 @@ export async function checkSpecCurrent(
   const files = await git.readSpecSnapshot(repoDir, `origin/${mainBranch}`);
   const parsed = parseSpecs(files);
   return parsed.specs.some((s) => s.id === spec.id && s.hash === spec.hash);
+}
+
+/**
+ * 无代码变更成功的版本锚点：fresh origin/main 必须等于固定来源提交，候选树也必须等于该提交的树。
+ * 任一步失败都抛出，由 Worker 失败关闭；同需求内容的主线漂移同样不能记成功。
+ */
+export async function checkSatisfiedRevisionCurrent(
+  git: GitClient,
+  repoDir: string,
+  mainBranch: string,
+  sourceMainSha: string,
+  candidateTreeSha: string,
+): Promise<boolean> {
+  await git.fetch(repoDir, mainBranch);
+  const liveMainSha = (await git.revParse(repoDir, `origin/${mainBranch}`)).trim().toLowerCase();
+  const expected = sourceMainSha.trim().toLowerCase();
+  const candidate = candidateTreeSha.trim().toLowerCase();
+  const sourceTreeSha = (await git.revParse(repoDir, `${expected}^{tree}`)).trim().toLowerCase();
+  return liveMainSha === expected && candidate === sourceTreeSha;
+}
+
+/** Worker 结果只在完整 40 位提交/树锚点下进入 satisfied；返回值即实际落盘证据。 */
+export function validateSatisfiedOutcome(outcome: WorkerOutcome): WorkerOutcome {
+  if (outcome.status !== 'satisfied') return outcome;
+  const candidate = typeof outcome.candidateTreeSha === 'string'
+    ? outcome.candidateTreeSha.trim().toLowerCase()
+    : '';
+  return /^[0-9a-f]{40}$/.test(candidate)
+    ? {
+        status: 'satisfied',
+        candidateTreeSha: candidate,
+        ...(outcome.piAttempts === undefined ? {} : { piAttempts: outcome.piAttempts }),
+        ...(outcome.piLogDir === undefined ? {} : { piLogDir: outcome.piLogDir }),
+      }
+    : {
+        status: 'failed',
+        error: '无代码变更验收缺少有效候选树 SHA，拒绝 satisfied',
+        failureStage: 'publish',
+        resumeAction: 'worker',
+        piAttempts: outcome.piAttempts,
+        piLogDir: outcome.piLogDir,
+      };
 }
 
 function linkNodeModules(repoDir: string, workDir: string): void {
@@ -200,7 +259,9 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
   const jobCache = join(jobRoot, 'cache');
   const agentDir = join(jobRoot, 'agent');
   const jobLogDir = join(jobRoot, 'logs');
+  const browserEvidenceDir = join(deps.runDir, 'browser', 'worker', input.jobId);
   let published = false;
+  let satisfied = false;
 
   try {
     mkdirSync(workDir, { recursive: true });
@@ -309,9 +370,11 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
         resumeAction: 'worker',
       };
     }
-
+    // 真实候选与固定来源主线树相同时，不通过空提交伪造代码交付；仍必须走完
+    // 可信 typecheck/node:test/build、浏览器门禁与发布前 fresh 校验后返回 satisfied。
     // 在无 .git 的候选快照中验证：源/测试/配置只读，仅 dist 与作业临时目录可写。
     const treeSha = await deps.git.writeTree(workDir);
+    const noCodeChange = changed.length === 0;
     rmSync(snapshotDir, { recursive: true, force: true });
     await deps.git.archive(deps.repoDir, treeSha, snapshotDir);
     linkNodeModules(deps.repoDir, snapshotDir);
@@ -334,6 +397,27 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       );
     });
     const verification = await verify(snapshotDir);
+    const testResult = verification.find((item) => item.name === 'test');
+    if (testResult) {
+      const record = createNodeTestRunRecord({
+        stage: 'worker',
+        version: input.sourceMainSha,
+        startedAt: null,
+        finishedAt: new Date().toISOString(),
+        jobId: input.jobId,
+        reqId: input.reqId,
+        specHash: input.spec.hash,
+        sourceMainSha: input.sourceMainSha,
+        candidateTreeSha: treeSha,
+        ok: testResult.ok,
+        stdout: `${testResult.stdout}\n${testResult.stderr}`,
+      });
+      try {
+        writeTestRunRecord(join(deps.runDir, 'test-runs'), record);
+      } catch (error) {
+        logger.warn(`写入 node:test 摘要失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     if (!verificationPassed(verification)) {
       await deps.git.reset(workDir);
       return {
@@ -344,12 +428,104 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       };
     }
 
-    const stillCurrent = await (deps.checkCurrent ?? (() => checkSpecCurrent(deps.git, deps.repoDir, mainBranch, input.spec)))(
-      input.spec,
-    );
+    const satisfiedRevisionCurrent = deps.checkSatisfiedRevisionCurrent
+      ?? ((source: string, candidate: string) =>
+        checkSatisfiedRevisionCurrent(deps.git, deps.repoDir, mainBranch, source, candidate));
+    const stillCurrent = noCodeChange
+      ? await satisfiedRevisionCurrent(input.sourceMainSha, treeSha)
+      : await (deps.checkCurrent ?? (() => checkSpecCurrent(deps.git, deps.repoDir, mainBranch, input.spec)))(
+          input.spec,
+        );
     if (!stillCurrent) {
       await deps.git.reset(workDir);
-      return { status: 'stale', error: `需求 ${input.reqId} 版本已变化，取消发布`, failureStage: 'publish' };
+      return {
+        status: 'stale',
+        error: `需求 ${input.reqId} ${noCodeChange ? '来源主线或候选树已漂移' : '版本已变化'}，取消发布`,
+        failureStage: 'publish',
+      };
+    }
+
+    // 固定检查通过后、commit/push/PR 前强制浏览器验收；失败走既有 verify 失败路径，不产生 PR。
+    const browserCacheDir = deps.browserCacheDir ?? resolveBrowserCacheDir();
+    const browserE2eRoot = deps.browserE2eRoot ?? deps.repoDir;
+    const browserGate = deps.runBrowserGate ?? runBrowserGate;
+    // 浏览器证据与 jobRoot 的生命周期分离；成功发布不能删除 PR 引用的报告、
+    // 回执和冻结套件，凭据仍只放在会被清理的 agent 目录。
+    mkdirSync(browserEvidenceDir, { recursive: true });
+    const gateResult = await browserGate({
+      repoDir: deps.repoDir,
+      e2eRoot: browserE2eRoot,
+      artifactDir: join(snapshotDir, 'dist'),
+      mountPath: '/',
+      version: input.sourceMainSha,
+      project: 'counter',
+      reqId: input.reqId,
+      specFiles: readSpecFilesFromDir(snapshotDir),
+      jobTmp: browserEvidenceDir,
+      browserCacheDir,
+      globalAgentDir,
+      agentDir,
+      logger,
+      timeoutMs: deps.browserGateTimeoutMs,
+      testRunsRoot: join(deps.runDir, 'test-runs'),
+      evidenceStage: 'worker',
+      jobId: input.jobId,
+      sourceMainSha: input.sourceMainSha,
+      candidateTreeSha: treeSha,
+    });
+    writeBoundedLog(
+      browserEvidenceDir,
+      'browser-gate.json',
+      JSON.stringify(
+        {
+          reqId: input.reqId,
+          specHash: input.spec.hash,
+          sourceMainSha: input.sourceMainSha,
+          candidateTreeSha: treeSha,
+          suiteFingerprint: gateResult.suiteFingerprint,
+          ok: gateResult.ok,
+          detail: gateResult.detail,
+          reportDir: gateResult.reportDir,
+          reportPath: gateResult.reportPath,
+          stdoutLogPath: gateResult.stdoutLogPath,
+          stderrLogPath: gateResult.stderrLogPath,
+          receiptPath: gateResult.receiptPath,
+          displayVersion: input.sourceMainSha,
+          executedCaseIds: gateResult.executedCaseIds,
+        },
+        null,
+        2,
+      ),
+    );
+    if (!gateResult.ok) {
+      await deps.git.reset(workDir);
+      return {
+        status: 'failed',
+        error: `浏览器验收失败：${gateResult.detail}`,
+        failureStage: 'verify',
+        resumeAction: 'worker',
+      };
+    }
+
+    // 浏览器门禁可能运行很久，期间 origin/main 可能变化。无变更成功必须再次 fresh 核对
+    // 固定提交 SHA 与候选树；有变更仍按需求版本检查。不能复用早期布尔值。
+    const stillCurrentAfterBrowser = noCodeChange
+      ? await satisfiedRevisionCurrent(input.sourceMainSha, treeSha)
+      : await (deps.checkCurrent ?? (() => checkSpecCurrent(deps.git, deps.repoDir, mainBranch, input.spec)))(
+          input.spec,
+        );
+    if (!stillCurrentAfterBrowser) {
+      await deps.git.reset(workDir);
+      return {
+        status: 'stale',
+        error: `需求 ${input.reqId} ${noCodeChange ? '来源主线或候选树已漂移' : '版本已变化'}，取消发布`,
+        failureStage: 'publish',
+      };
+    }
+
+    if (noCodeChange) {
+      satisfied = true;
+      return { status: 'satisfied', candidateTreeSha: treeSha, piAttempts: attemptsRun };
     }
 
     await deps.git.commit(workDir, `feat(${input.reqId}): 实现 ${input.spec.title}`);
@@ -359,7 +535,7 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
     }
     await deps.git.push(workDir, branch);
 
-    const prBody = buildPrBody(input, verification);
+    const prBody = buildPrBody(input, verification, gateResult, treeSha);
     const prNumber = await deps.github.createPR(`[${input.reqId}] ${input.spec.title}`, prBody, branch, mainBranch);
 
     published = true;
@@ -373,7 +549,7 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       resumeAction: 'worker',
     };
   } finally {
-    if (!published) {
+    if (!published && !satisfied) {
       logger.warn(`保留失败/过期作业 worktree 与日志供诊断: ${workDir}（日志 ${jobLogDir}）`);
       // 仅清理体积较大的缓存/临时/agent，保留有界日志与 worktree。
       rmSync(jobCache, { recursive: true, force: true });
@@ -391,8 +567,17 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
   }
 }
 
-function buildPrBody(input: WorkerInput, verification: VerificationResult[]): string {
+function buildPrBody(
+  input: WorkerInput,
+  verification: VerificationResult[],
+  browserGate: BrowserGateResult,
+  candidateTreeSha: string,
+): string {
   const checks = verification.map((v) => `${v.ok ? '✅' : '❌'} ${v.name}`).join('\n');
+  const browserCheck = `${browserGate.ok ? '✅' : '❌'} browser`;
+  const browserEvidence = browserGate.reportDir
+    ? `\n浏览器报告：\`${browserGate.reportDir}\``
+    : '';
   const meta = encodeMetaBlock({
     schema: 1,
     system: 'spec-loop',
@@ -401,9 +586,10 @@ function buildPrBody(input: WorkerInput, verification: VerificationResult[]): st
     specPath: input.spec.path,
     specHash: input.spec.hash,
     sourceMainSha: input.sourceMainSha,
+    candidateTreeSha,
     jobId: input.jobId,
     attempt: input.attempt,
     operationKey: `${input.spec.hash}:${input.sourceMainSha}:${input.attempt}`,
   });
-  return `Closes #${input.issueNumber}\n\n需求 ID：\`${input.reqId}\`\n需求哈希：\`${input.spec.hash}\`\n来源 SHA：\`${input.sourceMainSha}\`\n\n验证结果：\n${checks}\n\n${meta}`;
+  return `Closes #${input.issueNumber}\n\n需求 ID：\`${input.reqId}\`\n需求哈希：\`${input.spec.hash}\`\n来源 SHA：\`${input.sourceMainSha}\`\n候选树 SHA：\`${candidateTreeSha}\`\n\n验证结果：\n${checks}\n${browserCheck}${browserEvidence}\n\n${meta}`;
 }
