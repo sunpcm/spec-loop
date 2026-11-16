@@ -620,6 +620,54 @@ test('syncPendingStatusLabels 遇过期 revision 只清标记，不污染当前 
   assert.equal(job?.resumeAction, undefined);
 });
 
+test('syncPendingStatusLabels 跳过被新基线取代的旧 Job，保留其恢复字段与时间', async () => {
+  const harness = makeWorkerHarness();
+  const old = {
+    jobId: 'job-old',
+    reqId: 'REQ-A-01',
+    issueNumber: 12,
+    specHash: 'h1',
+    sourceMainSha: sourceSha,
+    attempt: 1,
+    status: 'failed' as const,
+    failureStage: 'sync-status-label',
+    resumeAction: 'sync-status-label',
+    startedAt: '2026-11-15T00:00:00Z',
+    updatedAt: '2026-11-15T00:00:00Z',
+  };
+  const marker = structuredClone(old);
+  await harness.core.state.update((s) => {
+    s.jobs['job-old'] = { ...old };
+    s.retryBaselines = {
+      'retry-baseline-aaaaaaaaaaaaaaaaaaaaaaaa': {
+        operationId: 'retry-baseline-aaaaaaaaaaaaaaaaaaaaaaaa',
+        reqId: 'REQ-A-01',
+        issueNumber: 12,
+        specPath: 'docs/specs/REQ-A-01.md',
+        specHash: 'h1',
+        fromJobId: 'job-old',
+        fromSourceMainSha: sourceSha,
+        targetSourceMainSha: sourceSha,
+        newJobId: 'retry-baseline-aaaaaaaaaaaaaaaaaaaaaaaa-job',
+        attempt: 2,
+        stage: 'stale',
+        createdAt: '2026-11-17T00:00:00Z',
+        updatedAt: '2026-11-17T00:00:00Z',
+      },
+    };
+    return undefined;
+  });
+  await syncPendingStatusLabels(harness.core);
+  assert.deepEqual(harness.ghCalls, []);
+  assert.deepEqual(
+    ((snapshot) => {
+      const job = snapshot.jobs['job-old']!;
+      return { failureStage: job.failureStage, resumeAction: job.resumeAction, updatedAt: job.updatedAt };
+    })(harness.core.state.snapshot()),
+    { failureStage: marker.failureStage, resumeAction: marker.resumeAction, updatedAt: marker.updatedAt },
+  );
+});
+
 test('runOneWorkerForInput satisfied 结局持久化 candidateTreeSha 并同步标签/回执，不部署不关单', async () => {
   const harness = makeWorkerHarness();
   harness.setOutcome({ status: 'satisfied', candidateTreeSha: '9'.repeat(40) });
@@ -1060,7 +1108,7 @@ test('verifyReleaseOverHttp 使用 /releases/<sha>/ 同一路径验证候选资�
     t.skip('当前沙箱禁止 127.0.0.1 listen（EPERM），保留真实 HTTP 测试但不降级为 mock');
     return;
   }
-  const dir = mkdtempSync(tmpdir());
+  const dir = mkdtempSync(join(tmpdir(), 'spec-loop-release-http-'));
   const sha = 'c'.repeat(40);
   const release = join(dir, 'releases', sha);
   mkdirSync(join(release, 'assets'), { recursive: true });

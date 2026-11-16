@@ -511,6 +511,26 @@ test('同 target 的 failed 请求、活动 Worker 与 open 代码 PR 都阻止�
   assert.match(blockedByWorker, /活动 Worker #3/);
   assert.equal(workerHarness.piInvocations.length, 0);
 
+  const todoHarness = createHarness();
+  await todoHarness.state.update((state) => {
+    state.jobs.todo = makeJob('todo', 1, 'todo', todoHarness.fixture.baseSHA);
+  });
+  const blockedByTodo = await submitSpecRequirement(todoHarness.deps, '另一条需求', 'om-todo');
+  assert.match(blockedByTodo, /活动 Worker #3/);
+  assert.equal(todoHarness.piInvocations.length, 0);
+
+  const failedJobHarness = createHarness();
+  await failedJobHarness.state.update((state) => {
+    state.jobs.failed = makeJob('failed', 1, 'failed', failedJobHarness.fixture.baseSHA);
+  });
+  const allowedAfterRetryableFailure = await submitSpecRequirement(
+    failedJobHarness.deps,
+    '失败作业后的新需求',
+    'om-failed-job',
+  );
+  assert.doesNotMatch(allowedAfterRetryableFailure, /活动 Worker/);
+  assert.equal(failedJobHarness.piInvocations.length, 1);
+
   const prHarness = createHarness();
   prHarness.fakeGithub.addPR({
     number: 4,

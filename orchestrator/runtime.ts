@@ -11,7 +11,7 @@ import {
 } from './browser-gate.ts';
 import { createCommands } from './commands.ts';
 import type { Config } from './config.ts';
-import { deployOnce, type DeployDeps, type DeployResult } from './deploy.ts';
+import { deployOnce, retryDeployForIssue, type DeployDeps, type DeployResult } from './deploy.ts';
 import type { FeishuCommands } from './feishu-contract.ts';
 import { GitClient } from './git.ts';
 import { encodeMetaBlock, GithubClient } from './github.ts';
@@ -20,6 +20,11 @@ import { MergeService } from './merge.ts';
 import { Notifier } from './notifier.ts';
 import { deriveIssueBody } from './planner.ts';
 import { buildRequirementMeta } from './reconciler.ts';
+import {
+  hasActiveRetryBaseline,
+  resumeRetryBaselines,
+  type RetryBaselineDeps,
+} from './retry-baseline.ts';
 import { createStaticServer, extractAssetRefs } from './preview.ts';
 import { buildIsolationPaths, type SandboxProfileSpec } from './sandbox.ts';
 import {
@@ -30,7 +35,7 @@ import {
   type ReconcileSummary,
 } from './scheduler.ts';
 import { StateStore } from './state.ts';
-import type { JobState, ManagedPR, Spec } from './types.ts';
+import type { JobState, ManagedPR, OrchestratorState, Spec } from './types.ts';
 import {
   buildVerifierEnv,
   defaultVerificationCommands,
@@ -71,6 +76,7 @@ export interface Core {
   deployDeps: DeployDeps;
   reconcileContext: ReconcileContext;
   specIntakeDeps: SpecIntakeDeps;
+  retryBaselineDeps?: RetryBaselineDeps;
   planner: ((spec: Spec) => Promise<string | null>) | null;
   repo: string | null;
   workerRunner?: WorkerJobRunner;
@@ -437,6 +443,18 @@ export function createCore(
     workerRunner: runWorkerJob,
   };
 
+  const retryBaselineDeps: RetryBaselineDeps = {
+    repoDir: config.repoDir,
+    state,
+    git,
+    github,
+    logger: createLogger('RETRY-BASELINE'),
+    retryWorker: (input) => runOneWorkerForInput(core, input),
+    retryDeploy: (issueNumber, prNumber) => retryDeployForIssue(deployDeps, issueNumber, prNumber),
+    findExistingDelivery: (input) => findExistingDelivery(core, input),
+    trustedE2eRoot: workerDeps.browserE2eRoot ?? config.repoDir,
+    mainBranch: config.mainBranch,
+  };
   const commands = createCommands({
     repoDir: config.repoDir,
     state,
@@ -449,6 +467,7 @@ export function createCore(
     retryWorker: (input) => runOneWorkerForInput(core, input),
     requireSpec: (description, messageId) => submitSpecRequirement(specIntakeDeps, description, messageId),
     retrySpec: (requestId) => retrySpecRequirement(specIntakeDeps, requestId),
+    retryBaselineDeps,
     mergeService,
   });
 
@@ -469,6 +488,8 @@ export function createCore(
 
   core.commands = commands;
   core.planner = planner;
+  core.retryBaselineDeps = retryBaselineDeps;
+  reconcileContext.retryBaselines = retryBaselineDeps;
 
   return core;
 }
@@ -483,6 +504,7 @@ export async function reconcileWithPlanner(
   if (planner) {
     for (const op of summary.ops) {
       if ((op.kind === 'create' || op.kind === 'update') && op.spec) {
+        if (hasActiveRetryBaseline(ctx.state.snapshot(), op.reqId)) continue;
         const body = await planner(op.spec);
         if (body) {
           const meta = encodeMetaBlock(buildRequirementMeta(op.spec, summary.targetMainSha));
@@ -670,7 +692,11 @@ export async function syncPendingStatusLabels(core: Core): Promise<void> {
     (job) => job.failureStage === 'sync-status-label' || job.resumeAction === 'sync-status-label',
   );
   for (const job of pending) {
-    const requirement = core.state.snapshot().requirements[job.reqId];
+    const current = core.state.snapshot();
+    const requirement = current.requirements[job.reqId];
+    // 显式基线已接管旧 revision，或同一 revision 已有更高 attempt 时，
+    // 旧标签回执只能留在旧 Job 上供审计，不能改写新 Issue 状态。
+    if (isSupersededWorkerRecovery(current, job)) continue;
     if (
       !requirement ||
       requirement.issueNumber !== job.issueNumber ||
@@ -775,7 +801,9 @@ export async function syncPendingSatisfiedReceipts(core: Core): Promise<void> {
     (job) => job.status === 'satisfied' && job.resumeAction === 'sync-satisfied-receipt',
   );
   for (const job of pending) {
-    const requirement = core.state.snapshot().requirements[job.reqId];
+    const current = core.state.snapshot();
+    const requirement = current.requirements[job.reqId];
+    if (isSupersededWorkerRecovery(current, job)) continue;
     if (
       !requirement ||
       requirement.issueNumber !== job.issueNumber ||
@@ -805,6 +833,26 @@ export async function syncPendingSatisfiedReceipts(core: Core): Promise<void> {
       return undefined;
     });
   }
+}
+
+function isSupersededWorkerRecovery(state: OrchestratorState, job: JobState): boolean {
+  const baselineSupercedes = Object.values(state.retryBaselines ?? {}).some(
+    (baseline) =>
+      // 旧 Job 一经记录为审计前驱，任何阶段都必须冻结其恢复字段。
+      baseline.fromJobId === job.jobId ||
+      (baseline.newJobId === job.jobId &&
+        (baseline.stage === 'prepared' || baseline.stage === 'stale')),
+  );
+  if (baselineSupercedes) return true;
+  return Object.values(state.jobs).some(
+    (candidate) =>
+      candidate.jobId !== job.jobId &&
+      candidate.reqId === job.reqId &&
+      candidate.issueNumber === job.issueNumber &&
+      candidate.specHash === job.specHash &&
+      candidate.sourceMainSha === job.sourceMainSha &&
+      candidate.attempt > job.attempt,
+  );
 }
 
 /** 统一 Worker 生命周期：本地状态、GitHub 标签、失败评论与通知保持同一条状态机。 */
@@ -1018,6 +1066,11 @@ export async function runOnce(core: Core): Promise<{
   }
   await syncPendingStatusLabels(core);
   await syncPendingSatisfiedReceipts(core);
+  // 先把已登记的重试准备恢复到 ready/stale，再进入常规对账；
+  // 这样未决准备只作为短期防护存在，不会让权威删除/更新差量被静默吞掉。
+  if (core.retryBaselineDeps) {
+    await resumeRetryBaselines(core.retryBaselineDeps);
+  }
   // applyReconciliation 关键操作失败会抛错（不推进游标），此处不捕获：
   // 异常向上传播，跳过 Worker 派发与部署，等待下轮重放差量。
   const summary = await reconcileWithPlanner(core.reconcileContext, core.planner);

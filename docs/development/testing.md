@@ -100,6 +100,9 @@ npm run test:e2e:panel -- --record  # panel 成功也保留录屏
 
 - Worker 仅保留 `src/**` 写权限；可信验收套件来自**已部署控制器的受管 `tests/e2e` 与固定 `playwright.config.ts`**（`WorkerDeps.browserE2eRoot`，默认当前控制器工作树），不是候选 `sourceMainSha` 快照，避免把测试基线锁死在旧请求 SHA。
 - 候选构建与需求文档来自固定代码快照；两者来源分离。
+- 对旧 revision 的失败 Job 使用 `重试 #N`：先持久 `prepared` 意图，再从固定 target SHA 读取候选需求；Issue 确认 target 后原子写入新 requirement、新 `failed/retry-baseline` Job 和 `ready`。`ready` 可进入 `processing` 和正常 Worker 结局；旧 Job 及其字段不变。
+- 新准备不会由 `runOnce`/`recover` 自动调用模型；它们只恢复 Issue 与固定 SHA 准备，执行仍需下一次显式 `重试 #N`，并复用同一新 Job。正常完成或过期记录仅作历史审计；进程中断后的 `processing` 由 `npm run demo:recover` 按既有规则标记失败，不自动派发。
+- 显式重试的恢复与 Worker 共用 `createCore` 的 `RetryBaselineDeps`，可信根取 `workerDeps.browserE2eRoot ?? config.repoDir`。新基线的代码 PR 仍只进入人工确认合并流程，不自动合并或发布。
 - docs-only 需求合入 `main` 使 `counter.md` 哈希变化后，需由独立测试作者维护 `tests/e2e/contracts/counter.json` 的 `specHash/caseIds` 并更新控制器版本，再显式 retry 原请求；固定候选 `sourceMainSha` 不变也能采用新审查的验收资产。
 - 不自动生成或刷新预期哈希。基线恢复以测试作者提供的契约为准；控制器只核对并记录指纹（`computeE2eSuiteFingerprint`），不代写。
 

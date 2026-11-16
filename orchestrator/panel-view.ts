@@ -138,6 +138,8 @@ const KNOWN_FAILURE_STAGES = new Set([
   'sync-status-label',
   'remote-delivery-check',
   'sync-deploy-receipt',
+  'retry-baseline',
+  'retry-baseline-stale',
 ]);
 const KNOWN_MERGE_STAGES = new Set(['confirmable', 'attempted', 'merged', 'failed', 'expired', 'invalidated', 'unknown']);
 const KNOWN_MERGE_TYPES = new Set(['docs', 'code']);
@@ -152,6 +154,8 @@ const FAILURE_STAGE_LABELS: Record<string, string> = {
   'sync-status-label': '同步状态标签',
   'remote-delivery-check': '远端交付预检',
   'sync-deploy-receipt': '同步部署回执',
+  'retry-baseline': '等待显式重试',
+  'retry-baseline-stale': '重试准备已过期',
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -377,6 +381,7 @@ function normalizeJob(value: unknown): NormJob | null {
     status,
     failureStage: failureStageRaw && KNOWN_FAILURE_STAGES.has(failureStageRaw) ? failureStageRaw : null,
     resumeAction: resumeActionRaw === 'sync-deploy-receipt' || resumeActionRaw === 'sync-satisfied-receipt'
+      || resumeActionRaw === 'retry-baseline' || resumeActionRaw === 'retry-baseline-stale'
       ? resumeActionRaw
       : null,
     prNumber: asPositiveInt(value.prNumber),
