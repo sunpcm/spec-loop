@@ -16,6 +16,8 @@ export interface SandboxProfileSpec {
   /** 更具体的读拒绝 literal（在 allow 之后，如仓库内 .env）。 */
   sensitiveDenyLiterals?: string[];
   denyNetwork: boolean;
+  /** 在 (deny network*) 之后的细粒度放行规则（如仅本机固定端口的 outbound）。 */
+  allowNetworkRules?: string[];
 }
 
 export function sandboxExecBin(): string {
@@ -56,6 +58,9 @@ export function buildSandboxProfile(spec: SandboxProfileSpec): string {
   }
   if (spec.denyNetwork) {
     lines.push('(deny network*)');
+  }
+  for (const rule of spec.allowNetworkRules ?? []) {
+    lines.push(rule);
   }
   return `${lines.join('\n')}\n`;
 }

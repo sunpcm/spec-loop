@@ -15,6 +15,8 @@ import { extractAssetRefs } from '../orchestrator/preview.ts';
 import { markInterruptedJobsFailed } from '../orchestrator/recover.ts';
 import { checkReleaseHttp, pickWorkerTargets } from '../orchestrator/runtime.ts';
 import { buildIsolationPaths, buildSandboxProfile } from '../orchestrator/sandbox.ts';
+import type { BrowserGateResult } from '../orchestrator/browser-gate.ts';
+import { computeE2eSuiteFingerprint, freezeE2eSuite } from '../orchestrator/browser-gate.ts';
 import { StateStore } from '../orchestrator/state.ts';
 import type { OrchestratorState, Spec } from '../orchestrator/types.ts';
 import { buildVerifierEnv, makeSandboxedRunner, resolveSafePath, validateWorkerManifest } from '../orchestrator/validate.ts';
@@ -50,6 +52,34 @@ const silentLogger: Logger = {
   error: () => {},
   debug: () => {},
 };
+
+function okBrowserGate(): Promise<BrowserGateResult> {
+  return Promise.resolve({
+    ok: true,
+    detail: '浏览器验收通过',
+    reportDir: '/tmp/report',
+    reportPath: '/tmp/report/results.json',
+    stdoutLogPath: '/tmp/report/playwright.stdout.txt',
+    stderrLogPath: '/tmp/report/playwright.stderr.txt',
+  });
+}
+
+function makePlaywrightReport(): string {
+  return JSON.stringify({
+    errors: [],
+    suites: [{
+      specs: ['E2E-CNT-001 a', 'E2E-CNT-002 b'].map((title) => ({
+        title,
+        tests: [{
+          expectedStatus: 'passed',
+          projectName: 'counter',
+          status: 'expected',
+          results: [{ status: 'passed', retry: 0 }],
+        }],
+      })),
+    }],
+  });
+}
 
 function gitSync(args: string[], cwd: string): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -475,6 +505,7 @@ test('runWorkerJob 成功路径：快照验证后发布 PR', async () => {
       }),
       verify: async (): Promise<VerificationResult[]> => [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }],
       checkCurrent: async () => true,
+      runBrowserGate: okBrowserGate,
     },
     {
       jobId: 'job-1',
@@ -491,6 +522,125 @@ test('runWorkerJob 成功路径：快照验证后发布 PR', async () => {
   assert.ok(calls.includes('archive'));
   assert.ok(calls.includes('commit'));
   assert.ok(calls.includes('push'));
+});
+
+test('runWorkerJob 成功后浏览器证据独立保留，临时 agent 被清理且证据绑定候选版本', async () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'spec-loop-worker-'));
+  const repoDir = mkdtempSync(join(tmpdir(), 'spec-loop-repo-'));
+  const globalAgentDir = join(runDir, 'agent');
+  const cleanups: string[] = [];
+  writeFileSync(join(repoDir, 'README.md'), 'readonly source\n', 'utf8');
+  mkdirSync(join(repoDir, 'node_modules'), { recursive: true });
+  mkdirSync(join(repoDir, 'tests', 'e2e', 'contracts'), { recursive: true });
+  writeFileSync(join(repoDir, 'playwright.config.ts'), 'export default {};\n', 'utf8');
+  writeFileSync(join(repoDir, 'tests', 'e2e', 'counter.spec.ts'), "test('E2E-CNT-001 x', () => {});\n", 'utf8');
+  writeFileSync(join(repoDir, 'tests', 'e2e', 'contracts', 'counter.json'), '{"caseIds":["E2E-CNT-001"]}\n', 'utf8');
+  const git = {
+    async createWorktree(): Promise<void> {},
+    async add(): Promise<void> {},
+    async diffNameOnly(): Promise<string[]> {
+      return ['src/counter.ts'];
+    },
+    async reset(): Promise<void> {},
+    async writeTree(): Promise<string> {
+      return 'tree-retained';
+    },
+    async archive(): Promise<void> {},
+    async commit(): Promise<void> {},
+    async revParse(): Promise<string> {
+      return '1'.repeat(40);
+    },
+    async push(): Promise<void> {},
+    async removeWorktree(): Promise<void> {
+      cleanups.push('worktree');
+    },
+  } as unknown as GitClient;
+  const prBodies: string[] = [];
+  const github = {
+    async createPR(_title: string, body: string): Promise<number> {
+      prBodies.push(body);
+      return 46;
+    },
+  } as unknown as GithubClient;
+  let retained: { reportDir: string; receiptPath: string; candidateTreeSha: string; suiteFingerprint: string } | undefined;
+  let tempAgentDir = '';
+
+  const outcome = await runWorkerJob(
+    {
+      repoDir,
+      runDir,
+      piAgentDir: globalAgentDir,
+      git,
+      github,
+      logger: silentLogger,
+      runPi: async (inv) => {
+        tempAgentDir = inv.agentDir;
+        writeFileSync(join(inv.agentDir, 'private-model-cache.txt'), 'temporary credential material', 'utf8');
+        return {
+          ok: true,
+          exitCode: 0,
+          stdout: '',
+          stderr: '',
+          output: { files: [{ path: 'src/counter.ts', content: 'export const x = 1;\n' }] },
+          durationMs: 0,
+          timedOut: false,
+        };
+      },
+      verify: async (cwd): Promise<VerificationResult[]> => {
+        mkdirSync(join(cwd, 'dist'), { recursive: true });
+        writeFileSync(join(cwd, 'dist', 'verification.cache'), 'temporary', 'utf8');
+        return [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }];
+      },
+      checkCurrent: async () => true,
+      runBrowserGate: async (opts) => {
+        mkdirSync(opts.jobTmp, { recursive: true });
+        const reportDir = join(opts.jobTmp, 'run-actual', 'report');
+        const receiptPath = join(opts.jobTmp, 'run-actual', 'browser-gate-receipt.json');
+        mkdirSync(reportDir, { recursive: true });
+        writeFileSync(join(reportDir, 'results.json'), makePlaywrightReport(), 'utf8');
+        writeFileSync(receiptPath, '{"kind":"browser-gate-receipt","ok":true}\n', 'utf8');
+        const frozen = freezeE2eSuite(repoDir, join(opts.jobTmp, 'suite-actual'));
+        assert.equal(frozen.fingerprint, computeE2eSuiteFingerprint(frozen.files));
+        retained = { reportDir, receiptPath, candidateTreeSha: 'tree-retained', suiteFingerprint: frozen.fingerprint };
+        return {
+          ok: true,
+          detail: '浏览器验收通过',
+          reportDir,
+          reportPath: join(reportDir, 'results.json'),
+          stdoutLogPath: join(opts.jobTmp, 'run-actual', 'playwright.stdout.txt'),
+          stderrLogPath: join(opts.jobTmp, 'run-actual', 'playwright.stderr.txt'),
+          receiptPath,
+          suiteFingerprint: frozen.fingerprint,
+        };
+      },
+    },
+    {
+      jobId: 'job-evidence',
+      reqId: 'REQ-A-01',
+      issueNumber: 1,
+      spec: spec('REQ-A-01'),
+      sourceMainSha: 's1',
+      attempt: 1,
+    },
+  );
+
+  assert.equal(outcome.status, 'published', outcome.error);
+  assert.equal(cleanups.length, 1);
+  assert.ok(retained);
+  assert.ok(retained.reportDir.startsWith(join(runDir, 'browser', 'worker', 'job-evidence')));
+  assert.ok(existsSync(join(retained.reportDir, 'results.json')));
+  assert.ok(existsSync(retained.receiptPath));
+  assert.ok(existsSync(join(runDir, 'browser', 'worker', 'job-evidence', 'suite-actual', 'tests', 'e2e', 'counter.spec.ts')));
+  const workerEvidence = JSON.parse(readFileSync(join(runDir, 'browser', 'worker', 'job-evidence', 'browser-gate.json'), 'utf8')) as Record<string, unknown>;
+  assert.equal(workerEvidence.candidateTreeSha, 'tree-retained');
+  assert.equal(workerEvidence.sourceMainSha, 's1');
+  assert.equal(workerEvidence.suiteFingerprint, retained.suiteFingerprint);
+  assert.equal(workerEvidence.reportDir, retained.reportDir);
+  assert.match(prBodies[0] ?? '', new RegExp(retained.reportDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.equal(existsSync(tempAgentDir), false);
+  assert.equal(existsSync(join(runDir, 'jobs', 'job-evidence')), false);
+  assert.equal(existsSync(join(runDir, 'verify', 'job-evidence')), false);
+  assert.equal(existsSync(join(repoDir, 'verification.cache')), false);
 });
 
 test('runWorkerJob 越权变更范围在提交前被拒绝', async () => {
@@ -534,6 +684,7 @@ test('runWorkerJob 越权变更范围在提交前被拒绝', async () => {
       }),
       verify: async (): Promise<VerificationResult[]> => [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }],
       checkCurrent: async () => true,
+      runBrowserGate: okBrowserGate,
     },
     {
       jobId: 'job-2',
@@ -610,6 +761,7 @@ test('runWorkerJob 作业内重试：首次失败、二次成功', async () => {
       },
       verify: async (): Promise<VerificationResult[]> => [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }],
       checkCurrent: async () => true,
+      runBrowserGate: okBrowserGate,
     },
     {
       jobId: 'job-retry',
@@ -666,6 +818,7 @@ test('runWorkerJob 两次失败：返回 failed、保留有界日志且摘要脱
       }),
       verify: async (): Promise<VerificationResult[]> => [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }],
       checkCurrent: async () => true,
+      runBrowserGate: okBrowserGate,
     },
     {
       jobId: 'job-fail',
@@ -685,6 +838,174 @@ test('runWorkerJob 两次失败：返回 failed、保留有界日志且摘要脱
   const logDir = outcome.piLogDir ?? join(runDir, 'jobs', 'job-fail', 'logs');
   assert.ok(readFileSync(join(logDir, 'attempt-1.stderr.txt'), 'utf8').includes('真实失败详情'));
   assert.ok(readFileSync(join(logDir, 'attempt-2.stderr.txt'), 'utf8').includes('真实失败详情'));
+});
+
+test('runWorkerJob 浏览器验收失败时按 verify 失败处理且不产生 PR', async () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'spec-loop-worker-'));
+  const repoDir = mkdtempSync(join(tmpdir(), 'spec-loop-repo-'));
+  const calls: string[] = [];
+  const git = {
+    async createWorktree(): Promise<void> {},
+    async add(): Promise<void> {},
+    async diffNameOnly(): Promise<string[]> {
+      return ['src/counter.ts'];
+    },
+    async reset(): Promise<void> {
+      calls.push('reset');
+    },
+    async writeTree(): Promise<string> {
+      return 'tree1';
+    },
+    async archive(): Promise<void> {},
+    async commit(): Promise<void> {
+      calls.push('commit');
+    },
+    async revParse(): Promise<string> {
+      return '3'.repeat(40);
+    },
+    async push(): Promise<void> {
+      calls.push('push');
+    },
+    async removeWorktree(): Promise<void> {},
+  } as unknown as GitClient;
+  const github = {
+    async createPR(): Promise<number> {
+      calls.push('createPR');
+      return 44;
+    },
+  } as unknown as GithubClient;
+
+  const outcome = await runWorkerJob(
+    {
+      repoDir,
+      runDir,
+      git,
+      github,
+      logger: silentLogger,
+      runPi: async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        output: { files: [{ path: 'src/counter.ts', content: 'export const x = 1;\n' }] },
+        durationMs: 0,
+        timedOut: false,
+      }),
+      verify: async (): Promise<VerificationResult[]> => [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }],
+      checkCurrent: async () => true,
+      runBrowserGate: async () => ({
+        ok: false,
+        detail: '验收基线待独立维护：specHash 已过期',
+        reportDir: '/tmp/report',
+        reportPath: '/tmp/report/results.json',
+        stdoutLogPath: '/tmp/report/playwright.stdout.txt',
+        stderrLogPath: '/tmp/report/playwright.stderr.txt',
+      }),
+    },
+    {
+      jobId: 'job-gate-fail',
+      reqId: 'REQ-A-01',
+      issueNumber: 1,
+      spec: spec('REQ-A-01'),
+      sourceMainSha: 's1',
+      attempt: 1,
+    },
+  );
+  assert.equal(outcome.status, 'failed');
+  assert.equal(outcome.failureStage, 'verify');
+  assert.match(outcome.error ?? '', /浏览器验收失败/);
+  assert.ok(!calls.includes('commit'));
+  assert.ok(!calls.includes('push'));
+  assert.ok(!calls.includes('createPR'));
+});
+
+test('runWorkerJob 浏览器成功后再核对需求版本，fresh check 漂移时不发布', async () => {
+  const runDir = mkdtempSync(join(tmpdir(), 'spec-loop-worker-'));
+  const repoDir = mkdtempSync(join(tmpdir(), 'spec-loop-repo-'));
+  const calls: string[] = [];
+  let checkCount = 0;
+  let gateStarted = false;
+  const git = {
+    async createWorktree(): Promise<void> {},
+    async add(): Promise<void> {},
+    async diffNameOnly(): Promise<string[]> {
+      return ['src/counter.ts'];
+    },
+    async reset(): Promise<void> {
+      calls.push('reset');
+    },
+    async writeTree(): Promise<string> {
+      return 'tree1';
+    },
+    async archive(): Promise<void> {},
+    async commit(): Promise<void> {
+      calls.push('commit');
+    },
+    async revParse(): Promise<string> {
+      return '4'.repeat(40);
+    },
+    async push(): Promise<void> {
+      calls.push('push');
+    },
+    async removeWorktree(): Promise<void> {},
+    async fetch(): Promise<void> {},
+  } as unknown as GitClient;
+  const github = {
+    async createPR(): Promise<number> {
+      calls.push('createPR');
+      return 45;
+    },
+  } as unknown as GithubClient;
+
+  const outcome = await runWorkerJob(
+    {
+      repoDir,
+      runDir,
+      git,
+      github,
+      logger: silentLogger,
+      runPi: async () => ({
+        ok: true,
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        output: { files: [{ path: 'src/counter.ts', content: 'export const x = 1;\n' }] },
+        durationMs: 0,
+        timedOut: false,
+      }),
+      verify: async (): Promise<VerificationResult[]> => [{ name: 't', ok: true, code: 0, stdout: '', stderr: '' }],
+      checkCurrent: async () => {
+        checkCount += 1;
+        // 第一次为浏览器前的快速检查；浏览器开始后需求漂移，第二次必须 fresh-check 失败。
+        return !gateStarted;
+      },
+      runBrowserGate: async () => {
+        gateStarted = true;
+        return {
+          ok: true,
+          detail: '浏览器验收通过',
+          reportDir: '/tmp/report',
+          reportPath: '/tmp/report/results.json',
+          stdoutLogPath: '/tmp/report/playwright.stdout.txt',
+          stderrLogPath: '/tmp/report/playwright.stderr.txt',
+        };
+      },
+    },
+    {
+      jobId: 'job-gate-stale',
+      reqId: 'REQ-A-01',
+      issueNumber: 1,
+      spec: spec('REQ-A-01'),
+      sourceMainSha: 's1',
+      attempt: 1,
+    },
+  );
+  assert.equal(outcome.status, 'stale');
+  assert.equal(checkCount, 2);
+  assert.match(outcome.error ?? '', /版本已变化/);
+  assert.ok(!calls.includes('commit'));
+  assert.ok(!calls.includes('push'));
+  assert.ok(!calls.includes('createPR'));
 });
 
 test('summarizePiFailure 脱敏并保留有界摘要', () => {

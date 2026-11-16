@@ -1,5 +1,13 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import {
+  browserGateTimeoutMs,
+  resolveBrowserCacheDir,
+  runBrowserGate,
+  readSpecFilesFromDir,
+  type BrowserGateOptions,
+  type BrowserGateResult,
+} from './browser-gate.ts';
 import { createCommands } from './commands.ts';
 import type { Config } from './config.ts';
 import { deployOnce, type DeployDeps, type DeployResult } from './deploy.ts';
@@ -177,11 +185,13 @@ export function createBuild(
   config: Config,
   git: GitClient,
   runnerOverride?: CommandRunner,
+  browserGateOverride?: (opts: BrowserGateOptions) => Promise<BrowserGateResult>,
 ): (sha: string) => Promise<{ ok: boolean; detail: string }> {
   return async (sha: string) => {
     const outDir = join(config.runDir, 'releases', sha);
     const snapshotDir = join(config.runDir, 'build', sha);
     const jobTmp = join(config.runDir, 'tmp', sha);
+    const browserJobTmp = join(config.runDir, 'browser', sha);
     try {
       rmSync(outDir, { recursive: true, force: true });
       // Vite 不负责创建输出目录祖先；在沙箱生效前创建受控输出根，
@@ -229,6 +239,25 @@ export function createBuild(
             .map((r) => `${r.name}: ${r.stderr.trim() || r.stdout.trim()}`)
             .join('\n'),
         };
+      }
+      const browserGate = browserGateOverride ?? runBrowserGate;
+      const gateResult = await browserGate({
+        repoDir: config.repoDir,
+        e2eRoot: config.repoDir,
+        artifactDir: outDir,
+        mountPath: `/releases/${sha}/`,
+        version: sha,
+        project: 'counter',
+        specFiles: readSpecFilesFromDir(snapshotDir),
+        jobTmp: browserJobTmp,
+        browserCacheDir: resolveBrowserCacheDir(),
+        globalAgentDir: config.piAgentDir,
+        agentDir: join(config.runDir, 'jobs'),
+        logger: createLogger('BROWSER-GATE'),
+        timeoutMs: browserGateTimeoutMs(),
+      });
+      if (!gateResult.ok) {
+        return { ok: false, detail: `浏览器验收失败：${gateResult.detail}` };
       }
       return { ok: true, detail: '构建成功' };
     } catch (error) {

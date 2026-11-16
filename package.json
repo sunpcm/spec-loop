@@ -18,7 +18,9 @@
     "demo:retry": "node orchestrator/retry.ts",
     "demo:recover": "node orchestrator/recover.ts",
     "build:panel": "vite build --config panel/vite.config.ts --configLoader native",
-    "panel": "npm run build:panel && node orchestrator/panel.ts"
+    "panel": "npm run build:panel && node orchestrator/panel.ts",
+    "test:e2e": "node orchestrator/browser-gate-cli.ts counter",
+    "test:e2e:panel": "node orchestrator/browser-gate-cli.ts panel"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.5.2",
@@ -32,6 +34,7 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "typescript": "^5.8.0",
+    "@playwright/test": "1.65.1",
     "vite": "^6.0.0"
   }
 }

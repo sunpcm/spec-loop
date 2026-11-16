@@ -1,0 +1,11 @@
+{
+  "specPath": "docs/specs/counter.md",
+  "reqId": "REQ-CNT-01",
+  "caseIds": [
+    "PANEL-DEMO-001",
+    "PANEL-DEMO-002",
+    "PANEL-DEMO-003",
+    "PANEL-DEMO-004",
+    "PANEL-DEMO-005"
+  ]
+}

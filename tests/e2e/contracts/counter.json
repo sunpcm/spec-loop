@@ -1,0 +1,13 @@
+{
+  "reqId": "REQ-CNT-01",
+  "specPath": "docs/specs/counter.md",
+  "specHash": "cb239039ca5ba35e151624c7a56272e5b1194aed2e0ceca8ad28a1b79f877060",
+  "caseIds": [
+    "E2E-CNT-001",
+    "E2E-CNT-002",
+    "E2E-CNT-003",
+    "E2E-CNT-004",
+    "E2E-CNT-005",
+    "E2E-CNT-006"
+  ]
+}

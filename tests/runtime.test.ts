@@ -611,6 +611,14 @@ test('createBuild 在沙箱前创建 outDir，注入版本资源 base 且不泄�
       runs.push({ cwd: opts.cwd, env: opts.env });
       return { code: 0, stdout: 'ok', stderr: '' };
     },
+    async () => ({
+      ok: true,
+      detail: '浏览器验收通过',
+      reportDir: '/tmp/report',
+      reportPath: '/tmp/report/results.json',
+      stdoutLogPath: '/tmp/report/playwright.stdout.txt',
+      stderrLogPath: '/tmp/report/playwright.stderr.txt',
+    }),
   );
   const result = await build(sha);
 
@@ -624,6 +632,41 @@ test('createBuild 在沙箱前创建 outDir，注入版本资源 base 且不泄�
   assert.equal(runs[0]?.env.GH_TOKEN, undefined);
   assert.equal(runs[0]?.env.PI_PROVIDER, undefined);
   assert.equal(runs[0]?.env.PI_MODEL, undefined);
+});
+
+test('createBuild 浏览器验收失败时返回失败且不继续成功发布', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'spec-loop-build-fail-'));
+  const sha = '3'.repeat(40);
+  const config = {
+    repoDir: dir,
+    runDir: join(dir, '.orchestrator'),
+    buildTimeoutMs: 1000,
+    piAgentDir: join(dir, '.orchestrator', 'agent'),
+  } as Config;
+  const git = {
+    archive: async (_cwd: string, _sha: string, destDir: string) => {
+      mkdirSync(destDir, { recursive: true });
+    },
+  } as unknown as GitClient;
+
+  const build = createBuild(
+    config,
+    git,
+    async () => ({ code: 0, stdout: 'ok', stderr: '' }),
+    async () => ({
+      ok: false,
+      detail: 'Playwright 退出码 1；报告目录 /tmp/report；stdout /tmp/report/stdout；stderr /tmp/report/stderr',
+      reportDir: '/tmp/report',
+      reportPath: '/tmp/report/results.json',
+      stdoutLogPath: '/tmp/report/stdout',
+      stderrLogPath: '/tmp/report/stderr',
+    }),
+  );
+
+  const result = await build(sha);
+  assert.equal(result.ok, false);
+  assert.match(result.detail, /浏览器验收失败/);
+  assert.match(result.detail, /退出码 1/);
 });
 
 test('预览服务当前/历史版本同路径可用，并阻止非法 SHA 与 symlink 逃逸', async (t) => {
