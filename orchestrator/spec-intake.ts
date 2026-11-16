@@ -5,6 +5,7 @@ import type { GitClient } from './git.ts';
 import { redact, type Logger } from './log.ts';
 import { preparePiAgentDir, runPi, type PiInvocation, type PiResult } from './pi-runner.ts';
 import { SPEC_AUTHOR_PROMPT } from './prompts.ts';
+import { hasActiveRetryBaseline } from './retry-baseline.ts';
 import { buildIsolationPaths, type SandboxProfileSpec } from './sandbox.ts';
 import {
   computeSpecBranch,
@@ -918,6 +919,10 @@ export async function submitSpecRequirement(
     const active = activeSpecRequest(deps);
     if (active) return specRequestMessage(deps, active);
 
+    if (hasActiveRetryBaseline(deps.state.snapshot(), TARGET_REQ_ID)) {
+      return `需求 ${TARGET_REQ_ID} 有未结束的显式重试准备，请先完成或等待恢复后再提需求`;
+    }
+
     const workerJob = activeWorkerJob(deps);
     if (workerJob) {
       return `已有活动 Worker #${workerJob.issueNumber}（${workerJob.status}），请先完成后再提需求`;
@@ -947,6 +952,16 @@ export async function submitSpecRequirement(
 export async function retrySpecRequirement(deps: SpecIntakeDeps, requestId: string): Promise<string> {
   try {
     if (!SPEC_REQUEST_ID_RE.test(requestId)) return `非法需求请求 ID: ${requestId}`;
+    const state = deps.state.snapshot();
+    if (hasActiveRetryBaseline(state, TARGET_REQ_ID)) {
+      return `需求 ${TARGET_REQ_ID} 有未结束的显式重试准备，请先完成代码重试恢复`;
+    }
+    const activeWorker = Object.values(state.jobs).find(
+      (job) => job.status === 'todo' || job.status === 'processing' || job.status === 'in-review',
+    );
+    if (activeWorker) {
+      return `已有活动 Worker #${activeWorker.issueNumber}（${activeWorker.status}），请先完成后再重试需求`;
+    }
     await reconcileSpecRequests(deps);
     const req = deps.state.snapshot().specRequests?.[requestId];
     if (!req) return `找不到需求请求 ${requestId}`;

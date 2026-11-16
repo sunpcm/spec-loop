@@ -78,6 +78,26 @@ export interface RequirementState {
   sourceMainSha: string;
 }
 
+export type RetryBaselineStage = 'prepared' | 'ready' | 'stale' | 'completed';
+
+/** 显式重试旧 revision 到当前 main 的可恢复准备记录；旧 Job 与旧 requirement 不被改写。 */
+export interface RetryBaselineState {
+  operationId: string;
+  reqId: string;
+  issueNumber: number;
+  specPath: string;
+  specHash: string;
+  fromJobId: string;
+  fromSourceMainSha: string;
+  targetSourceMainSha: string;
+  newJobId: string;
+  attempt: number;
+  stage: RetryBaselineStage;
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+}
+
 export interface DeployState {
   activeSha: string | null;
   releaseDir: string | null;
@@ -182,6 +202,8 @@ export interface OrchestratorState {
   specRequests: Record<string, SpecRequest>;
   /** schema 1 的向后兼容可选扩展；旧 state 加载时补为空对象。 */
   mergeRequests?: Record<string, MergeRequestState>;
+  /** schema 1 的向后兼容可选扩展；保留旧 Job，仅记录显式重试的新基线准备。 */
+  retryBaselines?: Record<string, RetryBaselineState>;
   opLog: OpLogEntry[];
 }
 
@@ -195,6 +217,7 @@ export function emptyState(): OrchestratorState {
     deploy: { activeSha: null, releaseDir: null, deployedPRs: [] },
     specRequests: {},
     mergeRequests: {},
+    retryBaselines: {},
     opLog: [],
   };
 }
