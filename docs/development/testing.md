@@ -11,6 +11,17 @@
 
 两层都通过才允许继续 `commit/push/PR`（Worker 路径）或 `healthCheck/switchPreview/markDeployed`（合并构建路径）。
 
+### 无代码变更验收（satisfied）
+
+当 Worker 的真实候选树与固定来源 `sourceMainSha` 主线树相同（`src` 无任何变更）时，仍必须先走完固定可信检查、独立浏览器门禁与发布前 fresh 校验，全部通过后返回明确终态 `satisfied`，不调用 `commit/push/createPR`，也不做空提交伪造代码交付。该终态不等于已部署的 `done`：
+
+- 持久记录 `reqId/specHash/sourceMainSha/candidateTreeSha` 与本次可信检查/浏览器证据，不能仅凭模型 summary 判成功。
+- 无代码变更成功前及浏览器门禁后均 fresh `fetch origin main`；`origin/main` 完整 SHA 必须等于固定 `sourceMainSha`，候选树必须等于 `sourceMainSha^{tree}`。任一步失败或相同需求内容的主线漂移都返回失败/过期。
+- 通过 `status:satisfied` 标签与幂等评论回执表示“已验收无需代码变更”，不关闭 Issue、不改 `deploy.activeSha`、不伪造 PR/发布回执。
+- satisfied 状态与 `sync-satisfied-receipt` 待补标志必须在同一次 StateStore 更新中落盘，再发外部标签/回执；回执成功后才清除标志。重载后可重查绑定 `reqId/specHash/sourceMainSha/candidateTreeSha` 的幂等评论，响应丢失时补发不重复评论、不重跑 Pi。
+- `commands.retry` 对 satisfied 返回中文成功说明，明确没有代码 PR/部署及回执是否待补；面板保留代码确认节待补状态，构建显示无需部署，不把回执未完成显示成已部署。
+- 旧 revision 不污染新 revision；新需求仍正常接续。
+
 ## 2. 依赖与浏览器准备
 
 - Node 版本锁定 `24.x`，实测 `v24.15.0`。安装阶段可能因宿主默认 Node 版本不同出现 `EBADENGINE` 警告，自测请固定用 `/Users/sunpcm/.nvm/versions/node/v24.15.0/bin`。
@@ -78,6 +89,7 @@ npm run test:e2e:panel -- --record  # panel 成功也保留录屏
 - 每次执行使用唯一子目录（`run-<时间戳>-<序号>`），避免误读历史 `results.json`，同时保留旧 attempt 证据。
 - 每次实际运行写 `browser-gate-receipt.json`，绑定 `project`、`reqId/specHash`（可得时）、`displayVersion`、套件指纹、Node/platform、结果与报告/日志路径。`displayVersion` 只表示构建展示版本，不代替候选代码 `candidateTreeSha` 或 `sourceMainSha`。
 - Worker 在浏览器成功后、`commit/push/createPR` 前再做一次 fresh `checkCurrent`；浏览器执行期间 `origin/main` 漂移会返回 `stale`，不发布过期代码。
+- 无代码变更且固定/浏览器/fresh 校验全部通过时返回 `satisfied`，不建 PR；固定或浏览器失败仍返回 `failed`，同需求内容的 `origin/main` 漂移返回 `stale`，均不得伪造 `satisfied`。
 - Worker 的浏览器证据放在独立持久目录 `runDir/browser/worker/<jobId>`，成功清理临时作业后报告、回执和冻结套件仍可读；PR 验证项包含 `browser`，并带该报告路径。独立 Worker 证据 `browser-gate.json` 保留 `candidateTreeSha` 与 `sourceMainSha`。临时 `HOME/TMPDIR`、模型 agent 目录与缓存仍随作业清理。
 - 固定 `node:test` 与浏览器门禁还会向 `runDir/test-runs`（或面板状态文件目录旁的 `.orchestrator/test-runs`）写入受控 `test-run.json` 证据索引，供本机面板只读展示。记录仅包含索引、摘要、SHA、用例和附件入口；附件按文件名扩展名归类为 `screenshot`、`video`、`trace`、`json`，不读取业务日志或任意外部路径。
 - 证据索引与附件有硬性容量/扫描边界：索引最多保留 100 条运行记录、扫描最多 2000 条目录项且深度最多 8 层、单个附件最大 512MiB、单次运行附件预算 1GiB、每个 run 最多 1000 条用例、每份附件列表最多 256 项。附件必须来自本次 report 目录内的普通文件（拒绝 symlink 逃逸与越界路径），复制失败不会留下可点击死链。

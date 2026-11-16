@@ -50,7 +50,7 @@ export interface ManagedPR {
   url?: string;
 }
 
-export type StatusLabel = 'todo' | 'processing' | 'in-review' | 'done' | 'failed';
+export type StatusLabel = 'todo' | 'processing' | 'in-review' | 'done' | 'failed' | 'satisfied';
 
 export interface JobState {
   jobId: string;
@@ -65,6 +65,8 @@ export interface JobState {
   prNumber?: number;
   /** Worker 实际提交并经控制器持久验证的完整 head SHA；缺失时合并必须 fail closed。 */
   headSHA?: string;
+  /** 无代码变更验收（satisfied）时持久化的候选树 SHA；与浏览器/node:test 证据绑定。 */
+  candidateTreeSha?: string;
   startedAt: string;
   updatedAt: string;
 }

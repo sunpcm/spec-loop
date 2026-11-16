@@ -120,6 +120,9 @@ export function createCommands(deps: CommandsDeps): FeishuCommands {
 
       if (!job) return `#${issueNumber} 无失败任务记录，不重跑`;
       if (job.status !== 'failed') {
+        if (job.status === 'satisfied') {
+          return `#${issueNumber} 已验收无需代码变更，未创建代码 PR、未部署；GitHub 回执${job.resumeAction === 'sync-satisfied-receipt' ? '待补，控制器会恢复回执，不会重跑 Pi' : '已完成'}`;
+        }
         return `#${issueNumber} 当前状态 ${job.status}，仅失败任务可重试`;
       }
 
@@ -157,6 +160,8 @@ export function createCommands(deps: CommandsDeps): FeishuCommands {
       const outcome = await deps.retryWorker(input);
       return outcome.status === 'published'
         ? `#${issueNumber} 已重新进入 review（PR #${outcome.prNumber}）`
+        : outcome.status === 'satisfied'
+          ? `#${issueNumber} 已验收无需代码变更，未创建代码 PR、未部署`
         : `#${issueNumber} 重试失败: ${outcome.error ?? outcome.status}`;
     },
   };

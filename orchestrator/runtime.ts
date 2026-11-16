@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -40,7 +41,14 @@ import {
 } from './validate.ts';
 import { createNodeTestRunRecord } from './test-evidence-node.ts';
 import { writeTestRunRecord } from './test-evidence.ts';
-import { runWorkerJob, type WorkerDeps, type WorkerInput, type WorkerOutcome } from './worker.ts';
+import {
+  checkSatisfiedRevisionCurrent,
+  runWorkerJob,
+  validateSatisfiedOutcome,
+  type WorkerDeps,
+  type WorkerInput,
+  type WorkerOutcome,
+} from './worker.ts';
 import {
   reconcileSpecRequests,
   retrySpecRequirement,
@@ -340,6 +348,14 @@ export function createCore(
     piTimeoutMs: config.piTimeoutMs,
     piGraceMs: config.piGraceMs,
     verifyTimeoutMs: config.verifyTimeoutMs,
+    checkSatisfiedRevisionCurrent: (sourceMainSha, candidateTreeSha) =>
+      checkSatisfiedRevisionCurrent(
+        git,
+        config.repoDir,
+        config.mainBranch,
+        sourceMainSha,
+        candidateTreeSha,
+      ),
   };
 
   const build = createBuild(config, git);
@@ -514,7 +530,14 @@ export function pickWorkerTargets(state: ReturnType<StateStore['snapshot']>, spe
     const spec = specById.get(reqId);
     if (!spec) continue;
     const job = latestJobForRevision(state, reqId, spec.hash, req.sourceMainSha);
-    if (job && (job.status === 'processing' || job.status === 'in-review' || job.status === 'done' || job.status === 'failed')) {
+    if (
+      job &&
+      (job.status === 'processing' ||
+        job.status === 'in-review' ||
+        job.status === 'done' ||
+        job.status === 'failed' ||
+        job.status === 'satisfied')
+    ) {
       continue;
     }
     const attempt = (job ? job.attempt : 0) + 1;
@@ -594,6 +617,15 @@ async function markWorkerOutcome(core: Core, jobId: string, outcome: WorkerOutco
       }
       return undefined;
     }
+    if (outcome.status === 'satisfied') {
+      job.status = 'satisfied';
+      job.candidateTreeSha = outcome.candidateTreeSha;
+      job.resumeAction = 'sync-satisfied-receipt';
+      // satisfied 终态无 PR / 提交，清空可能残留的发布字段，避免面板或合并误读。
+      delete job.prNumber;
+      delete job.headSHA;
+      return undefined;
+    }
     job.status = 'failed';
     job.failureStage = outcome.failureStage;
     job.resumeAction = outcome.resumeAction;
@@ -665,6 +697,111 @@ export async function syncPendingStatusLabels(core: Core): Promise<void> {
         target.resumeAction = undefined;
         target.updatedAt = new Date().toISOString();
       }
+      return undefined;
+    });
+  }
+}
+
+function satisfiedReceiptKey(
+  reqId: string,
+  specHash: string,
+  sourceMainSha: string,
+  candidateTreeSha: string,
+): string {
+  return createHash('sha256')
+    .update(`${reqId}\n${specHash}\n${sourceMainSha}\n${candidateTreeSha}`)
+    .digest('hex');
+}
+
+function satisfiedReceiptText(
+  reqId: string,
+  specHash: string,
+  sourceMainSha: string,
+  candidateTreeSha: string,
+): string {
+  const revisionKey = satisfiedReceiptKey(reqId, specHash, sourceMainSha, candidateTreeSha);
+  const lines = [
+    '✅ 已验收无需代码变更',
+    `需求 \`${reqId}\` 在固定来源 \`${sourceMainSha}\` 已通过 typecheck/node:test/build 与浏览器验收，源码已满足需求，未创建代码 PR、未部署。`,
+    `需求哈希：\`${specHash}\``,
+    `来源主线 SHA：\`${sourceMainSha}\``,
+  ];
+  lines.push(`候选树 SHA：\`${candidateTreeSha}\``);
+  lines.push(`回执幂等键：\`${revisionKey}\``);
+  return lines.join('\n');
+}
+
+/**
+ * satisfied 终态的外部回执：同步 `status:satisfied` 标签并幂等写一句“无需代码变更”评论。
+ * 状态在调用前已持久化，本函数失败不丢失成功证据，只返回 false 等待下轮补同步。
+ */
+async function syncSatisfiedReceipt(
+  core: Core,
+  issueNumber: number,
+  reqId: string,
+  specHash: string,
+  sourceMainSha: string,
+  candidateTreeSha: string,
+): Promise<boolean> {
+  // 幂等键绑定完整 revision；响应丢失后重放可以识别此前已提交的回执。
+  const marker = `回执幂等键：\`${satisfiedReceiptKey(reqId, specHash, sourceMainSha, candidateTreeSha)}\``;
+  const results: boolean[] = [];
+  try {
+    await core.github.removeLabels(issueNumber, STATUS_LABELS);
+    await core.github.addLabels(issueNumber, ['pi-task', 'status:satisfied']);
+    results.push(true);
+  } catch {
+    results.push(false);
+  }
+  try {
+    const comments = await core.github.listIssueComments(issueNumber);
+    const already = comments.some((c) => c.body.includes(marker));
+    if (!already) {
+      await core.github.comment(
+        issueNumber,
+        satisfiedReceiptText(reqId, specHash, sourceMainSha, candidateTreeSha),
+      );
+    }
+    results.push(true);
+  } catch {
+    results.push(false);
+  }
+  return results.every(Boolean);
+}
+
+/** 重启后仅恢复未完成的 satisfied 回执阶段；不重跑 Pi，旧 revision 只清标记不污染新需求。 */
+export async function syncPendingSatisfiedReceipts(core: Core): Promise<void> {
+  const pending = Object.values(core.state.snapshot().jobs).filter(
+    (job) => job.status === 'satisfied' && job.resumeAction === 'sync-satisfied-receipt',
+  );
+  for (const job of pending) {
+    const requirement = core.state.snapshot().requirements[job.reqId];
+    if (
+      !requirement ||
+      requirement.issueNumber !== job.issueNumber ||
+      requirement.specHash !== job.specHash ||
+      requirement.sourceMainSha !== job.sourceMainSha ||
+      !/^[0-9a-f]{40}$/.test(job.candidateTreeSha ?? '')
+    ) {
+      await core.state.update((s) => {
+        const target = s.jobs[job.jobId];
+        if (target && target.resumeAction === 'sync-satisfied-receipt') target.resumeAction = undefined;
+        return undefined;
+      });
+      continue;
+    }
+    const ok = await syncSatisfiedReceipt(
+      core,
+      job.issueNumber,
+      job.reqId,
+      job.specHash,
+      job.sourceMainSha,
+      job.candidateTreeSha!,
+    );
+    if (!ok) continue;
+    await core.state.update((s) => {
+      const target = s.jobs[job.jobId];
+      if (target && target.resumeAction === 'sync-satisfied-receipt') target.resumeAction = undefined;
       return undefined;
     });
   }
@@ -782,11 +919,39 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
   );
 
   const runner = core.workerRunner ?? runWorkerJob;
-  const outcome = await runner(core.workerDeps, input);
+  const outcome = validateSatisfiedOutcome(await runner(core.workerDeps, input));
   await markWorkerOutcome(core, jobId, outcome);
 
   if (outcome.status === 'stale') {
     await notifyBestEffort(core, `⏭️ ${issueUrl} ${outcome.error ?? '作业已过期'}`);
+    return outcome;
+  }
+
+  if (outcome.status === 'satisfied') {
+    const receiptOk = await syncSatisfiedReceipt(
+      core,
+      input.issueNumber,
+      input.reqId,
+      input.spec.hash,
+      input.sourceMainSha,
+      outcome.candidateTreeSha!,
+    );
+    if (!receiptOk) {
+      await notifyBestEffort(core, `⚠️ ${issueUrl} 已验收，GitHub 回执待补；不会重跑 Pi`);
+      return outcome;
+    }
+    await core.state.update((s) => {
+      const job = s.jobs[jobId];
+      if (job && job.status === 'satisfied') {
+        job.resumeAction = undefined;
+        job.updatedAt = new Date().toISOString();
+      }
+      return undefined;
+    });
+    await notifyBestEffort(
+      core,
+      `✅ ${issueUrl} 已验收无需代码变更${outcome.candidateTreeSha ? `（候选树 ${outcome.candidateTreeSha.slice(0, 8)}）` : ''}`,
+    );
     return outcome;
   }
 
@@ -852,6 +1017,7 @@ export async function runOnce(core: Core): Promise<{
     core.logger.warn(`spec 请求远端对账失败（本轮跳过）: ${error instanceof Error ? error.message : String(error)}`);
   }
   await syncPendingStatusLabels(core);
+  await syncPendingSatisfiedReceipts(core);
   // applyReconciliation 关键操作失败会抛错（不推进游标），此处不捕获：
   // 异常向上传播，跳过 Worker 派发与部署，等待下轮重放差量。
   const summary = await reconcileWithPlanner(core.reconcileContext, core.planner);
