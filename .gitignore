@@ -10,3 +10,12 @@ dist/
 .review/
 .DS_Store
 npm-debug.log*
+
+# Local Codex chat attachments
+/.codex-attachments/
+
+# Logo explorations; approved assets are in docs/assets/brand-v1/
+/docs/assets/spec-loop-logo-*.png
+
+# Superseded social-sharing draft; keep the v2 deliverable tracked
+/docs/assets/social/spec-loop-moments-four-panel-v1.*
