@@ -2,6 +2,11 @@ import type { GithubClient } from './github.ts';
 import type { GitClient } from './git.ts';
 import type { Logger } from './log.ts';
 import { planReconciliation, type ReconcileOp } from './reconciler.ts';
+import {
+  hasActiveRetryBaseline,
+  resumeRetryBaselines,
+  type RetryBaselineDeps,
+} from './retry-baseline.ts';
 import { diffSpecs, parseSpecs } from './specs.ts';
 import type { StateStore } from './state.ts';
 import type { ManagedPR, Spec } from './types.ts';
@@ -12,6 +17,7 @@ export const STATUS_LABELS = [
   'status:in-review',
   'status:done',
   'status:failed',
+  'status:satisfied',
 ];
 
 export interface ReconcileContext {
@@ -21,6 +27,7 @@ export interface ReconcileContext {
   state: StateStore;
   logger: Logger;
   mainBranch?: string;
+  retryBaselines?: RetryBaselineDeps;
 }
 
 export interface ReconcileSummary {
@@ -81,6 +88,16 @@ export async function applyReconciliation(
   ops: ReconcileOp[],
   targetMainSha: string,
 ): Promise<void> {
+  const blocked = ops.find(
+    (op) =>
+      (op.kind === 'create' || op.kind === 'update' || op.kind === 'close') &&
+      hasActiveRetryBaseline(ctx.state.snapshot(), op.reqId),
+  );
+  if (blocked) {
+    const message = `需求 ${blocked.reqId} 有未决的显式重试准备，权威对账改动不能跳过；保留游标并停止本轮后续派发`;
+    ctx.logger.warn(message);
+    throw new Error(message);
+  }
   let failed = false;
   for (const op of ops) {
     try {
@@ -139,6 +156,10 @@ export async function applyReconciliation(
 
       const backfill = op.backfill;
       if (op.kind === 'noop' && op.issueNumber && backfill) {
+        if (hasActiveRetryBaseline(ctx.state.snapshot(), op.reqId)) {
+          ctx.logger.warn(`需求 ${op.reqId} 有未决显式重试准备，跳过普通 noop 回填`);
+          continue;
+        }
         await ctx.state.update((s) => {
           s.requirements[op.reqId] = {
             issueNumber: op.issueNumber!,

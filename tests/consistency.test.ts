@@ -294,6 +294,49 @@ test('F1 对账：需求删除关闭全部关联 open PR', async () => {
   }
 });
 
+test('F1 对账：未决显式重试准备阻挡权威删除时 fail closed，游标不推进', async () => {
+  const h1 = hashOf(specDoc(REQ_A, 'v1'));
+  const diff = diffSpecs(specsOf({ 'docs/specs/a.md': specDoc(REQ_A, 'v1') }), []);
+  const issues = [managedIssue(12, { reqId: REQ_A, specHash: h1, specPath: 'docs/specs/a.md', sourceMainSha: 'sha0' })];
+  const prs = [openPR(7, REQ_A, h1)];
+  const ops = planReconciliation(diff, issues, 'sha1', prs);
+
+  const { dir, store } = makeStore(stateWith({
+    cursorMainSha: 'sha0',
+    requirements: { [REQ_A]: requirement(12, h1) },
+    retryBaselines: {
+      'retry-op': {
+        operationId: 'retry-op',
+        reqId: REQ_A,
+        issueNumber: 12,
+        specPath: 'docs/specs/a.md',
+        specHash: h1,
+        fromJobId: 'oldJob',
+        fromSourceMainSha: 'sha0',
+        targetSourceMainSha: 'sha1',
+        newJobId: 'retry-op-job',
+        attempt: 2,
+        stage: 'prepared',
+        createdAt: '2026-11-15T00:00:00Z',
+        updatedAt: '2026-11-15T00:00:00Z',
+      },
+    },
+  }));
+  try {
+    const { gh, calls } = reconcileGithub(issues, prs);
+    await assert.rejects(
+      applyReconciliation(reconcileCtx(store, gh), ops, 'sha1'),
+      /未决的显式重试准备/,
+    );
+    assert.equal(store.snapshot().cursorMainSha, 'sha0');
+    assert.equal(store.snapshot().requirements[REQ_A]?.issueNumber, 12);
+    assert.deepEqual(calls.closedIssues, []);
+    assert.deepEqual(calls.closedPRs, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('F1 部署：过期 revision 的合并 PR 不部署、不关单', async () => {
   const h2 = hashOf(specDoc(REQ_A, 'v2'));
   const { dir, store } = makeStore(stateWith({ requirements: { [REQ_A]: requirement(12, h2) } }));
@@ -590,6 +633,122 @@ test('F6 状态：损坏文件备份并拒绝启动，ENOENT 才空状态，合�
     writeFileSync(file, JSON.stringify({ ...emptyState(), cursorMainSha: 'sha9' }), 'utf8');
     const loaded = new StateStore(file).load();
     assert.equal(loaded.cursorMainSha, 'sha9');
+
+    for (const retryBaselines of [[], 'malformed', 1, null]) {
+      writeFileSync(
+        file,
+        JSON.stringify({ schemaVersion: 1, retryBaselines }),
+        'utf8',
+      );
+      assert.throws(() => new StateStore(file).load(), /状态文件损坏|retryBaselines/);
+    }
+    writeFileSync(file, JSON.stringify({ schemaVersion: 1 }), 'utf8');
+    assert.deepEqual(new StateStore(file).load().retryBaselines, {});
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('显式重试状态按阶段重载：prepared 无 Job、ready 已处理、历史终态与当前需求解耦', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'spec-loop-consistency-retry-state-'));
+  try {
+    const file = join(dir, 'state.json');
+    const oldSha = 'a'.repeat(40);
+    const newSha = 'b'.repeat(40);
+    const hash = 'c'.repeat(64);
+    const operationId = `retry-baseline-${'d'.repeat(24)}`;
+    const newJobId = `${operationId}-job`;
+    const initial = stateWith({
+      requirements: {
+        [REQ_A]: { issueNumber: 12, specHash: hash, specPath: 'docs/specs/a.md', sourceMainSha: oldSha },
+      },
+      jobs: {
+        j1: job({ jobId: 'j1', issueNumber: 12, specHash: hash, sourceMainSha: oldSha, status: 'failed' }),
+      },
+    });
+    const store = new StateStore(file, initial);
+    store.load();
+    const baseline = {
+      operationId,
+      reqId: REQ_A,
+      issueNumber: 12,
+      specPath: 'docs/specs/a.md',
+      specHash: hash,
+      fromJobId: 'j1',
+      fromSourceMainSha: oldSha,
+      targetSourceMainSha: newSha,
+      newJobId,
+      attempt: 2,
+      stage: 'prepared' as const,
+      createdAt: '2026-11-17T00:00:00Z',
+      updatedAt: '2026-11-17T00:00:00Z',
+    };
+    await store.update((s) => {
+      s.retryBaselines![operationId] = baseline;
+      return undefined;
+    });
+    assert.equal(new StateStore(file).load().retryBaselines![operationId]?.stage, 'prepared');
+    await store.update((s) => {
+      s.retryBaselines![operationId]!.stage = 'stale';
+      return undefined;
+    });
+    const staleWithoutJob = new StateStore(file).load();
+    assert.equal(staleWithoutJob.retryBaselines![operationId]?.stage, 'stale');
+    assert.equal(staleWithoutJob.jobs[newJobId], undefined);
+    assert.deepEqual(staleWithoutJob.jobs.j1, JSON.parse(JSON.stringify(initial.jobs.j1)));
+
+    await store.update((s) => {
+      delete s.requirements[REQ_A];
+      return undefined;
+    });
+    const staleAfterRequirementRemoval = new StateStore(file).load();
+    assert.equal(staleAfterRequirementRemoval.retryBaselines![operationId]?.stage, 'stale');
+    assert.equal(staleAfterRequirementRemoval.requirements[REQ_A], undefined);
+
+    await store.update((s) => {
+      s.retryBaselines![operationId]!.stage = 'prepared';
+      s.requirements[REQ_A] = initial.requirements[REQ_A]!;
+      return undefined;
+    });
+
+    await store.update((s) => {
+      s.retryBaselines![operationId]!.stage = 'ready';
+      s.requirements[REQ_A] = { ...s.requirements[REQ_A]!, sourceMainSha: newSha };
+      s.jobs[newJobId] = job({
+        jobId: newJobId,
+        issueNumber: 12,
+        specHash: hash,
+        sourceMainSha: newSha,
+        attempt: 2,
+        status: 'processing',
+      });
+      return undefined;
+    });
+    assert.equal(new StateStore(file).load().jobs[newJobId]?.status, 'processing');
+
+    await store.update((s) => {
+      s.retryBaselines![operationId]!.stage = 'completed';
+      s.jobs[newJobId]!.status = 'in-review';
+      s.requirements[REQ_A] = { ...s.requirements[REQ_A]!, sourceMainSha: 'e'.repeat(40), specHash: 'f'.repeat(64) };
+      return undefined;
+    });
+    const historical = new StateStore(file).load();
+    assert.equal(historical.requirements[REQ_A]?.specHash, 'f'.repeat(64));
+    assert.equal(historical.jobs[newJobId]?.status, 'in-review');
+    assert.equal(historical.jobs.j1?.status, 'failed');
+    await store.update((s) => {
+      delete s.requirements[REQ_A];
+      return undefined;
+    });
+    const historicalAfterRequirementRemoval = new StateStore(file).load();
+    assert.equal(historicalAfterRequirementRemoval.retryBaselines![operationId]?.stage, 'completed');
+    assert.equal(historicalAfterRequirementRemoval.jobs[newJobId]?.status, 'in-review');
+
+    await store.update((s) => {
+      s.jobs[newJobId]!.sourceMainSha = oldSha;
+      return undefined;
+    });
+    assert.throws(() => new StateStore(file).load(), /状态文件损坏/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -613,7 +772,7 @@ function commandDeps(
   };
 }
 
-test('R2 重试：经 retryWorker 生命周期成功后新 job 与 PR 状态可发现', async () => {
+test('R2 重试：未提供生产可信依赖时 fail closed，不直接调用 Worker', async () => {
   const h1 = hashOf(specDoc(REQ_A, 'v1'));
   const { dir, store } = makeStore(stateWith({
     requirements: { [REQ_A]: requirement(12, h1) },
@@ -648,17 +807,57 @@ test('R2 重试：经 retryWorker 生命周期成功后新 job 与 PR 状态可�
       },
     );
     const message = await createCommands(deps).retry(12);
-    assert.ok(message.includes('已重新进入 review'));
-    assert.ok(message.includes('42'));
-    assert.equal(retryCalls.length, 1);
-    assert.equal(retryCalls[0]!.attempt, 2);
-    assert.equal(retryCalls[0]!.sourceMainSha, 'sha0');
+    assert.match(message, /可信验收资产|Git|重试/);
+    assert.equal(retryCalls.length, 0);
     const snapshot = store.snapshot();
-    const newJob = Object.values(snapshot.jobs).find((j) => j.jobId.startsWith('retry-'));
-    assert.ok(newJob);
-    assert.equal(newJob.status, 'processing');
-    assert.equal(newJob.prNumber, 42);
-    assert.equal(newJob.attempt, 2);
+    assert.equal(Object.keys(snapshot.jobs).length, 1);
+    assert.equal(snapshot.jobs.j1?.failureStage, 'verify');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('R2 重试：satisfied 终态原回复，不调用 Worker、重试或部署', async () => {
+  const h1 = hashOf(specDoc(REQ_A, 'v1'));
+  const { dir, store } = makeStore(stateWith({
+    requirements: { [REQ_A]: requirement(12, h1) },
+    jobs: {
+      j1: job({
+        jobId: 'j1',
+        issueNumber: 12,
+        status: 'failed',
+        failureStage: 'verify',
+        resumeAction: 'worker',
+        specHash: h1,
+      }),
+    },
+  }));
+  try {
+    let retryCalls = 0;
+    const deps = commandDeps(
+      store,
+      { readSpecSnapshot: async () => ({ 'docs/specs/a.md': specDoc(REQ_A, 'v1') }) },
+      deployFixture(store, []).ctx,
+      async () => {
+        retryCalls += 1;
+        return { status: 'satisfied', candidateTreeSha: 'a'.repeat(40) };
+      },
+    );
+    await store.update((s) => {
+      const current = s.jobs.j1;
+      assert.ok(current);
+      current.status = 'satisfied';
+      current.candidateTreeSha = 'a'.repeat(40);
+      current.resumeAction = 'sync-satisfied-receipt';
+      return undefined;
+    });
+    const satisfied = await createCommands(deps).retry(12);
+    assert.match(satisfied, /已验收无需代码变更/);
+    assert.match(satisfied, /未创建代码 PR/);
+    assert.match(satisfied, /未部署/);
+    assert.match(satisfied, /回执待补/);
+    assert.equal(retryCalls, 0);
+    assert.equal(store.snapshot().deploy.activeSha, null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -684,7 +883,7 @@ test('R2 重试：retryWorker 未接线时明确拒绝，不进入旧重跑路�
   }
 });
 
-test('R2 重试：旧版本高 attempt 不遮盖当前版本 job', async () => {
+test('R2 重试：旧版本高 attempt 不触发当前版本 Worker；未接可信依赖时拒绝', async () => {
   const h1 = hashOf(specDoc(REQ_A, 'v1'));
   const h2 = hashOf(specDoc(REQ_A, 'v2'));
   const { dir, store } = makeStore(stateWith({
@@ -705,17 +904,16 @@ test('R2 重试：旧版本高 attempt 不遮盖当前版本 job', async () => {
         return { status: 'published', prNumber: 43 };
       },
     );
-    await createCommands(deps).retry(12);
-    assert.equal(retryCalls.length, 1);
-    assert.equal(retryCalls[0]!.attempt, 2);
-    assert.equal(retryCalls[0]!.sourceMainSha, 'sha1');
-    assert.equal(retryCalls[0]!.spec.hash, h2);
+    const message = await createCommands(deps).retry(12);
+    assert.match(message, /可信验收资产|Git|重试/);
+    assert.equal(retryCalls.length, 0);
+    assert.deepEqual(Object.keys(store.snapshot().jobs).sort(), ['jNew', 'jOld']);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('R2 重试：main 快照与需求基线不一致时拒绝重试', async () => {
+test('R2 重试：main 快照不匹配不产生新 Job、Worker 或部署副作用', async () => {
   const h1 = hashOf(specDoc(REQ_A, 'v1'));
   const { dir, store } = makeStore(stateWith({
     requirements: { [REQ_A]: requirement(12, h1) },
@@ -733,8 +931,10 @@ test('R2 重试：main 快照与需求基线不一致时拒绝重试', async () 
       },
     );
     const message = await createCommands(deps).retry(12);
-    assert.ok(message.includes('需求版本与任务基线不一致'));
+    assert.doesNotMatch(message, /已重新进入 review/);
     assert.deepEqual(retryCalls, []);
+    assert.deepEqual(Object.keys(store.snapshot().jobs), ['j1']);
+    assert.equal(store.snapshot().deploy.activeSha, null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -753,19 +953,19 @@ test('R2 对账：closePR 失败时抛错且游标不推进', async () => {
 
   const { dir, store } = makeStore(stateWith({ cursorMainSha: 'sha0' }));
   try {
-    const gh = {
-      listIssues: async () => issues,
-      listPRs: async () => prs,
-      updateIssueBody: async () => {},
-      reopenIssue: async () => {},
-      removeLabels: async () => {},
-      addLabels: async () => {},
-      closePR: async () => {
+      const { gh } = reconcileGithub(issues);
+      gh.closePR = async () => {
         throw new Error('PR 关闭失败（fake）');
-      },
-    } as unknown as GithubClient;
+      };
     await assert.rejects(
-      applyReconciliation(reconcileCtx(store, gh), ops, 'sha1'),
+        applyReconciliation({
+          ...reconcileCtx(store, gh),
+          git: {
+            ...reconcileCtx(store, gh).git,
+            revParse: async () => 'sha1',
+            readSpecSnapshot: async () => ({ 'docs/specs/a.md': v2 }),
+          } as unknown as GitClient,
+        }, ops, 'sha1'),
       /对账存在失败操作/,
     );
     assert.equal(store.snapshot().cursorMainSha, 'sha0');

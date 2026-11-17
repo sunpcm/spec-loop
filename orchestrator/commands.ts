@@ -5,7 +5,11 @@ import type { GithubClient } from './github.ts';
 import type { GitClient } from './git.ts';
 import { redact, type Logger } from './log.ts';
 import type { MergeService } from './merge.ts';
-import { parseSpecs } from './specs.ts';
+import {
+  retryWithBaseline,
+  type RetryBaselineDeps,
+  type RetryBaselineHooks,
+} from './retry-baseline.ts';
 import type { StateStore } from './state.ts';
 import type { WorkerDeps, WorkerInput, WorkerOutcome } from './worker.ts';
 
@@ -25,6 +29,9 @@ export interface CommandsDeps {
   mainBranch?: string;
   requireSpec?: (description: string, messageId: string) => Promise<string>;
   retrySpec?: (requestId: string) => Promise<string>;
+  retryBaselineHooks?: RetryBaselineHooks;
+  /** runtime 的同一生产依赖对象；显式重试、启动恢复和 runOnce 共用可信资产根。 */
+  retryBaselineDeps?: RetryBaselineDeps;
   mergeService?: Pick<MergeService, 'preflight' | 'confirm'> | null;
 }
 
@@ -104,60 +111,67 @@ export function createCommands(deps: CommandsDeps): FeishuCommands {
     },
 
     async retry(issueNumber: number): Promise<string> {
-      const s = deps.state.snapshot();
-      const reqEntry = Object.entries(s.requirements).find(([, r]) => r.issueNumber === issueNumber);
-      const jobsForIssue = Object.values(s.jobs).filter((j) => j.issueNumber === issueNumber);
-      // 只在当前需求版本（specHash+sourceMainSha 一致）内挑 latest job；
-      // attempt 在新版本会重置，跨版本按 attempt 比较会让旧版本遮盖新版本。
-      const currentJobs = reqEntry
-        ? jobsForIssue.filter(
-            (j) => j.specHash === reqEntry[1].specHash && j.sourceMainSha === reqEntry[1].sourceMainSha,
+      if (!deps.repoDir || !deps.git) {
+        return `#${issueNumber} 当前控制器缺少仓库/Git 固定快照入口，拒绝未受控重试`;
+      }
+      const currentRequest = Object.entries(deps.state.snapshot().requirements)
+        .find(([, requirement]) => requirement.issueNumber === issueNumber);
+      const currentJob = currentRequest
+        ? Object.values(deps.state.snapshot().jobs)
+          .filter((job) =>
+            job.reqId === currentRequest[0] &&
+            job.issueNumber === issueNumber &&
+            job.specHash === currentRequest[1].specHash &&
+            job.sourceMainSha === currentRequest[1].sourceMainSha,
           )
-        : jobsForIssue;
-      const job = currentJobs
-        .sort((a, b) => a.attempt - b.attempt || (a.updatedAt < b.updatedAt ? -1 : a.updatedAt > b.updatedAt ? 1 : 0))
-        .at(-1);
-
-      if (!job) return `#${issueNumber} 无失败任务记录，不重跑`;
-      if (job.status !== 'failed') {
-        return `#${issueNumber} 当前状态 ${job.status}，仅失败任务可重试`;
+          .sort((a, b) => a.attempt - b.attempt || (a.updatedAt < b.updatedAt ? -1 : a.updatedAt > b.updatedAt ? 1 : 0))
+          .at(-1)
+        : undefined;
+      if (currentJob?.status === 'satisfied') {
+        return `#${issueNumber} 已验收无需代码变更，未创建代码 PR、未部署；GitHub 回执${currentJob.resumeAction === 'sync-satisfied-receipt' ? '待补，控制器会恢复回执，不会重跑 Pi' : '已完成'}`;
       }
-
-      if (job.failureStage === 'deploy' && job.resumeAction === 'deploy-only') {
-        const res = await retryDeployForIssue(deps.deploy, issueNumber, job.prNumber);
-        return res.status === 'deployed'
+      if (
+        currentJob?.status === 'failed' &&
+        currentJob.failureStage === 'deploy' &&
+        currentJob.resumeAction === 'deploy-only'
+      ) {
+        const deployResult = await retryDeployForIssue(deps.deploy, issueNumber, currentJob.prNumber);
+        return deployResult.status === 'deployed'
           ? `已重新部署 #${issueNumber}`
-          : `重试部署 #${issueNumber} 失败: ${res.error ?? '无待部署合并'}`;
+          : `重试部署 #${issueNumber} 失败: ${deployResult.error ?? '无待部署合并'}`;
       }
-
-      if (!reqEntry) return `#${issueNumber} 无受管任务，不当作代码任务重跑`;
+      if (currentJob && currentJob.status !== 'failed') {
+        return `#${issueNumber} 当前状态 ${currentJob.status}，仅失败任务可重试`;
+      }
+      if (!currentJob) return `#${issueNumber} 无失败任务记录，不重跑`;
       if (!deps.retryWorker) {
         return `#${issueNumber} Worker 重试生命周期未接线，拒绝直接重跑，等待 runtime 接入统一作业入口`;
       }
-
-      const [reqId, req] = reqEntry;
-      await deps.git.fetch(deps.repoDir, mainBranch);
-      const files = await deps.git.readSpecSnapshot(deps.repoDir, `origin/${mainBranch}`);
-      const parsed = parseSpecs(files);
-      const spec = parsed.specs.find((sp) => sp.id === reqId);
-      if (!spec) return `#${issueNumber} 需求快照不存在`;
-      if (spec.hash !== req.specHash || req.specHash !== job.specHash || req.sourceMainSha !== job.sourceMainSha) {
-        return `#${issueNumber} 需求版本与任务基线不一致，等待对账后重试`;
+      if (typeof deps.github.listIssues !== 'function' ||
+          typeof deps.github.listPRs !== 'function' ||
+          typeof deps.github.updateIssueBody !== 'function' ||
+          typeof deps.github.branchExists !== 'function') {
+        return `#${issueNumber} 当前控制器缺少 Issue/PR 只读或 Issue 更新能力，拒绝未受控重试`;
       }
-
-      const jobId = `retry-${issueNumber}-${Date.now()}`;
-      const input: WorkerInput = {
-        jobId,
-        reqId,
-        issueNumber,
-        spec,
-        sourceMainSha: req.sourceMainSha,
-        attempt: job.attempt + 1,
+      const baselineDeps = deps.retryBaselineDeps ?? {
+        repoDir: deps.repoDir,
+        state: deps.state,
+        git: deps.git,
+        github: deps.github,
+        logger: deps.logger,
+        retryWorker: deps.retryWorker,
+        // 直接 createCommands 的调用没有部署控制器资产根，准备必须 fail closed。
+        retryDeploy: async () => ({ status: 'failed' as const, error: '重试部署未接线' }),
+        mainBranch,
+        hooks: deps.retryBaselineHooks,
       };
-      const outcome = await deps.retryWorker(input);
-      return outcome.status === 'published'
-        ? `#${issueNumber} 已重新进入 review（PR #${outcome.prNumber}）`
-        : `#${issueNumber} 重试失败: ${outcome.error ?? outcome.status}`;
+      let baselineMessage: string;
+      try {
+        baselineMessage = await retryWithBaseline(baselineDeps, issueNumber);
+      } catch (error) {
+        return `#${issueNumber} 重试受控准备失败: ${boundedStatusText(error instanceof Error ? error.message : String(error))}`;
+      }
+      return baselineMessage;
     },
   };
 }

@@ -1,8 +1,17 @@
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import {
+  browserGateTimeoutMs,
+  resolveBrowserCacheDir,
+  runBrowserGate,
+  readSpecFilesFromDir,
+  type BrowserGateOptions,
+  type BrowserGateResult,
+} from './browser-gate.ts';
 import { createCommands } from './commands.ts';
 import type { Config } from './config.ts';
-import { deployOnce, type DeployDeps, type DeployResult } from './deploy.ts';
+import { deployOnce, retryDeployForIssue, type DeployDeps, type DeployResult } from './deploy.ts';
 import type { FeishuCommands } from './feishu-contract.ts';
 import { GitClient } from './git.ts';
 import { encodeMetaBlock, GithubClient } from './github.ts';
@@ -11,6 +20,11 @@ import { MergeService } from './merge.ts';
 import { Notifier } from './notifier.ts';
 import { deriveIssueBody } from './planner.ts';
 import { buildRequirementMeta } from './reconciler.ts';
+import {
+  hasActiveRetryBaseline,
+  resumeRetryBaselines,
+  type RetryBaselineDeps,
+} from './retry-baseline.ts';
 import { createStaticServer, extractAssetRefs } from './preview.ts';
 import { buildIsolationPaths, type SandboxProfileSpec } from './sandbox.ts';
 import {
@@ -21,7 +35,7 @@ import {
   type ReconcileSummary,
 } from './scheduler.ts';
 import { StateStore } from './state.ts';
-import type { JobState, ManagedPR, Spec } from './types.ts';
+import type { JobState, ManagedPR, OrchestratorState, Spec } from './types.ts';
 import {
   buildVerifierEnv,
   defaultVerificationCommands,
@@ -30,7 +44,16 @@ import {
   verificationPassed,
   type CommandRunner,
 } from './validate.ts';
-import { runWorkerJob, type WorkerDeps, type WorkerInput, type WorkerOutcome } from './worker.ts';
+import { createNodeTestRunRecord } from './test-evidence-node.ts';
+import { writeTestRunRecord } from './test-evidence.ts';
+import {
+  checkSatisfiedRevisionCurrent,
+  runWorkerJob,
+  validateSatisfiedOutcome,
+  type WorkerDeps,
+  type WorkerInput,
+  type WorkerOutcome,
+} from './worker.ts';
 import {
   reconcileSpecRequests,
   retrySpecRequirement,
@@ -53,6 +76,7 @@ export interface Core {
   deployDeps: DeployDeps;
   reconcileContext: ReconcileContext;
   specIntakeDeps: SpecIntakeDeps;
+  retryBaselineDeps?: RetryBaselineDeps;
   planner: ((spec: Spec) => Promise<string | null>) | null;
   repo: string | null;
   workerRunner?: WorkerJobRunner;
@@ -177,11 +201,13 @@ export function createBuild(
   config: Config,
   git: GitClient,
   runnerOverride?: CommandRunner,
+  browserGateOverride?: (opts: BrowserGateOptions) => Promise<BrowserGateResult>,
 ): (sha: string) => Promise<{ ok: boolean; detail: string }> {
   return async (sha: string) => {
     const outDir = join(config.runDir, 'releases', sha);
     const snapshotDir = join(config.runDir, 'build', sha);
     const jobTmp = join(config.runDir, 'tmp', sha);
+    const browserJobTmp = join(config.runDir, 'browser', sha);
     try {
       rmSync(outDir, { recursive: true, force: true });
       // Vite 不负责创建输出目录祖先；在沙箱生效前创建受控输出根，
@@ -221,6 +247,29 @@ export function createBuild(
           jobTmp,
         ),
       );
+      const buildTestResult = results.find((item) => item.name === 'test');
+      if (buildTestResult) {
+        try {
+          writeTestRunRecord(
+            join(config.runDir, 'test-runs'),
+            createNodeTestRunRecord({
+              stage: 'build',
+              version: sha,
+              startedAt: null,
+              finishedAt: new Date().toISOString(),
+              jobId: null,
+              reqId: null,
+              specHash: null,
+              sourceMainSha: sha,
+              candidateTreeSha: null,
+              ok: buildTestResult.ok,
+              stdout: `${buildTestResult.stdout}\n${buildTestResult.stderr}`,
+            }),
+          );
+        } catch (error) {
+          createLogger('BUILD').warn(`写入 build node:test 摘要失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       if (!verificationPassed(results)) {
         return {
           ok: false,
@@ -229,6 +278,28 @@ export function createBuild(
             .map((r) => `${r.name}: ${r.stderr.trim() || r.stdout.trim()}`)
             .join('\n'),
         };
+      }
+      const browserGate = browserGateOverride ?? runBrowserGate;
+      const gateResult = await browserGate({
+        repoDir: config.repoDir,
+        e2eRoot: config.repoDir,
+        artifactDir: outDir,
+        mountPath: `/releases/${sha}/`,
+        version: sha,
+        project: 'counter',
+        specFiles: readSpecFilesFromDir(snapshotDir),
+        jobTmp: browserJobTmp,
+        browserCacheDir: resolveBrowserCacheDir(),
+        globalAgentDir: config.piAgentDir,
+        agentDir: join(config.runDir, 'jobs'),
+        logger: createLogger('BROWSER-GATE'),
+        timeoutMs: browserGateTimeoutMs(),
+        testRunsRoot: join(config.runDir, 'test-runs'),
+        evidenceStage: 'build',
+        sourceMainSha: sha,
+      });
+      if (!gateResult.ok) {
+        return { ok: false, detail: `浏览器验收失败：${gateResult.detail}` };
       }
       return { ok: true, detail: '构建成功' };
     } catch (error) {
@@ -283,6 +354,14 @@ export function createCore(
     piTimeoutMs: config.piTimeoutMs,
     piGraceMs: config.piGraceMs,
     verifyTimeoutMs: config.verifyTimeoutMs,
+    checkSatisfiedRevisionCurrent: (sourceMainSha, candidateTreeSha) =>
+      checkSatisfiedRevisionCurrent(
+        git,
+        config.repoDir,
+        config.mainBranch,
+        sourceMainSha,
+        candidateTreeSha,
+      ),
   };
 
   const build = createBuild(config, git);
@@ -364,6 +443,18 @@ export function createCore(
     workerRunner: runWorkerJob,
   };
 
+  const retryBaselineDeps: RetryBaselineDeps = {
+    repoDir: config.repoDir,
+    state,
+    git,
+    github,
+    logger: createLogger('RETRY-BASELINE'),
+    retryWorker: (input) => runOneWorkerForInput(core, input),
+    retryDeploy: (issueNumber, prNumber) => retryDeployForIssue(deployDeps, issueNumber, prNumber),
+    findExistingDelivery: (input) => findExistingDelivery(core, input),
+    trustedE2eRoot: workerDeps.browserE2eRoot ?? config.repoDir,
+    mainBranch: config.mainBranch,
+  };
   const commands = createCommands({
     repoDir: config.repoDir,
     state,
@@ -376,6 +467,7 @@ export function createCore(
     retryWorker: (input) => runOneWorkerForInput(core, input),
     requireSpec: (description, messageId) => submitSpecRequirement(specIntakeDeps, description, messageId),
     retrySpec: (requestId) => retrySpecRequirement(specIntakeDeps, requestId),
+    retryBaselineDeps,
     mergeService,
   });
 
@@ -396,6 +488,8 @@ export function createCore(
 
   core.commands = commands;
   core.planner = planner;
+  core.retryBaselineDeps = retryBaselineDeps;
+  reconcileContext.retryBaselines = retryBaselineDeps;
 
   return core;
 }
@@ -410,6 +504,7 @@ export async function reconcileWithPlanner(
   if (planner) {
     for (const op of summary.ops) {
       if ((op.kind === 'create' || op.kind === 'update') && op.spec) {
+        if (hasActiveRetryBaseline(ctx.state.snapshot(), op.reqId)) continue;
         const body = await planner(op.spec);
         if (body) {
           const meta = encodeMetaBlock(buildRequirementMeta(op.spec, summary.targetMainSha));
@@ -457,7 +552,14 @@ export function pickWorkerTargets(state: ReturnType<StateStore['snapshot']>, spe
     const spec = specById.get(reqId);
     if (!spec) continue;
     const job = latestJobForRevision(state, reqId, spec.hash, req.sourceMainSha);
-    if (job && (job.status === 'processing' || job.status === 'in-review' || job.status === 'done' || job.status === 'failed')) {
+    if (
+      job &&
+      (job.status === 'processing' ||
+        job.status === 'in-review' ||
+        job.status === 'done' ||
+        job.status === 'failed' ||
+        job.status === 'satisfied')
+    ) {
       continue;
     }
     const attempt = (job ? job.attempt : 0) + 1;
@@ -537,6 +639,15 @@ async function markWorkerOutcome(core: Core, jobId: string, outcome: WorkerOutco
       }
       return undefined;
     }
+    if (outcome.status === 'satisfied') {
+      job.status = 'satisfied';
+      job.candidateTreeSha = outcome.candidateTreeSha;
+      job.resumeAction = 'sync-satisfied-receipt';
+      // satisfied 终态无 PR / 提交，清空可能残留的发布字段，避免面板或合并误读。
+      delete job.prNumber;
+      delete job.headSHA;
+      return undefined;
+    }
     job.status = 'failed';
     job.failureStage = outcome.failureStage;
     job.resumeAction = outcome.resumeAction;
@@ -581,7 +692,11 @@ export async function syncPendingStatusLabels(core: Core): Promise<void> {
     (job) => job.failureStage === 'sync-status-label' || job.resumeAction === 'sync-status-label',
   );
   for (const job of pending) {
-    const requirement = core.state.snapshot().requirements[job.reqId];
+    const current = core.state.snapshot();
+    const requirement = current.requirements[job.reqId];
+    // 显式基线已接管旧 revision，或同一 revision 已有更高 attempt 时，
+    // 旧标签回执只能留在旧 Job 上供审计，不能改写新 Issue 状态。
+    if (isSupersededWorkerRecovery(current, job)) continue;
     if (
       !requirement ||
       requirement.issueNumber !== job.issueNumber ||
@@ -611,6 +726,133 @@ export async function syncPendingStatusLabels(core: Core): Promise<void> {
       return undefined;
     });
   }
+}
+
+function satisfiedReceiptKey(
+  reqId: string,
+  specHash: string,
+  sourceMainSha: string,
+  candidateTreeSha: string,
+): string {
+  return createHash('sha256')
+    .update(`${reqId}\n${specHash}\n${sourceMainSha}\n${candidateTreeSha}`)
+    .digest('hex');
+}
+
+function satisfiedReceiptText(
+  reqId: string,
+  specHash: string,
+  sourceMainSha: string,
+  candidateTreeSha: string,
+): string {
+  const revisionKey = satisfiedReceiptKey(reqId, specHash, sourceMainSha, candidateTreeSha);
+  const lines = [
+    '✅ 已验收无需代码变更',
+    `需求 \`${reqId}\` 在固定来源 \`${sourceMainSha}\` 已通过 typecheck/node:test/build 与浏览器验收，源码已满足需求，未创建代码 PR、未部署。`,
+    `需求哈希：\`${specHash}\``,
+    `来源主线 SHA：\`${sourceMainSha}\``,
+  ];
+  lines.push(`候选树 SHA：\`${candidateTreeSha}\``);
+  lines.push(`回执幂等键：\`${revisionKey}\``);
+  return lines.join('\n');
+}
+
+/**
+ * satisfied 终态的外部回执：同步 `status:satisfied` 标签并幂等写一句“无需代码变更”评论。
+ * 状态在调用前已持久化，本函数失败不丢失成功证据，只返回 false 等待下轮补同步。
+ */
+async function syncSatisfiedReceipt(
+  core: Core,
+  issueNumber: number,
+  reqId: string,
+  specHash: string,
+  sourceMainSha: string,
+  candidateTreeSha: string,
+): Promise<boolean> {
+  // 幂等键绑定完整 revision；响应丢失后重放可以识别此前已提交的回执。
+  const marker = `回执幂等键：\`${satisfiedReceiptKey(reqId, specHash, sourceMainSha, candidateTreeSha)}\``;
+  const results: boolean[] = [];
+  try {
+    await core.github.removeLabels(issueNumber, STATUS_LABELS);
+    await core.github.addLabels(issueNumber, ['pi-task', 'status:satisfied']);
+    results.push(true);
+  } catch {
+    results.push(false);
+  }
+  try {
+    const comments = await core.github.listIssueComments(issueNumber);
+    const already = comments.some((c) => c.body.includes(marker));
+    if (!already) {
+      await core.github.comment(
+        issueNumber,
+        satisfiedReceiptText(reqId, specHash, sourceMainSha, candidateTreeSha),
+      );
+    }
+    results.push(true);
+  } catch {
+    results.push(false);
+  }
+  return results.every(Boolean);
+}
+
+/** 重启后仅恢复未完成的 satisfied 回执阶段；不重跑 Pi，旧 revision 只清标记不污染新需求。 */
+export async function syncPendingSatisfiedReceipts(core: Core): Promise<void> {
+  const pending = Object.values(core.state.snapshot().jobs).filter(
+    (job) => job.status === 'satisfied' && job.resumeAction === 'sync-satisfied-receipt',
+  );
+  for (const job of pending) {
+    const current = core.state.snapshot();
+    const requirement = current.requirements[job.reqId];
+    if (isSupersededWorkerRecovery(current, job)) continue;
+    if (
+      !requirement ||
+      requirement.issueNumber !== job.issueNumber ||
+      requirement.specHash !== job.specHash ||
+      requirement.sourceMainSha !== job.sourceMainSha ||
+      !/^[0-9a-f]{40}$/.test(job.candidateTreeSha ?? '')
+    ) {
+      await core.state.update((s) => {
+        const target = s.jobs[job.jobId];
+        if (target && target.resumeAction === 'sync-satisfied-receipt') target.resumeAction = undefined;
+        return undefined;
+      });
+      continue;
+    }
+    const ok = await syncSatisfiedReceipt(
+      core,
+      job.issueNumber,
+      job.reqId,
+      job.specHash,
+      job.sourceMainSha,
+      job.candidateTreeSha!,
+    );
+    if (!ok) continue;
+    await core.state.update((s) => {
+      const target = s.jobs[job.jobId];
+      if (target && target.resumeAction === 'sync-satisfied-receipt') target.resumeAction = undefined;
+      return undefined;
+    });
+  }
+}
+
+function isSupersededWorkerRecovery(state: OrchestratorState, job: JobState): boolean {
+  const baselineSupercedes = Object.values(state.retryBaselines ?? {}).some(
+    (baseline) =>
+      // 旧 Job 一经记录为审计前驱，任何阶段都必须冻结其恢复字段。
+      baseline.fromJobId === job.jobId ||
+      (baseline.newJobId === job.jobId &&
+        (baseline.stage === 'prepared' || baseline.stage === 'stale')),
+  );
+  if (baselineSupercedes) return true;
+  return Object.values(state.jobs).some(
+    (candidate) =>
+      candidate.jobId !== job.jobId &&
+      candidate.reqId === job.reqId &&
+      candidate.issueNumber === job.issueNumber &&
+      candidate.specHash === job.specHash &&
+      candidate.sourceMainSha === job.sourceMainSha &&
+      candidate.attempt > job.attempt,
+  );
 }
 
 /** 统一 Worker 生命周期：本地状态、GitHub 标签、失败评论与通知保持同一条状态机。 */
@@ -725,11 +967,39 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
   );
 
   const runner = core.workerRunner ?? runWorkerJob;
-  const outcome = await runner(core.workerDeps, input);
+  const outcome = validateSatisfiedOutcome(await runner(core.workerDeps, input));
   await markWorkerOutcome(core, jobId, outcome);
 
   if (outcome.status === 'stale') {
     await notifyBestEffort(core, `⏭️ ${issueUrl} ${outcome.error ?? '作业已过期'}`);
+    return outcome;
+  }
+
+  if (outcome.status === 'satisfied') {
+    const receiptOk = await syncSatisfiedReceipt(
+      core,
+      input.issueNumber,
+      input.reqId,
+      input.spec.hash,
+      input.sourceMainSha,
+      outcome.candidateTreeSha!,
+    );
+    if (!receiptOk) {
+      await notifyBestEffort(core, `⚠️ ${issueUrl} 已验收，GitHub 回执待补；不会重跑 Pi`);
+      return outcome;
+    }
+    await core.state.update((s) => {
+      const job = s.jobs[jobId];
+      if (job && job.status === 'satisfied') {
+        job.resumeAction = undefined;
+        job.updatedAt = new Date().toISOString();
+      }
+      return undefined;
+    });
+    await notifyBestEffort(
+      core,
+      `✅ ${issueUrl} 已验收无需代码变更${outcome.candidateTreeSha ? `（候选树 ${outcome.candidateTreeSha.slice(0, 8)}）` : ''}`,
+    );
     return outcome;
   }
 
@@ -795,6 +1065,12 @@ export async function runOnce(core: Core): Promise<{
     core.logger.warn(`spec 请求远端对账失败（本轮跳过）: ${error instanceof Error ? error.message : String(error)}`);
   }
   await syncPendingStatusLabels(core);
+  await syncPendingSatisfiedReceipts(core);
+  // 先把已登记的重试准备恢复到 ready/stale，再进入常规对账；
+  // 这样未决准备只作为短期防护存在，不会让权威删除/更新差量被静默吞掉。
+  if (core.retryBaselineDeps) {
+    await resumeRetryBaselines(core.retryBaselineDeps);
+  }
   // applyReconciliation 关键操作失败会抛错（不推进游标），此处不捕获：
   // 异常向上传播，跳过 Worker 派发与部署，等待下轮重放差量。
   const summary = await reconcileWithPlanner(core.reconcileContext, core.planner);

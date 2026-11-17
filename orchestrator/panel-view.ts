@@ -127,7 +127,7 @@ const KNOWN_SPEC_STAGES = new Set([
   'failed',
   'stale',
 ]);
-const KNOWN_JOB_STATUSES = new Set(['todo', 'processing', 'in-review', 'done', 'failed']);
+const KNOWN_JOB_STATUSES = new Set(['todo', 'processing', 'in-review', 'done', 'failed', 'satisfied']);
 const KNOWN_FAILURE_STAGES = new Set([
   'plan',
   'write',
@@ -138,6 +138,8 @@ const KNOWN_FAILURE_STAGES = new Set([
   'sync-status-label',
   'remote-delivery-check',
   'sync-deploy-receipt',
+  'retry-baseline',
+  'retry-baseline-stale',
 ]);
 const KNOWN_MERGE_STAGES = new Set(['confirmable', 'attempted', 'merged', 'failed', 'expired', 'invalidated', 'unknown']);
 const KNOWN_MERGE_TYPES = new Set(['docs', 'code']);
@@ -152,6 +154,8 @@ const FAILURE_STAGE_LABELS: Record<string, string> = {
   'sync-status-label': '同步状态标签',
   'remote-delivery-check': '远端交付预检',
   'sync-deploy-receipt': '同步部署回执',
+  'retry-baseline': '等待显式重试',
+  'retry-baseline-stale': '重试准备已过期',
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -265,6 +269,8 @@ function jobStatus(status: string): PanelStatus {
       return 'waiting';
     case 'done':
       return 'succeeded';
+    case 'satisfied':
+      return 'succeeded';
     case 'failed':
       return 'failed';
     default:
@@ -374,7 +380,10 @@ function normalizeJob(value: unknown): NormJob | null {
     attempt,
     status,
     failureStage: failureStageRaw && KNOWN_FAILURE_STAGES.has(failureStageRaw) ? failureStageRaw : null,
-    resumeAction: resumeActionRaw === 'sync-deploy-receipt' ? resumeActionRaw : null,
+    resumeAction: resumeActionRaw === 'sync-deploy-receipt' || resumeActionRaw === 'sync-satisfied-receipt'
+      || resumeActionRaw === 'retry-baseline' || resumeActionRaw === 'retry-baseline-stale'
+      ? resumeActionRaw
+      : null,
     prNumber: asPositiveInt(value.prNumber),
     headSHA: asSha40(value.headSHA),
     startedAt: safeTimestamp(value.startedAt),
@@ -520,6 +529,7 @@ function codeVerifyStatus(job: NormJob): PanelStatus {
   if (job.status === 'todo') return 'pending';
   if (job.status === 'processing') return 'running';
   if (job.status === 'in-review' || job.status === 'done') return 'succeeded';
+  if (job.status === 'satisfied') return 'succeeded';
   if (job.status === 'failed') {
     if (job.failureStage && ['plan', 'write', 'verify'].includes(job.failureStage)) return 'failed';
     if (job.failureStage && ['commit', 'publish'].includes(job.failureStage)) return 'succeeded';
@@ -665,6 +675,8 @@ function computeNodes(input: FlowInput): PanelNode[] {
     codeConfirm = 'succeeded';
   } else if (mergedEvidence === 'unknown') {
     codeConfirm = 'unknown';
+  } else if (primary.status === 'satisfied') {
+    codeConfirm = primary.resumeAction === 'sync-satisfied-receipt' ? 'waiting' : 'succeeded';
   } else if (primary.status === 'in-review') {
     codeConfirm = 'waiting';
   } else if (primary.status === 'failed' && primary.failureStage && ['commit', 'publish'].includes(primary.failureStage)) {
@@ -679,7 +691,11 @@ function computeNodes(input: FlowInput): PanelNode[] {
     label: '代码人工确认',
     status: codeConfirm,
     current: false,
-    detail: codeConfirmDetail(codeConfirm, primary?.prNumber ?? null),
+    detail: primary?.status === 'satisfied'
+      ? primary.resumeAction === 'sync-satisfied-receipt'
+        ? '已验收无需代码变更；GitHub 回执待补'
+        : '已验收无需代码变更，无代码 PR'
+      : codeConfirmDetail(codeConfirm, primary?.prNumber ?? null),
   });
 
   const primaryPr = primary?.prNumber ?? null;
@@ -693,7 +709,13 @@ function computeNodes(input: FlowInput): PanelNode[] {
     label: '构建与部署',
     status: buildDeploy,
     current: false,
-    detail: deploy.deployedPRs.includes(primaryPr ?? -1) ? '已本地部署' : deploy.deployFailedPRs.includes(primaryPr ?? -1) ? '部署失败' : '未部署',
+    detail: primary?.status === 'satisfied'
+      ? '无需部署（源码已满足需求）'
+      : deploy.deployedPRs.includes(primaryPr ?? -1)
+        ? '已本地部署'
+        : deploy.deployFailedPRs.includes(primaryPr ?? -1)
+          ? '部署失败'
+          : '未部署',
   });
 
   let healthReceipt: PanelStatus = 'pending';
@@ -709,7 +731,11 @@ function computeNodes(input: FlowInput): PanelNode[] {
     label: '健康检查与回执',
     status: healthReceipt,
     current: false,
-    detail: deploy.deployedPRs.includes(primaryPr ?? -1)
+    detail: primary?.status === 'satisfied'
+      ? primary.resumeAction === 'sync-satisfied-receipt'
+        ? '无需部署；GitHub 回执待补'
+        : '无需部署回执'
+      : deploy.deployedPRs.includes(primaryPr ?? -1)
       ? healthReceipt === 'waiting'
         ? '部署成功，回执待补'
         : '健康检查与回执完成'

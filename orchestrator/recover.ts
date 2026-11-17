@@ -3,6 +3,7 @@ import { loadConfig } from './config.ts';
 import { GitClient } from './git.ts';
 import { acquireInstanceLock } from './lock.ts';
 import { createCore, resolveRepoFromOrigin } from './runtime.ts';
+import { resumeRetryBaselines } from './retry-baseline.ts';
 import { reconcileOnce, type ReconcileSummary } from './scheduler.ts';
 import type { OrchestratorState } from './types.ts';
 
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
 
     let summary: ReconcileSummary | null;
     try {
+      if (core.retryBaselineDeps) await resumeRetryBaselines(core.retryBaselineDeps);
       summary = await reconcileOnce(core.reconcileContext);
     } catch (error) {
       core.logger.error(`对账失败: ${error instanceof Error ? error.message : String(error)}`);

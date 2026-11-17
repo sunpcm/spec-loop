@@ -50,7 +50,7 @@ export interface ManagedPR {
   url?: string;
 }
 
-export type StatusLabel = 'todo' | 'processing' | 'in-review' | 'done' | 'failed';
+export type StatusLabel = 'todo' | 'processing' | 'in-review' | 'done' | 'failed' | 'satisfied';
 
 export interface JobState {
   jobId: string;
@@ -65,6 +65,8 @@ export interface JobState {
   prNumber?: number;
   /** Worker 实际提交并经控制器持久验证的完整 head SHA；缺失时合并必须 fail closed。 */
   headSHA?: string;
+  /** 无代码变更验收（satisfied）时持久化的候选树 SHA；与浏览器/node:test 证据绑定。 */
+  candidateTreeSha?: string;
   startedAt: string;
   updatedAt: string;
 }
@@ -74,6 +76,26 @@ export interface RequirementState {
   specHash: string;
   specPath: string;
   sourceMainSha: string;
+}
+
+export type RetryBaselineStage = 'prepared' | 'ready' | 'stale' | 'completed';
+
+/** 显式重试旧 revision 到当前 main 的可恢复准备记录；旧 Job 与旧 requirement 不被改写。 */
+export interface RetryBaselineState {
+  operationId: string;
+  reqId: string;
+  issueNumber: number;
+  specPath: string;
+  specHash: string;
+  fromJobId: string;
+  fromSourceMainSha: string;
+  targetSourceMainSha: string;
+  newJobId: string;
+  attempt: number;
+  stage: RetryBaselineStage;
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
 }
 
 export interface DeployState {
@@ -180,6 +202,8 @@ export interface OrchestratorState {
   specRequests: Record<string, SpecRequest>;
   /** schema 1 的向后兼容可选扩展；旧 state 加载时补为空对象。 */
   mergeRequests?: Record<string, MergeRequestState>;
+  /** schema 1 的向后兼容可选扩展；保留旧 Job，仅记录显式重试的新基线准备。 */
+  retryBaselines?: Record<string, RetryBaselineState>;
   opLog: OpLogEntry[];
 }
 
@@ -193,6 +217,7 @@ export function emptyState(): OrchestratorState {
     deploy: { activeSha: null, releaseDir: null, deployedPRs: [] },
     specRequests: {},
     mergeRequests: {},
+    retryBaselines: {},
     opLog: [],
   };
 }
