@@ -127,6 +127,9 @@ npm run demo
 | [本机只读流程面板](docs/development/local-panel.md) | React Flow 流程视图、请求与交付证据、合成演示边界 |
 | [需求与验收](docs/development/requirements.md) | 编排系统的需求与验收设计，含后置范围 |
 | [架构与运行契约](docs/development/architecture.md) | 角色隔离、版本管理与故障恢复设计，含目标设计 |
+| [知识库与跨项目记忆评估](docs/development/knowledge-memory-design.md) | 多端来源、知识权威与跨项目复用的设计草案 |
+| [ZooWork 对比分析](docs/development/zoowork-comparison-report.md) | 产品定位、交付机制与可借鉴方向 |
+| [ZooWork 改进清单](docs/development/zoowork-improvement-backlog.md) | 候选工作的优先级、依赖与验收标准，尚未启动 |
 
 `docs/development/` 用于工程设计与维护，不参与产品需求扫描；其中草案和目标设计不能代替实际验收结果。
 
