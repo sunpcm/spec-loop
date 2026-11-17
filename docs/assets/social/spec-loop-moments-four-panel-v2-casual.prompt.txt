@@ -1,0 +1,46 @@
+生成工具：内置 imagegen
+修改依据：用户要求朋友圈风格轻松幽默，不要正式广告感。
+本图以自嘲漫画表达需求文档确认、代码检查、人工确认合并；不表示新的实时验收结果。
+
+Generate a brand NEW funny four-panel comic in simplified Chinese, one square image suitable for a casual personal WeChat Moments post. The user specifically rejected a previous glossy corporate infographic as "too formal, looks like an advertisement". COMPLETELY change the visual language. This should look like a witty hand-drawn diary by a Chinese programmer, not product marketing.
+
+STYLE: charming loose black pen doodles on warm off-white sketchbook paper, slightly irregular hand-drawn panel borders, expressive simple cartoon faces, muted sage-green and pale yellow spot coloring with pencil texture. Flat 2D newspaper/webcomic, roomy and easy to read on a phone. Deliberately casual, human, understated and funny. NO 3D rendering, glossy gradients, UI feature cards, large logo, numbered steps, professional stage headings, arrows, ribbons, commercial slogans, checklist-infographic layout, corporate blue background, marketing polish. Exactly a 2x2 comic grid, four equal panels, simple thin imperfect black divider lines and comfortable whitespace. No giant global title. The comedy comes from expectations vs reality, facial expressions and the final punchline. Natural Chinese handwritten comic lettering, fully legible, authentic characters. Use exactly the supplied short dialogue. Do not add extra text.
+
+CONTEXT: Spec Loop is a personal Demo where a human proposes a small software change; AI drafts a requirement document, the human approves the document; AI plans/writes code and deterministic checks run; human explicitly approves the code merge. The funny premise is the person hoped AI would let them lie down, but ends up being the "human confirm button". This is affectionate self-deprecating humor, not an ad, not fear of AI. AI does not merge autonomously. Two human approvals are an important accurate detail but should be shown naturally in the story.
+
+CAST: same slightly scruffy young adult programmer in all four panels, messy black hair, simple round glasses, dark T-shirt, comfortable shorts and house slippers, expressive tiny eyes. One small friendly mint-green square AI coworker with simple face and little arms, not a branded mascot. An orange-and-white cat quietly appears lying asleep in background panels and gets the final tiny visual joke. The person's desk has a laptop, mug, a couple of cables, normal home workspace. Keep background minimal, don't clutter.
+
+PANEL 1 top left: Programmer at home desk holding mug, thinking of a glorious lazy future, grinning smugly and leaning back in chair with feet up. A small imaginary cloud shows him on a sofa. Laptop has a very minimal chat, text:
+"加个翻倍按钮"
+His big speech bubble, exact:
+"我提需求，AI 写代码。"
+Second smaller bubble, exact:
+"这把可以躺了吧？"
+
+PANEL 2 top right: Small AI coworker earnestly presents ONE requirement document (not a huge overwhelming pile). Programmer sits up, holding a little approval stamp, cooperative but slightly puzzled. Document has a dog-eared top corner, three abstract lines and a small handwritten title:
+"需求文档"
+AI speech bubble, exact:
+"老板，需求先确认一下。"
+Programmer small bubble, exact:
+"行。"
+The stamp being pressed on the document reads:
+"确认"
+
+PANEL 3 bottom left: AI diligently types on laptop; a few simple source-code brackets and a little green checked card beside it suggest code and automated tests, no dense text. Programmer has migrated to the sofa, visibly happy, starts pulling a small blanket over himself. Cat already sleeping near sofa.
+AI speech bubble, exact:
+"代码写好了，检查也过了。"
+Programmer speech bubble, exact:
+"终于轮到我躺了。"
+
+PANEL 4 bottom right: AI taps the almost-asleep programmer on shoulder while extending a mouse or laptop; programmer rises with a hilariously deadpan, resigned face, a huge visible mouse button drawn as a simple metaphor for approving the merge. Laptop screen shows a tiny counter app: numeral "2" and a "×2" button. The cat is now fully sprawled out, extremely relaxed, obvious visual punchline.
+AI speech bubble, exact:
+"老板，合并还得你点。"
+Programmer speech bubble, exact:
+"原来我是人形确认键。"
+One very small handwritten annotation next to sleeping cat, exact:
+"它倒是真躺了。"
+
+Only once in an unobtrusive bottom corner OUTSIDE the dialogue, tiny casual handwriting:
+"Spec Loop · 折腾日常"
+
+Please prioritize the relaxed humor and readable speech-bubble hierarchy. No strong overall branding, no repeated project title, no promotional footer. Real comic storytelling with expression changes from smug -> cooperative -> delighted -> resigned. The final panel should make the viewer smile. Draw the four panels as one complete finished square comic.
