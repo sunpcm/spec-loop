@@ -272,6 +272,14 @@ export async function publishDispatchRevision(
   if (!deps) {
     throw new Error('未配置派工门禁依赖，无法发布派工版本');
   }
+  // 发布入口独立核对受管仓库数字 ID，防止把冻结任务绑到错误的仓库；
+  // runtime 传入的 repoId 必须与当前 GitHub 适配器所绑定的仓库一致。
+  const actualRepoId = await ctx.github.getDispatchRepositoryId();
+  if (actualRepoId !== input.repoId) {
+    throw new Error(
+      `派工仓库 ID 与适配器当前仓库不一致（${input.repoId} != ${actualRepoId}），保持待排期`,
+    );
+  }
   return applyGatedDispatch(ctx, deps, input.spec, input.issueNumber, input.targetMainSha, input.repoId);
 }
 
@@ -458,6 +466,82 @@ async function persistRequirement(
   });
 }
 
+/** 与 dispatchCommentMarker 一致的版本评论 marker 形态，用于远端高水位回读。 */
+const DISPATCH_MARKER_RE = /^spec-loop:dispatch:([^:\s]+):r(\d+)$/;
+
+/** 开工标签形态；控制器只摘除过期版本标签，不得自行贴当前版本标签。 */
+const DISPATCH_LABEL_RE = /^可开工\/r(\d+)$/;
+
+/** 从 Issue 当前标签中挑出已被新版取代的开工标签（rN != currentRevision）。 */
+function staleDispatchLabels(labels: string[], currentRevision: number): string[] {
+  return labels.filter((label) => {
+    const match = DISPATCH_LABEL_RE.exec(label);
+    if (!match) return false;
+    const revision = Number.parseInt(match[1], 10);
+    return Number.isSafeInteger(revision) && revision !== currentRevision;
+  });
+}
+
+/**
+ * 从 Issue 既有评论回读本需求已使用的 rN 集合（仅控制器自有评论）。
+ * 本地 receipt 遗失时据此恢复高水位；读取失败时抛错（fail closed）。
+ * marker 是发布评论中的独占行，只按精确行匹配，不信任正文内任意子串。
+ */
+async function remoteDispatchRevisions(
+  ctx: ReconcileContext,
+  issueNumber: number,
+  reqId: string,
+): Promise<Set<number>> {
+  let comments: Array<{ id: number; body: string }>;
+  try {
+    comments = await ctx.github.listTrustedDispatchComments(issueNumber);
+  } catch (error) {
+    throw new Error(
+      `读取 Issue #${issueNumber} 评论失败，无法确认派工版本高水位: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const revisions = new Set<number>();
+  for (const comment of comments) {
+    for (const rawLine of comment.body.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      const match = DISPATCH_MARKER_RE.exec(line);
+      if (!match || match[1] !== reqId) continue;
+      const revision = Number.parseInt(match[2], 10);
+      if (Number.isSafeInteger(revision) && revision > 0) revisions.add(revision);
+    }
+  }
+  return revisions;
+}
+
+/**
+ * 本地历史 + 远端可信 marker 高水位取较大者，得到下一个不会撞号的版本号。
+ * 远端已用号超前本地时必须能证明 (localMax, remoteHigh] 连续存在；有缺口
+ * 无法排除撞号或旧标复用，直接抛错停止待核实。
+ */
+async function nextDispatchRevisionWithRemote(
+  ctx: ReconcileContext,
+  issueNumber: number,
+  reqId: string,
+): Promise<number> {
+  const snapshot = ctx.state.snapshot();
+  const localNext = nextDispatchRevision(snapshot, reqId);
+  const localMax = localNext - 1;
+  const remote = await remoteDispatchRevisions(ctx, issueNumber, reqId);
+  let remoteHigh = 0;
+  for (const revision of remote) {
+    if (revision > remoteHigh) remoteHigh = revision;
+  }
+  if (remoteHigh <= localMax) return localNext;
+  for (let revision = localMax + 1; revision <= remoteHigh; revision += 1) {
+    if (!remote.has(revision)) {
+      throw new Error(
+        `需求 ${reqId} 远端已使用到 r${remoteHigh}，但缺少 r${revision} 的连续版本证据，停止待核实`,
+      );
+    }
+  }
+  return remoteHigh + 1;
+}
+
 /**
  * 冻结并发布一个派工版本。顺序保证：
  * 1. 优先复用同 (specHash, sourceMainSha) 的未发布冻结记录，避免重试撞号或重复调用 Planner；
@@ -492,10 +576,11 @@ async function applyGatedDispatch(
     if (!validateDispatchTask(task)) {
       throw new Error(`需求 ${spec.id} 派工任务未通过校验，保持待排期`);
     }
+    const revisionNumber = await nextDispatchRevisionWithRemote(ctx, issueNumber, spec.id);
     revision = freezeDispatchRevision({
       reqId: spec.id,
       repoId,
-      revision: nextDispatchRevision(snapshot, spec.id),
+      revision: revisionNumber,
       issueNumber,
       spec,
       sourceMainSha: targetMainSha,
@@ -520,6 +605,10 @@ async function applyGatedDispatch(
   );
   await ctx.github.updateIssueBody(issueNumber, nextBody);
   await ctx.github.ensureDispatchLabel(dispatchLabel(revision.revision));
+  const staleLabels = staleDispatchLabels(currentIssue.labels, revision.revision);
+  if (staleLabels.length > 0) {
+    await ctx.github.removeLabels(issueNumber, staleLabels);
+  }
   const comment = buildDispatchRevisionComment(spec, revision, repo);
   const published = await ctx.github.ensureDispatchComment(issueNumber, comment.marker, comment.body);
 

@@ -41,7 +41,7 @@ import {
 } from './scheduler.ts';
 import { parseSpecs } from './specs.ts';
 import { StateStore } from './state.ts';
-import type { DispatchRevision, JobState, ManagedIssue, ManagedPR, OrchestratorState, Spec } from './types.ts';
+import type { DispatchGrant, DispatchRevision, JobState, ManagedIssue, ManagedPR, OrchestratorState, Spec } from './types.ts';
 import {
   buildVerifierEnv,
   defaultVerificationCommands,
@@ -620,13 +620,60 @@ function dispatchTargetMatchesRevision(
   );
 }
 
+interface RefreshedDispatchClaim {
+  revision: DispatchRevision;
+  grant: DispatchGrant;
+}
+
+/**
+ * 刷新本版远端开工许可：重新读取 Issue、仓库 ID 与标签事件，用最新状态重新评估
+ * 空名单/撤标/新打标。规格是否当前由 claim 的 checkDispatchCurrent 与 worker 各自核对。
+ * 任一步失败或非授权都返回 null，调用方据此等待而不是创建 failed job。
+ */
+async function refreshDispatchClaim(
+  core: Core,
+  reqId: string,
+  issueNumber: number,
+): Promise<RefreshedDispatchClaim | null> {
+  let issue: ManagedIssue;
+  let repoId: string;
+  let events: DispatchLabelEvent[];
+  try {
+    [issue, repoId, events] = await Promise.all([
+      core.github.getDispatchIssue(issueNumber),
+      core.github.getDispatchRepositoryId(),
+      core.github.listDispatchLabelEvents(issueNumber),
+    ]);
+  } catch (error) {
+    core.logger.warn(
+      `派工 ${reqId} 远端许可刷新失败，暂停领取: ${errorText(error)}`,
+    );
+    return null;
+  }
+  if (issue.state !== 'open' || issue.number !== issueNumber) return null;
+
+  const decision = evaluateDispatchClaim(core.state.snapshot(), reqId, {
+    repoId,
+    issueNumber,
+    labels: issue.labels,
+    events,
+    allowedActorIds: core.config.dispatchAllowedUserIds ?? [],
+  });
+  if (!decision.claimable) return null;
+  return { revision: decision.revision, grant: decision.grant };
+}
+
 /**
  * 生产运行时唯一的计数器开工门禁。远端标签与事件只决定是否可领取，
  * 本地状态更新再原子占用全局 Pi 名额和本版作业，避免并发轮询重复启动。
  */
 async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<WorkerTarget | null> {
   const deps = core.reconcileContext.dispatch;
-  if (!deps?.isGated(target.reqId)) return target;
+  if (!deps?.isGated(target.reqId)) {
+    // 已有派工历史但门禁已失效时 fail closed，不能退回旧 REQ 直通路径。
+    if (hasDispatchHistory(core.state.snapshot(), target.reqId)) return null;
+    return target;
+  }
 
   const initial = core.state.snapshot();
   const revision = latestDispatchRevisionFor(initial, target.reqId);
@@ -639,36 +686,13 @@ async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<Wo
     return null;
   }
 
-  let issue: ManagedIssue;
-  let repoId: string;
-  let events: DispatchLabelEvent[];
-  try {
-    [issue, repoId, events] = await Promise.all([
-      core.github.getDispatchIssue(target.issueNumber),
-      core.github.getDispatchRepositoryId(),
-      core.github.listDispatchLabelEvents(target.issueNumber),
-    ]);
-  } catch (error) {
-    core.logger.warn(
-      `派工 ${target.reqId} r${revision.revision} 远端许可读取失败，暂停领取: ${errorText(error)}`,
-    );
-    return null;
-  }
-  if (issue.state !== 'open' || issue.number !== target.issueNumber) return null;
-
-  const decision = evaluateDispatchClaim(initial, target.reqId, {
-    repoId,
-    issueNumber: target.issueNumber,
-    labels: issue.labels,
-    events,
-    allowedActorIds: core.config.dispatchAllowedUserIds ?? [],
-  });
-  if (!decision.claimable || !dispatchTargetMatchesRevision(target, decision.revision)) {
+  const refreshed = await refreshDispatchClaim(core, target.reqId, target.issueNumber);
+  if (!refreshed || !dispatchTargetMatchesRevision(target, refreshed.revision)) {
     return null;
   }
 
   const checker = core.workerDeps.checkDispatchCurrent;
-  if (!checker || !(await checker(decision.revision))) return null;
+  if (!checker || !(await checker(refreshed.revision))) return null;
 
   const jobId = `job-${target.reqId}-${target.attempt}-${Date.now()}`;
   const now = new Date().toISOString();
@@ -683,13 +707,13 @@ async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<Wo
       requirement.specPath !== target.spec.path ||
       requirement.sourceMainSha !== target.sourceMainSha ||
       !current ||
-      current.revision !== decision.revision.revision ||
+      current.revision !== refreshed.revision.revision ||
       hasActivePiJob(state) ||
       hasJobForRevision(state, target.reqId, current.revision)
     ) {
       return undefined;
     }
-    current.grant = decision.grant;
+    current.grant = refreshed.grant;
     state.jobs[jobId] = {
       jobId,
       reqId: target.reqId,
@@ -699,7 +723,7 @@ async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<Wo
       attempt: target.attempt,
       status: 'todo',
       dispatchRevision: current.revision,
-      grantEventId: decision.grant.eventId,
+      grantEventId: refreshed.grant.eventId,
       startedAt: now,
       updatedAt: now,
     };
@@ -711,7 +735,7 @@ async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<Wo
   return {
     ...target,
     jobId,
-    dispatchRevision: decision.revision,
+    dispatchRevision: refreshed.revision,
   };
 }
 
@@ -754,8 +778,16 @@ function latestDispatchRevisionFor(state: OrchestratorState, reqId: string): Dis
   return list[list.length - 1];
 }
 
+function hasDispatchHistory(state: OrchestratorState, reqId: string): boolean {
+  return (state.dispatchRevisions?.[reqId]?.length ?? 0) > 0;
+}
+
 function hasActivePiJob(state: OrchestratorState): boolean {
-  return Object.values(state.jobs).some((job) => job.status === 'processing');
+  // 已领取但尚未执行的 todo 作业同样占用全局单 Pi 名额，避免异常重启或串行间隙
+  // 让其他需求在名额未真正释放前重复领取。
+  return Object.values(state.jobs).some(
+    (job) => job.status === 'processing' || job.status === 'todo',
+  );
 }
 
 function hasJobForRevision(state: OrchestratorState, reqId: string, revision: number): boolean {
@@ -1070,14 +1102,50 @@ function isSupersededWorkerRecovery(state: OrchestratorState, job: JobState): bo
   });
 }
 
+/**
+ * CAS 将已领取的 todo 作业原子转为 processing，并把本版许可刷新为最新事件。
+ * 只有仍处于 todo 且绑定仍与输入一致时才成功，防止同 job 并发双调 Pi。
+ * 返回 false 表示已被并发领取或状态已变，调用方等待而不重复启动。
+ */
+async function transitionDispatchToProcessing(
+  core: Core,
+  input: WorkerInput,
+  grant: DispatchGrant,
+): Promise<boolean> {
+  const jobId = input.jobId;
+  let transitioned = false;
+  await core.state.update((state) => {
+    const job = state.jobs[jobId];
+    if (
+      !job ||
+      job.status !== 'todo' ||
+      job.reqId !== input.reqId ||
+      job.issueNumber !== input.issueNumber ||
+      job.specHash !== input.spec.hash ||
+      job.sourceMainSha !== input.sourceMainSha ||
+      job.dispatchRevision !== input.dispatchRevision?.revision
+    ) {
+      return undefined;
+    }
+    job.status = 'processing';
+    job.grantEventId = grant.eventId;
+    job.updatedAt = new Date().toISOString();
+    transitioned = true;
+    return undefined;
+  });
+  return transitioned;
+}
+
 /** 统一 Worker 生命周期：本地状态、GitHub 标签、失败评论与通知保持同一条状态机。 */
 export async function runOneWorkerForInput(core: Core, input: WorkerInput): Promise<WorkerOutcome> {
   const jobId = input.jobId;
   const snapshot = core.state.snapshot();
   const requirement = snapshot.requirements[input.reqId];
-  // 计数器（有派工历史的需求）必须走冻结领取：缺少冻结记录即未领取/未授权直通调用；
-  // 已领取或已执行的作业不得再次调用 Pi。旧 REQ 需求没有派工历史，保持原直通行为。
-  const gatedReq = (snapshot.dispatchRevisions?.[input.reqId]?.length ?? 0) > 0;
+  // 受管派工需求以生产门禁 isGated 为准，并用已存在历史兜底，防止首次发布记录
+  // 落盘前的直接重试绕过领取。旧 REQ 需求既无门禁也无历史，保持原直通行为。
+  const isGatedReq = core.reconcileContext?.dispatch?.isGated(input.reqId) ?? false;
+  const gatedReq = isGatedReq || hasDispatchHistory(snapshot, input.reqId);
+  let freshGrant: DispatchGrant | undefined;
   if (gatedReq) {
     const claimedJob = snapshot.jobs[jobId];
     if (input.dispatchRevision === undefined) {
@@ -1100,6 +1168,18 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
         failureStage: 'publish',
       };
     }
+    // 在 todo→processing 之前刷新远端许可：空名单、领取后撤标或新打标都会让本版失效。
+    // 这里用最新远端事件而非输入携带的旧 grant，防止显式重试绕过最新授权。
+    const refreshed = await refreshDispatchClaim(core, input.reqId, input.issueNumber);
+    if (!refreshed || refreshed.revision.revision !== input.dispatchRevision.revision) {
+      core.logger.warn(`拒绝 ${input.reqId} r${input.dispatchRevision.revision} 当前无有效开工许可，等待`);
+      return {
+        status: 'stale',
+        error: `需求 ${input.reqId} r${input.dispatchRevision.revision} 当前无有效开工许可，未启动 Pi`,
+        failureStage: 'publish',
+      };
+    }
+    freshGrant = refreshed.grant;
   }
   const currentDispatchRevision =
     input.dispatchRevision !== undefined
@@ -1149,40 +1229,45 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
     return stale;
   }
 
-  await core.state.update((s) => {
-    const previous = s.jobs[jobId];
-    const preserveTrustedHead =
-      previous &&
-      previous.reqId === input.reqId &&
-      previous.issueNumber === input.issueNumber &&
-      previous.specHash === input.spec.hash &&
-      previous.sourceMainSha === input.sourceMainSha &&
-      previous.attempt === input.attempt &&
-      previous.dispatchRevision === input.dispatchRevision?.revision
-        ? previous.headSHA
-        : undefined;
-    s.jobs[jobId] = {
-      jobId,
-      reqId: input.reqId,
-      issueNumber: input.issueNumber,
-      specHash: input.spec.hash,
-      sourceMainSha: input.sourceMainSha,
-      attempt: input.attempt,
-      status: 'processing',
-      headSHA: preserveTrustedHead,
-      ...(input.dispatchRevision !== undefined
-        ? {
-            dispatchRevision: input.dispatchRevision.revision,
-            ...(currentDispatchRevision?.grant?.eventId !== undefined
-              ? { grantEventId: currentDispatchRevision.grant.eventId }
-              : {}),
-          }
-        : {}),
-      startedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    return undefined;
-  });
+  if (gatedReq) {
+    // CAS 领取：只有仍处于 todo 且绑定一致才真正转为 processing，防同 job 并发双调。
+    const transitioned = await transitionDispatchToProcessing(core, input, freshGrant!);
+    if (!transitioned) {
+      core.logger.warn(`拒绝 ${input.reqId} r${input.dispatchRevision!.revision} 作业已并发领取或状态变化`);
+      return {
+        status: 'stale',
+        error: `需求 ${input.reqId} r${input.dispatchRevision!.revision} 作业已并发领取或状态变化，未启动 Pi`,
+        failureStage: 'publish',
+      };
+    }
+  } else {
+    await core.state.update((s) => {
+      const previous = s.jobs[jobId];
+      const preserveTrustedHead =
+        previous &&
+        previous.reqId === input.reqId &&
+        previous.issueNumber === input.issueNumber &&
+        previous.specHash === input.spec.hash &&
+        previous.sourceMainSha === input.sourceMainSha &&
+        previous.attempt === input.attempt &&
+        previous.dispatchRevision === input.dispatchRevision?.revision
+          ? previous.headSHA
+          : undefined;
+      s.jobs[jobId] = {
+        jobId,
+        reqId: input.reqId,
+        issueNumber: input.issueNumber,
+        specHash: input.spec.hash,
+        sourceMainSha: input.sourceMainSha,
+        attempt: input.attempt,
+        status: 'processing',
+        headSHA: preserveTrustedHead,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      return undefined;
+    });
+  }
 
   const issueUrl = issueLink(core, input.issueNumber);
   let existingPr: ManagedPR | null;

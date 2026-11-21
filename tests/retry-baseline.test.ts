@@ -72,6 +72,13 @@ class FakeGithub {
   issue: ManagedIssue;
   prs: ManagedPR[] = [];
   branches = new Set<string>();
+  dispatchLabelEvents: Array<{
+    id: number;
+    actorId: number | null;
+    name: string;
+    event: 'labeled' | 'unlabeled';
+    createdAt: string;
+  }> = [];
   issueUpdates: string[] = [];
   issueUpdateAttempts = 0;
   loseFirstIssueResponse = false;
@@ -146,9 +153,35 @@ class FakeGithub {
     if (args[0] === 'pr' && args[1] === 'close') return { stdout: '', stderr: '', code: 0 };
     if (args[0] !== 'api') return { stdout: '', stderr: '', code: 0 };
     const path = args.find((arg) => arg.startsWith('repos/')) ?? '';
+    if (args[1] === 'user') {
+      return { stdout: JSON.stringify({ id: 4242 }), stderr: '', code: 0 };
+    }
     if (path === 'repos/owner/repo') {
       if (this.failRepoIdRead) return { stdout: '', stderr: '模拟仓库 ID 读取失败', code: 1 };
       return { stdout: JSON.stringify({ id: Number(this.repoId) }), stderr: '', code: 0 };
+    }
+    if (path === `repos/owner/repo/issues/${this.issue.number}`) {
+      return {
+        stdout: JSON.stringify({
+          ...this.issue,
+          labels: this.issue.labels.map((name) => ({ name })),
+        }),
+        stderr: '',
+        code: 0,
+      };
+    }
+    if (path === `repos/owner/repo/issues/${this.issue.number}/events?per_page=100`) {
+      return {
+        stdout: JSON.stringify([this.dispatchLabelEvents.map((event) => ({
+          id: event.id,
+          event: event.event,
+          actor: event.actorId === null ? null : { id: event.actorId },
+          label: { name: event.name },
+          created_at: event.createdAt,
+        }))]),
+        stderr: '',
+        code: 0,
+      };
     }
     if (/\/issues\/\d+\/comments\?/.test(path)) {
       return { stdout: JSON.stringify([[]]), stderr: '', code: 0 };
@@ -273,6 +306,16 @@ async function createFixture(options: {
   };
   const github = new FakeGithub(`${doc('计数器初始需求', reqId)}\n\n${encodeMetaBlock(issueMeta)}`);
   github.issue.meta = issueMeta;
+  if (options.counterRevision === 'published-granted') {
+    github.issue.labels = ['可开工/r1'];
+    github.dispatchLabelEvents = [{
+      id: 8101,
+      actorId: 4242,
+      name: '可开工/r1',
+      event: 'labeled',
+      createdAt: '2026-11-20T00:01:00.000Z',
+    }];
+  }
   const stateFile = join(repo, '.orchestrator-state.json');
   const state: OrchestratorState = {
     ...emptyState(),
@@ -416,7 +459,10 @@ function productionDeps(core: Core, github: GithubClient, hooks?: RetryBaselineH
 }
 
 function coreConfig(fx: BaselineFixture): Config {
-  return loadConfig(fx.repo);
+  const config = loadConfig(fx.repo);
+  return fx.reqId === COUNTER_REQ_ID
+    ? { ...config, dispatchAllowedUserIds: ['4242'] }
+    : config;
 }
 
 function useProductionCommands(fx: BaselineFixture): void {
@@ -1414,6 +1460,41 @@ test('counter 同 SHA 带当前授权可经正常命令入口重试，并携带�
     assert.equal(state.jobs[baseline.newJobId]?.dispatchRevision, 1);
     assert.equal(state.jobs[baseline.newJobId]?.grantEventId, 8101);
     assert.deepEqual(state.jobs.oldJob, originalJob);
+  } finally {
+    fx.dispose();
+  }
+});
+
+test('counter 显式重试时当前开工标签已撤下，不调用 Worker 或创建代码 PR', async () => {
+  const fx = await createFixture({
+    sameSha: true,
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published-granted',
+  });
+  try {
+    useRealCore(fx, async () => {
+      throw new Error('撤标后不应调用 Worker');
+    });
+    const originalJob = structuredClone(fx.store.snapshot().jobs.oldJob);
+    fx.github.issue.labels = [];
+    fx.github.dispatchLabelEvents.push({
+      id: 8102,
+      actorId: 4242,
+      name: '可开工/r1',
+      event: 'unlabeled',
+      createdAt: '2026-11-20T00:02:00.000Z',
+    });
+
+    const result = await fx.core!.commands.retry(12);
+
+    assert.match(result, /主线漂移或过期|当前无有效开工许可/);
+    assert.equal(fx.workerCalls.length, 0);
+    assert.deepEqual(fx.github.prs, []);
+    assert.deepEqual(fx.store.snapshot().jobs.oldJob, originalJob);
+    assert.equal(
+      fx.store.snapshot().dispatchRevisions?.[COUNTER_REQ_ID]?.[0]?.grant?.eventId,
+      8101,
+    );
   } finally {
     fx.dispose();
   }

@@ -263,6 +263,23 @@ export class GithubClient {
     return parsed.map((c) => ({ id: c.id, body: c.body ?? '' }));
   }
 
+  /**
+   * 读取当前 gh 认证控制器发布的评论。
+   *
+   * 派工发布高水位只信任控制器自己的评论；普通用户可以用相同 marker 正文伪造
+   * 版本号。这里复用完整分页和字段校验，不重复解析评论 JSON。
+   */
+  async listTrustedDispatchComments(
+    number: number,
+  ): Promise<Array<{ id: number; body: string; createdAt: string }>> {
+    assertIssueNumber(number);
+    const controllerId = await this.dispatchControllerId();
+    const comments = await this.listDispatchCommentRecords(number);
+    return comments
+      .filter((comment) => comment.userId === controllerId)
+      .map(({ id, body, createdAt }) => ({ id, body, createdAt }));
+  }
+
   /** 读取受管仓库的稳定数字 ID，用于把开工许可绑定到具体仓库。 */
   async getDispatchRepositoryId(): Promise<string> {
     const raw = await this.gh(['api', `repos/${this.repo}`]);

@@ -195,6 +195,20 @@ class PersistentDispatchGithub {
     }));
   }
 
+  async listTrustedDispatchComments(number: number): Promise<Array<{
+    id: number;
+    body: string;
+    userId: string;
+    createdAt: string;
+  }>> {
+    return (this.comments.get(number) ?? []).map((comment) => ({
+      id: comment.id,
+      body: comment.body,
+      userId: 'github-repository-id:9001',
+      createdAt: comment.createdAt,
+    }));
+  }
+
   async closePR(number: number): Promise<void> {
     const pr = this.prs.get(number);
     if (pr) pr.state = 'closed';

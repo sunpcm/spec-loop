@@ -535,3 +535,29 @@ test('ensureDispatchComment 对 marker 格式和正文精确行做本地校验',
     /独占一行/,
   );
 });
+
+test('listTrustedDispatchComments 只返回认证控制器评论，普通用户伪造 marker 不计入', async () => {
+  const markerFor = (revision: number): string => `spec-loop:dispatch:REQ-CNT-01:r${revision}`;
+  const fake = commentApi([
+    {
+      id: 1,
+      body: `${markerFor(1)}\n状态：待排期`,
+      userId: 42,
+      createdAt: '2026-11-21T00:01:00Z',
+    },
+    {
+      id: 2,
+      body: `${markerFor(Number.MAX_SAFE_INTEGER)}\n普通用户伪造高水位`,
+      userId: 99,
+      createdAt: '2026-11-21T00:02:00Z',
+    },
+  ]);
+
+  const trustComments = await new GithubClient('o/r', fake.runner)
+    .listTrustedDispatchComments(7);
+  assert.deepEqual(trustComments, [{
+    id: 1,
+    body: `${markerFor(1)}\n状态：待排期`,
+    createdAt: '2026-11-21T00:01:00Z',
+  }]);
+});
