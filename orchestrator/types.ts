@@ -69,6 +69,10 @@ export interface JobState {
   candidateTreeSha?: string;
   startedAt: string;
   updatedAt: string;
+  /** 派工版本号；旧任务或无门禁需求可为空。 */
+  dispatchRevision?: number;
+  /** 领取本次作业的许可事件 ID，用于持久去重。 */
+  grantEventId?: number;
 }
 
 export interface RequirementState {
@@ -76,6 +80,52 @@ export interface RequirementState {
   specHash: string;
   specPath: string;
   sourceMainSha: string;
+}
+
+/** 一次派工中的单个工作步骤，acceptanceRefs 必须引用 acceptance 内的键。 */
+export interface DispatchStep {
+  text: string;
+  acceptanceRefs: string[];
+}
+
+/**
+ * 已冻结、可交给 Worker 的结构化派工任务。来源、路径、版本与哈希由控制器固定，
+ * 本结构只承载目标、步骤、验收与写入范围；allowedPaths 由仓库策略解析。
+ */
+export interface DispatchTask {
+  goal: string;
+  steps: DispatchStep[];
+  acceptance: Record<string, string>;
+  allowedPaths: string[];
+  dependsOn: string[];
+}
+
+/** 本版开工许可的本地快照；grantEventId 由 GitHub labeled 事件 ID 持久去重。 */
+export interface DispatchGrant {
+  eventId: number;
+  actorId: string;
+  grantedAt: string;
+}
+
+/**
+ * 一个 `repo + reqId` 的历版冻结派工记录。revision 单调递增、永久占用；
+ * repoId 绑定受管仓库数字 ID，runtime 可据此核对 Issue 归属。
+ */
+export interface DispatchRevision {
+  reqId: string;
+  repoId: string;
+  revision: number;
+  issueNumber: number;
+  specHash: string;
+  specPath: string;
+  sourceMainSha: string;
+  task: DispatchTask;
+  /** 发布评论/标签完成并回读后的时间；缺失表示尚未发布或发布结果未知。 */
+  publishedAt?: string;
+  /** 发布评论回读到的 GitHub 评论 ID。 */
+  publicationCommentId?: number;
+  /** 已观察到的有效本版许可（尚未领取或已领取）；由标签事件 ID 持久去重。 */
+  grant?: DispatchGrant;
 }
 
 export type RetryBaselineStage = 'prepared' | 'ready' | 'stale' | 'completed';
@@ -204,6 +254,8 @@ export interface OrchestratorState {
   mergeRequests?: Record<string, MergeRequestState>;
   /** schema 1 的向后兼容可选扩展；保留旧 Job，仅记录显式重试的新基线准备。 */
   retryBaselines?: Record<string, RetryBaselineState>;
+  /** schema 1 的向后兼容可选扩展；每个 reqId 的历版冻结派工任务，按 revision 升序。 */
+  dispatchRevisions?: Record<string, DispatchRevision[]>;
   opLog: OpLogEntry[];
 }
 
@@ -218,6 +270,7 @@ export function emptyState(): OrchestratorState {
     specRequests: {},
     mergeRequests: {},
     retryBaselines: {},
+    dispatchRevisions: {},
     opLog: [],
   };
 }

@@ -12,13 +12,15 @@ import {
 import { createCommands } from './commands.ts';
 import type { Config } from './config.ts';
 import { deployOnce, retryDeployForIssue, type DeployDeps, type DeployResult } from './deploy.ts';
+import type { DispatchLabelEvent } from './dispatch-grant.ts';
+import { evaluateDispatchClaim } from './dispatch-task.ts';
 import type { FeishuCommands } from './feishu-contract.ts';
 import { GitClient } from './git.ts';
 import { encodeMetaBlock, GithubClient } from './github.ts';
 import { createLogger, type Logger } from './log.ts';
 import { MergeService } from './merge.ts';
 import { Notifier } from './notifier.ts';
-import { deriveIssueBody } from './planner.ts';
+import { deriveDispatchTask, deriveIssueBody } from './planner.ts';
 import { buildRequirementMeta } from './reconciler.ts';
 import {
   hasActiveRetryBaseline,
@@ -30,12 +32,16 @@ import { buildIsolationPaths, type SandboxProfileSpec } from './sandbox.ts';
 import {
   applyReconciliation,
   planForMain,
+  publishDispatchRevision,
+  reconcileWithDispatch,
   STATUS_LABELS,
+  type DispatchReconcileDeps,
   type ReconcileContext,
   type ReconcileSummary,
 } from './scheduler.ts';
+import { parseSpecs } from './specs.ts';
 import { StateStore } from './state.ts';
-import type { JobState, ManagedPR, OrchestratorState, Spec } from './types.ts';
+import type { DispatchGrant, DispatchRevision, JobState, ManagedIssue, ManagedPR, OrchestratorState, Spec } from './types.ts';
 import {
   buildVerifierEnv,
   defaultVerificationCommands,
@@ -362,6 +368,8 @@ export function createCore(
         sourceMainSha,
         candidateTreeSha,
       ),
+    checkDispatchCurrent: (revision: DispatchRevision) =>
+      checkDispatchRevisionCurrent(git, config.repoDir, config.mainBranch, revision),
   };
 
   const build = createBuild(config, git);
@@ -387,6 +395,29 @@ export function createCore(
     },
   };
 
+  const dispatchDeps: DispatchReconcileDeps = {
+    // 门禁只绑定需求 ID，不绑定可改名的 owner/repo。仓库身份由发布和领取时的
+    // GitHub 数字 repoId 核验；未配置仓库时远端核验失败并 fail closed。
+    isGated: (reqId) => reqId === 'REQ-CNT-01',
+    allowedPaths: () => ['src/**'],
+    dependsOn: () => [],
+    deriveTask: (spec, options) =>
+      deriveDispatchTask(
+        spec,
+        {
+          repoDir: config.repoDir,
+          runDir: config.runDir,
+          provider: config.piProvider,
+          model: config.piModel,
+          agentDir: config.piAgentDir,
+          timeoutMs: config.piTimeoutMs,
+          graceMs: config.piGraceMs,
+          logger: createLogger('DISPATCH-PLANNER'),
+        },
+        options,
+      ),
+  };
+
   const reconcileContext: ReconcileContext = {
     repoDir: config.repoDir,
     git,
@@ -394,6 +425,7 @@ export function createCore(
     state,
     logger: createLogger('RECONCILER'),
     mainBranch: config.mainBranch,
+    dispatch: dispatchDeps,
   };
 
   const specIntakeDeps: SpecIntakeDeps = {
@@ -454,6 +486,7 @@ export function createCore(
     findExistingDelivery: (input) => findExistingDelivery(core, input),
     trustedE2eRoot: workerDeps.browserE2eRoot ?? config.repoDir,
     mainBranch: config.mainBranch,
+    publishDispatchRevision: (input) => publishDispatchRevision(reconcileContext, input),
   };
   const commands = createCommands({
     repoDir: config.repoDir,
@@ -499,11 +532,15 @@ export async function reconcileWithPlanner(
   ctx: ReconcileContext,
   planner: ((spec: Spec) => Promise<string | null>) | null,
 ): Promise<ReconcileSummary | null> {
+  if (ctx.dispatch && !planner) {
+    return reconcileWithDispatch(ctx, ctx.dispatch);
+  }
   const summary = await planForMain(ctx);
   if (!summary) return null;
   if (planner) {
     for (const op of summary.ops) {
       if ((op.kind === 'create' || op.kind === 'update') && op.spec) {
+        if (ctx.dispatch?.isGated(op.reqId)) continue;
         if (hasActiveRetryBaseline(ctx.state.snapshot(), op.reqId)) continue;
         const body = await planner(op.spec);
         if (body) {
@@ -518,11 +555,13 @@ export async function reconcileWithPlanner(
 }
 
 export interface WorkerTarget {
+  jobId?: string;
   reqId: string;
   issueNumber: number;
   spec: Spec;
   sourceMainSha: string;
   attempt: number;
+  dispatchRevision?: DispatchRevision;
 }
 
 /**
@@ -566,6 +605,195 @@ export function pickWorkerTargets(state: ReturnType<StateStore['snapshot']>, spe
     targets.push({ reqId, issueNumber: req.issueNumber, spec, sourceMainSha: req.sourceMainSha, attempt });
   }
   return targets;
+}
+
+function dispatchTargetMatchesRevision(
+  target: WorkerTarget,
+  revision: DispatchRevision,
+): boolean {
+  return (
+    revision.reqId === target.reqId &&
+    revision.issueNumber === target.issueNumber &&
+    revision.specHash === target.spec.hash &&
+    revision.specPath === target.spec.path &&
+    revision.sourceMainSha === target.sourceMainSha
+  );
+}
+
+interface RefreshedDispatchClaim {
+  revision: DispatchRevision;
+  grant: DispatchGrant;
+}
+
+/**
+ * 刷新本版远端开工许可：重新读取 Issue、仓库 ID 与标签事件，用最新状态重新评估
+ * 空名单/撤标/新打标。规格是否当前由 claim 的 checkDispatchCurrent 与 worker 各自核对。
+ * 任一步失败或非授权都返回 null，调用方据此等待而不是创建 failed job。
+ */
+async function refreshDispatchClaim(
+  core: Core,
+  reqId: string,
+  issueNumber: number,
+): Promise<RefreshedDispatchClaim | null> {
+  let issue: ManagedIssue;
+  let repoId: string;
+  let events: DispatchLabelEvent[];
+  try {
+    [issue, repoId, events] = await Promise.all([
+      core.github.getDispatchIssue(issueNumber),
+      core.github.getDispatchRepositoryId(),
+      core.github.listDispatchLabelEvents(issueNumber),
+    ]);
+  } catch (error) {
+    core.logger.warn(
+      `派工 ${reqId} 远端许可刷新失败，暂停领取: ${errorText(error)}`,
+    );
+    return null;
+  }
+  if (issue.state !== 'open' || issue.number !== issueNumber) return null;
+
+  const decision = evaluateDispatchClaim(core.state.snapshot(), reqId, {
+    repoId,
+    issueNumber,
+    labels: issue.labels,
+    events,
+    allowedActorIds: core.config.dispatchAllowedUserIds ?? [],
+  });
+  if (!decision.claimable) return null;
+  return { revision: decision.revision, grant: decision.grant };
+}
+
+/**
+ * 生产运行时唯一的计数器开工门禁。远端标签与事件只决定是否可领取，
+ * 本地状态更新再原子占用全局 Pi 名额和本版作业，避免并发轮询重复启动。
+ */
+async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<WorkerTarget | null> {
+  const deps = core.reconcileContext.dispatch;
+  if (!deps?.isGated(target.reqId)) {
+    // 已有派工历史但门禁已失效时 fail closed，不能退回旧 REQ 直通路径。
+    if (hasDispatchHistory(core.state.snapshot(), target.reqId)) return null;
+    return target;
+  }
+
+  const initial = core.state.snapshot();
+  const revision = latestDispatchRevisionFor(initial, target.reqId);
+  if (
+    !revision ||
+    !dispatchTargetMatchesRevision(target, revision) ||
+    hasActivePiJob(initial) ||
+    hasJobForRevision(initial, target.reqId, revision.revision)
+  ) {
+    return null;
+  }
+
+  const refreshed = await refreshDispatchClaim(core, target.reqId, target.issueNumber);
+  if (!refreshed || !dispatchTargetMatchesRevision(target, refreshed.revision)) {
+    return null;
+  }
+
+  const checker = core.workerDeps.checkDispatchCurrent;
+  if (!checker || !(await checker(refreshed.revision))) return null;
+
+  const jobId = `job-${target.reqId}-${target.attempt}-${Date.now()}`;
+  const now = new Date().toISOString();
+  let claimed = false;
+  await core.state.update((state) => {
+    const requirement = state.requirements[target.reqId];
+    const current = latestDispatchRevisionFor(state, target.reqId);
+    if (
+      !requirement ||
+      requirement.issueNumber !== target.issueNumber ||
+      requirement.specHash !== target.spec.hash ||
+      requirement.specPath !== target.spec.path ||
+      requirement.sourceMainSha !== target.sourceMainSha ||
+      !current ||
+      current.revision !== refreshed.revision.revision ||
+      hasActivePiJob(state) ||
+      hasJobForRevision(state, target.reqId, current.revision)
+    ) {
+      return undefined;
+    }
+    current.grant = refreshed.grant;
+    state.jobs[jobId] = {
+      jobId,
+      reqId: target.reqId,
+      issueNumber: target.issueNumber,
+      specHash: target.spec.hash,
+      sourceMainSha: target.sourceMainSha,
+      attempt: target.attempt,
+      status: 'todo',
+      dispatchRevision: current.revision,
+      grantEventId: refreshed.grant.eventId,
+      startedAt: now,
+      updatedAt: now,
+    };
+    claimed = true;
+    return undefined;
+  });
+  if (!claimed) return null;
+
+  return {
+    ...target,
+    jobId,
+    dispatchRevision: refreshed.revision,
+  };
+}
+
+/**
+ * 核远端当前版本：冻结提交仍在 origin/main 历史中，且该快照的需求路径/哈希与冻结记录一致。
+ * 任一步失败或读不到都 fail closed，返回 false，调用方据此等待而不是继续领取。
+ */
+async function checkDispatchRevisionCurrent(
+  git: GitClient,
+  repoDir: string,
+  mainBranch: string,
+  revision: DispatchRevision,
+): Promise<boolean> {
+  try {
+    await git.fetch(repoDir, mainBranch);
+    const current = (await git.revParse(repoDir, `origin/${mainBranch}`)).trim().toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(current)) return false;
+    if (!(await git.isAncestor(repoDir, revision.sourceMainSha, current))) return false;
+    // 沿第一父链检查冻结 SHA 之后到当前 HEAD 之间是否改过本需求块；
+    // 哪怕内容改后再改回（A→B→A）也必须视为过期，不能只看旧快照。
+    const commits = await git.firstParentCommits(repoDir, revision.sourceMainSha, current);
+    for (const sha of commits) {
+      const changed = await git.changedPathsFirstParent(repoDir, sha);
+      if (changed.includes(revision.specPath)) return false;
+    }
+    // 当前 HEAD 的需求块仍须与冻结记录同一身份（需求 ID / 路径 / 哈希）。
+    const files = await git.readSpecSnapshot(repoDir, current);
+    const parsed = parseSpecs(files);
+    if (parsed.errors.length > 0) return false;
+    return parsed.specs.some(
+      (spec) => spec.id === revision.reqId && spec.path === revision.specPath && spec.hash === revision.specHash,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function latestDispatchRevisionFor(state: OrchestratorState, reqId: string): DispatchRevision | undefined {
+  const list = state.dispatchRevisions?.[reqId] ?? [];
+  return list[list.length - 1];
+}
+
+function hasDispatchHistory(state: OrchestratorState, reqId: string): boolean {
+  return (state.dispatchRevisions?.[reqId]?.length ?? 0) > 0;
+}
+
+function hasActivePiJob(state: OrchestratorState): boolean {
+  // 已领取但尚未执行的 todo 作业同样占用全局单 Pi 名额，避免异常重启或串行间隙
+  // 让其他需求在名额未真正释放前重复领取。
+  return Object.values(state.jobs).some(
+    (job) => job.status === 'processing' || job.status === 'todo',
+  );
+}
+
+function hasJobForRevision(state: OrchestratorState, reqId: string, revision: number): boolean {
+  return Object.values(state.jobs).some(
+    (job) => job.reqId === reqId && job.dispatchRevision === revision,
+  );
 }
 
 function errorText(error: unknown): string {
@@ -657,13 +885,20 @@ async function markWorkerOutcome(core: Core, jobId: string, outcome: WorkerOutco
 
 function isCurrentRemoteDelivery(pr: ManagedPR, input: WorkerInput): boolean {
   const meta = pr.meta as Record<string, unknown>;
-  return (
-    meta?.kind === 'code-pr' &&
-    meta.reqId === input.reqId &&
-    meta.specHash === input.spec.hash &&
-    meta.sourceMainSha === input.sourceMainSha &&
-    (pr.state === 'open' || pr.merged)
-  );
+  if (
+    meta?.kind !== 'code-pr' ||
+    meta.reqId !== input.reqId ||
+    meta.specHash !== input.spec.hash ||
+    meta.sourceMainSha !== input.sourceMainSha ||
+    !(pr.state === 'open' || pr.merged)
+  ) {
+    return false;
+  }
+  // 派工输入必须精确匹配冻结版本；旧 REQ 输入只匹配不带版本的存量交付。
+  if (input.dispatchRevision !== undefined) {
+    return meta.dispatchRevision === input.dispatchRevision.revision;
+  }
+  return meta.dispatchRevision === undefined;
 }
 
 async function findExistingDelivery(core: Core, input: WorkerInput): Promise<ManagedPR | null> {
@@ -844,27 +1079,121 @@ function isSupersededWorkerRecovery(state: OrchestratorState, job: JobState): bo
         (baseline.stage === 'prepared' || baseline.stage === 'stale')),
   );
   if (baselineSupercedes) return true;
-  return Object.values(state.jobs).some(
-    (candidate) =>
-      candidate.jobId !== job.jobId &&
-      candidate.reqId === job.reqId &&
-      candidate.issueNumber === job.issueNumber &&
+  return Object.values(state.jobs).some((candidate) => {
+    if (
+      candidate.jobId === job.jobId ||
+      candidate.reqId !== job.reqId ||
+      candidate.issueNumber !== job.issueNumber
+    ) {
+      return false;
+    }
+    const candidateRevision = candidate.dispatchRevision;
+    const jobRevision = job.dispatchRevision;
+    if (candidateRevision !== undefined || jobRevision !== undefined) {
+      const left = candidateRevision ?? 0;
+      const right = jobRevision ?? 0;
+      if (left !== right) return left > right;
+    }
+    return (
       candidate.specHash === job.specHash &&
       candidate.sourceMainSha === job.sourceMainSha &&
-      candidate.attempt > job.attempt,
-  );
+      candidate.attempt > job.attempt
+    );
+  });
+}
+
+/**
+ * CAS 将已领取的 todo 作业原子转为 processing，并把本版许可刷新为最新事件。
+ * 只有仍处于 todo 且绑定仍与输入一致时才成功，防止同 job 并发双调 Pi。
+ * 返回 false 表示已被并发领取或状态已变，调用方等待而不重复启动。
+ */
+async function transitionDispatchToProcessing(
+  core: Core,
+  input: WorkerInput,
+  grant: DispatchGrant,
+): Promise<boolean> {
+  const jobId = input.jobId;
+  let transitioned = false;
+  await core.state.update((state) => {
+    const job = state.jobs[jobId];
+    if (
+      !job ||
+      job.status !== 'todo' ||
+      job.reqId !== input.reqId ||
+      job.issueNumber !== input.issueNumber ||
+      job.specHash !== input.spec.hash ||
+      job.sourceMainSha !== input.sourceMainSha ||
+      job.dispatchRevision !== input.dispatchRevision?.revision
+    ) {
+      return undefined;
+    }
+    job.status = 'processing';
+    job.grantEventId = grant.eventId;
+    job.updatedAt = new Date().toISOString();
+    transitioned = true;
+    return undefined;
+  });
+  return transitioned;
 }
 
 /** 统一 Worker 生命周期：本地状态、GitHub 标签、失败评论与通知保持同一条状态机。 */
 export async function runOneWorkerForInput(core: Core, input: WorkerInput): Promise<WorkerOutcome> {
   const jobId = input.jobId;
-  const requirement = core.state.snapshot().requirements[input.reqId];
+  const snapshot = core.state.snapshot();
+  const requirement = snapshot.requirements[input.reqId];
+  // 受管派工需求以生产门禁 isGated 为准，并用已存在历史兜底，防止首次发布记录
+  // 落盘前的直接重试绕过领取。旧 REQ 需求既无门禁也无历史，保持原直通行为。
+  const isGatedReq = core.reconcileContext?.dispatch?.isGated(input.reqId) ?? false;
+  const gatedReq = isGatedReq || hasDispatchHistory(snapshot, input.reqId);
+  let freshGrant: DispatchGrant | undefined;
+  if (gatedReq) {
+    const claimedJob = snapshot.jobs[jobId];
+    if (input.dispatchRevision === undefined) {
+      core.logger.warn(`拒绝 ${input.reqId} 未领取的派工调用（缺少 dispatchRevision）`);
+      return {
+        status: 'stale',
+        error: `需求 ${input.reqId} 为受管派工需求，缺少冻结领取记录，拒绝未授权调用`,
+        failureStage: 'publish',
+      };
+    }
+    if (
+      !claimedJob ||
+      claimedJob.dispatchRevision !== input.dispatchRevision.revision ||
+      claimedJob.status !== 'todo'
+    ) {
+      core.logger.warn(`拒绝 ${input.reqId} 已领取或已执行作业重复调用 Pi（job ${jobId}）`);
+      return {
+        status: 'stale',
+        error: `需求 ${input.reqId} r${input.dispatchRevision.revision} 作业已领取或已执行，禁止重复调用 Pi`,
+        failureStage: 'publish',
+      };
+    }
+    // 在 todo→processing 之前刷新远端许可：空名单、领取后撤标或新打标都会让本版失效。
+    // 这里用最新远端事件而非输入携带的旧 grant，防止显式重试绕过最新授权。
+    const refreshed = await refreshDispatchClaim(core, input.reqId, input.issueNumber);
+    if (!refreshed || refreshed.revision.revision !== input.dispatchRevision.revision) {
+      core.logger.warn(`拒绝 ${input.reqId} r${input.dispatchRevision.revision} 当前无有效开工许可，等待`);
+      return {
+        status: 'stale',
+        error: `需求 ${input.reqId} r${input.dispatchRevision.revision} 当前无有效开工许可，未启动 Pi`,
+        failureStage: 'publish',
+      };
+    }
+    freshGrant = refreshed.grant;
+  }
+  const currentDispatchRevision =
+    input.dispatchRevision !== undefined
+      ? latestDispatchRevisionFor(snapshot, input.reqId)
+      : undefined;
   // 新 revision 已接管该 Issue 时，旧作业不再写 GitHub，避免把新需求标成 failed。
   if (
     !requirement ||
     requirement.issueNumber !== input.issueNumber ||
     requirement.specHash !== input.spec.hash ||
-    requirement.sourceMainSha !== input.sourceMainSha
+    requirement.sourceMainSha !== input.sourceMainSha ||
+    (input.dispatchRevision !== undefined &&
+      (currentDispatchRevision === undefined ||
+        currentDispatchRevision.revision !== input.dispatchRevision.revision))
   ) {
     const stale: WorkerOutcome = {
       status: 'stale',
@@ -882,6 +1211,14 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
         attempt: input.attempt,
         status: 'failed',
         failureStage: 'publish',
+        ...(input.dispatchRevision !== undefined
+          ? {
+              dispatchRevision: input.dispatchRevision.revision,
+              ...(currentDispatchRevision?.grant?.eventId !== undefined
+                ? { grantEventId: currentDispatchRevision.grant.eventId }
+                : {}),
+            }
+          : {}),
         startedAt: now,
         updatedAt: now,
       };
@@ -892,31 +1229,45 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
     return stale;
   }
 
-  await core.state.update((s) => {
-    const previous = s.jobs[jobId];
-    const preserveTrustedHead =
-      previous &&
-      previous.reqId === input.reqId &&
-      previous.issueNumber === input.issueNumber &&
-      previous.specHash === input.spec.hash &&
-      previous.sourceMainSha === input.sourceMainSha &&
-      previous.attempt === input.attempt
-        ? previous.headSHA
-        : undefined;
-    s.jobs[jobId] = {
-      jobId,
-      reqId: input.reqId,
-      issueNumber: input.issueNumber,
-      specHash: input.spec.hash,
-      sourceMainSha: input.sourceMainSha,
-      attempt: input.attempt,
-      status: 'processing',
-      headSHA: preserveTrustedHead,
-      startedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    return undefined;
-  });
+  if (gatedReq) {
+    // CAS 领取：只有仍处于 todo 且绑定一致才真正转为 processing，防同 job 并发双调。
+    const transitioned = await transitionDispatchToProcessing(core, input, freshGrant!);
+    if (!transitioned) {
+      core.logger.warn(`拒绝 ${input.reqId} r${input.dispatchRevision!.revision} 作业已并发领取或状态变化`);
+      return {
+        status: 'stale',
+        error: `需求 ${input.reqId} r${input.dispatchRevision!.revision} 作业已并发领取或状态变化，未启动 Pi`,
+        failureStage: 'publish',
+      };
+    }
+  } else {
+    await core.state.update((s) => {
+      const previous = s.jobs[jobId];
+      const preserveTrustedHead =
+        previous &&
+        previous.reqId === input.reqId &&
+        previous.issueNumber === input.issueNumber &&
+        previous.specHash === input.spec.hash &&
+        previous.sourceMainSha === input.sourceMainSha &&
+        previous.attempt === input.attempt &&
+        previous.dispatchRevision === input.dispatchRevision?.revision
+          ? previous.headSHA
+          : undefined;
+      s.jobs[jobId] = {
+        jobId,
+        reqId: input.reqId,
+        issueNumber: input.issueNumber,
+        specHash: input.spec.hash,
+        sourceMainSha: input.sourceMainSha,
+        attempt: input.attempt,
+        status: 'processing',
+        headSHA: preserveTrustedHead,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      return undefined;
+    });
+  }
 
   const issueUrl = issueLink(core, input.issueNumber);
   let existingPr: ManagedPR | null;
@@ -1037,17 +1388,20 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
 
 export async function runOneWorker(core: Core, target: WorkerTarget): Promise<WorkerOutcome> {
   const input: WorkerInput = {
-    jobId: `job-${target.reqId}-${target.attempt}-${Date.now()}`,
+    jobId: target.jobId ?? `job-${target.reqId}-${target.attempt}-${Date.now()}`,
     reqId: target.reqId,
     issueNumber: target.issueNumber,
     spec: target.spec,
     sourceMainSha: target.sourceMainSha,
     attempt: target.attempt,
+    ...(target.dispatchRevision ? { dispatchRevision: target.dispatchRevision } : {}),
   };
   return runOneWorkerForInput(core, input);
 }
 
-export async function runOnce(core: Core): Promise<{
+const runOnceQueues = new WeakMap<Core, Promise<void>>();
+
+async function runOnceUnlocked(core: Core): Promise<{
   summary: ReconcileSummary | null;
   workers: WorkerOutcome[];
   deploy: DeployResult;
@@ -1078,9 +1432,35 @@ export async function runOnce(core: Core): Promise<{
   if (summary) {
     const targets = pickWorkerTargets(core.state.snapshot(), summary.specs);
     for (const target of targets) {
-      workers.push(await runOneWorker(core, target));
+      const claimed = await claimDispatchTarget(core, target);
+      if (!claimed) continue;
+      workers.push(await runOneWorker(core, claimed));
     }
   }
   const deploy = await deployOnce(core.deployDeps);
   return { summary, workers, deploy };
+}
+
+/** 同一 Core 的轮询串行执行，避免并发 fetch 抢同一个 origin/main 跟踪引用。 */
+export async function runOnce(core: Core): Promise<{
+  summary: ReconcileSummary | null;
+  workers: WorkerOutcome[];
+  deploy: DeployResult;
+}> {
+  const previous = runOnceQueues.get(core) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current);
+  runOnceQueues.set(core, tail);
+  await previous;
+  try {
+    return await runOnceUnlocked(core);
+  } finally {
+    release();
+    if (runOnceQueues.get(core) === tail) {
+      runOnceQueues.delete(core);
+    }
+  }
 }

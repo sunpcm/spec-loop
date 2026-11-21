@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { latestDispatchRevision } from './dispatch-task.ts';
 import type { FeishuActorContext } from './feishu-contract.ts';
 import type { GitClient } from './git.ts';
 import { extractMeta, type GhResult, type GithubClient } from './github.ts';
@@ -6,6 +7,7 @@ import { redact, type Logger } from './log.ts';
 import { parseSpecs } from './specs.ts';
 import type { StateStore } from './state.ts';
 import type {
+  DispatchRevision,
   JobState,
   MergePrType,
   MergeRequestStage,
@@ -360,7 +362,7 @@ export class MergeService {
       this.logger.info(
         `[MERGE] PR #${prNumber} ${evidence.type} 预检通过 head=${pr.headSHA.slice(0, 8)} base=${pr.baseSHA.slice(0, 8)}`,
       );
-      return this.preflightMessage(record);
+      return this.preflightMessage(record, this.mergeRevisionLabel(pr, evidence.type));
     } catch (error) {
       this.logger.warn(`[MERGE] PR #${prNumber} 预检拒绝 ${boundedError(error)}`);
       return this.reject(prNumber, boundedError(error));
@@ -424,7 +426,7 @@ export class MergeService {
         return await this.finishMerged(record, initialPull.mergeCommitSha);
       }
       const current = await this.currentSpecSnapshot();
-      this.assertRecordSnapshot(record, initialPull, current.mainSha);
+      await this.assertRecordSnapshot(record, initialPull, current.mainSha);
       initialEvidence = await this.validateManagedEvidence(initialPull, current, 'active');
       if (initialEvidence.type !== record.type) {
         throw new MergeEvidenceError('PR 受管类型与预检记录不一致');
@@ -467,7 +469,7 @@ export class MergeService {
         return await this.finishMerged(attempted, finalPull.mergeCommitSha);
       }
       const finalCurrent = await this.currentSpecSnapshot();
-      this.assertRecordSnapshot(attempted, finalPull, finalCurrent.mainSha);
+      await this.assertRecordSnapshot(attempted, finalPull, finalCurrent.mainSha);
       const finalEvidence = await this.validateManagedEvidence(finalPull, finalCurrent, 'active');
       if (finalEvidence.type !== attempted.type) {
         throw new MergeEvidenceError('PR 受管类型在确认时发生变化');
@@ -683,9 +685,6 @@ export class MergeService {
       if (pr.mergeableState !== 'clean') {
         throw new MergeEvidenceError(`PR mergeable_state=${pr.mergeableState}，只允许 clean`);
       }
-      if (!sameRepo(current.mainSha, pr.baseSHA)) {
-        throw new MergeEvidenceError('PR base SHA 与本地 origin/main 不一致，请重新预检');
-      }
     } else {
       if (!pr.merged) throw new MergeEvidenceError('PR 尚未合并');
       if (!pr.mergeCommitSha) throw new MergeEvidenceError('已合并 PR 缺少有效 merge commit SHA');
@@ -806,6 +805,7 @@ export class MergeService {
     evidenceBaseSHA: string,
   ): Promise<string> {
     const reqId = requiredString(meta.reqId, 'PR 元数据 reqId');
+    const specPath = requiredString(meta.specPath, 'PR 元数据 specPath');
     const specHash = requiredString(meta.specHash, 'PR 元数据 specHash');
     const sourceMainSha = requiredString(meta.sourceMainSha, 'PR 元数据 sourceMainSha');
     const jobId = requiredString(meta.jobId, 'PR 元数据 jobId');
@@ -835,18 +835,78 @@ export class MergeService {
     if (requirement && requirement.issueNumber !== job.issueNumber) {
       throw new MergeEvidenceError('state requirement 与 job 的 issue 绑定不一致');
     }
+    if (requirement && requirement.specPath !== specPath) {
+      throw new MergeEvidenceError('PR 元数据 specPath 与 state requirement 不一致');
+    }
+    const metaRevision =
+      meta.dispatchRevision === undefined
+        ? undefined
+        : requiredInteger(meta.dispatchRevision, 'PR 元数据 dispatchRevision', 1);
+    let stateRevision: number | undefined;
+    if (job.dispatchRevision !== undefined) {
+      if (!Number.isSafeInteger(job.dispatchRevision) || job.dispatchRevision <= 0) {
+        throw new MergeEvidenceError('job 的 dispatchRevision 必须是正整数');
+      }
+      stateRevision = job.dispatchRevision;
+    }
+    const dispatch: DispatchRevision | undefined = latestDispatchRevision(state, reqId);
+    if ((metaRevision === undefined) !== (stateRevision === undefined)) {
+      throw new MergeEvidenceError('PR 元数据与 job 的 dispatchRevision 必须同时存在');
+    }
+    if (metaRevision !== undefined && metaRevision !== stateRevision) {
+      throw new MergeEvidenceError('PR 元数据与 job 的 dispatchRevision 不一致');
+    }
+    if (!dispatch) {
+      if (metaRevision !== undefined || stateRevision !== undefined) {
+        throw new MergeEvidenceError('PR/job 带任务版本但 state 缺少对应冻结 dispatchRevision');
+      }
+    } else {
+      if (!requirement) {
+        throw new MergeEvidenceError('存在冻结派工版本但 state requirement 缺失');
+      }
+      if (
+        metaRevision === undefined ||
+        stateRevision === undefined ||
+        metaRevision !== dispatch.revision ||
+        stateRevision !== dispatch.revision
+      ) {
+        throw new MergeEvidenceError('PR/job 的任务版本与当前冻结 dispatchRevision 不一致');
+      }
+      if (
+        dispatch.issueNumber !== requirement.issueNumber ||
+        dispatch.issueNumber !== job.issueNumber ||
+        dispatch.specHash !== requirement.specHash ||
+        dispatch.specHash !== specHash ||
+        dispatch.specPath !== requirement.specPath ||
+        dispatch.specPath !== specPath ||
+        dispatch.sourceMainSha !== requirement.sourceMainSha ||
+        dispatch.sourceMainSha !== sourceMainSha ||
+        dispatch.reqId !== reqId
+      ) {
+        throw new MergeEvidenceError('当前冻结 dispatchRevision 与 requirement/job/PR 绑定不一致');
+      }
+    }
     const activeStatuses = new Set(['in-review']);
     const mergedStatuses = new Set(['in-review', 'done', 'failed']);
     if (!(mode === 'active' ? activeStatuses : mergedStatuses).has(job.status)) {
       throw new MergeEvidenceError(`本地 job 状态 ${job.status} 不允许当前操作`);
     }
-    const expectedBranch = buildWorkerBranchName(
-      reqId,
-      job.issueNumber,
-      specHash,
-      sourceMainSha,
-      attempt,
-    );
+    const expectedBranch = dispatch === undefined
+      ? buildWorkerBranchName(
+          reqId,
+          job.issueNumber,
+          specHash,
+          sourceMainSha,
+          attempt,
+        )
+      : buildWorkerBranchName(
+          reqId,
+          job.issueNumber,
+          specHash,
+          sourceMainSha,
+          attempt,
+          dispatch.revision,
+        );
     if (pr.headRef !== expectedBranch) {
       throw new MergeEvidenceError('PR head 分支不是受控 Worker 生成分支');
     }
@@ -857,10 +917,11 @@ export class MergeService {
       if (
         requirement.specHash !== specHash ||
         requirement.sourceMainSha !== sourceMainSha ||
-        !sameRepo(current.mainSha, sourceMainSha)
+        requirement.specPath !== specPath
       ) {
         throw new MergeEvidenceError('requirement/job/meta/当前 main 的 revision 绑定不一致');
       }
+      await this.assertSourceInMain(sourceMainSha, current.mainSha);
       const currentSpec = current.specs.find((spec) => spec.id === reqId);
       if (!currentSpec || currentSpec.hash !== requirement.specHash || currentSpec.hash !== specHash) {
         throw new MergeEvidenceError('当前 origin/main 需求哈希与 state/PR specHash 不一致');
@@ -1227,6 +1288,19 @@ export class MergeService {
     return { mainSha, specs: parsed.specs };
   }
 
+  /** 代码冻结基线只需仍在当前主线历史中；文档请求仍要求从当前 main 直接起草。 */
+  private async assertSourceInMain(sourceMainSha: string, currentMainSha: string): Promise<void> {
+    if (sameRepo(sourceMainSha, currentMainSha)) return;
+    try {
+      await this.git.raw(
+        ['merge-base', '--is-ancestor', sourceMainSha, currentMainSha],
+        this.repoDir,
+      );
+    } catch {
+      throw new MergeEvidenceError('冻结 sourceMainSha 不在当前 origin/main 历史中，任务版本已失效');
+    }
+  }
+
   private assertEvidenceSnapshot(first: PullRequestDetail, final: PullRequestDetail): void {
     if (
       first.number !== final.number ||
@@ -1247,17 +1321,20 @@ export class MergeService {
     }
   }
 
-  private assertRecordSnapshot(
+  private async assertRecordSnapshot(
     record: MergeRequestState,
     pr: PullRequestDetail,
     currentMainSha: string,
-  ): void {
+  ): Promise<void> {
     this.assertRecordHead(record, pr);
     if (pr.baseSHA !== record.baseSHA) {
       throw new MergeEvidenceError('PR base 已从确认码绑定 SHA 漂移，确认码作废');
     }
-    if (currentMainSha !== record.baseSHA) {
+    if (record.type === 'docs' && currentMainSha !== record.baseSHA) {
       throw new MergeEvidenceError('main/base 已从确认码绑定 SHA 漂移，确认码作废');
+    }
+    if (record.type === 'code') {
+      await this.assertSourceInMain(record.baseSHA, currentMainSha);
     }
     if (pr.state !== 'open') throw new MergeEvidenceError('PR 已关闭且未合并');
   }
@@ -1269,7 +1346,7 @@ export class MergeService {
   }
 
   private looksLikeDrift(error: unknown): boolean {
-    return /漂移|head 已|base 已|发生变化/.test(boundedError(error));
+    return /漂移|head 已|base 已|发生变化|任务版本|dispatchRevision/.test(boundedError(error));
   }
 
   private uniqueConfirmationCode(): string {
@@ -1289,13 +1366,31 @@ export class MergeService {
     return !Number.isFinite(expiresAt) || this.now() >= expiresAt;
   }
 
-  private preflightMessage(record: MergeRequestState): string {
+  private mergeRevisionLabel(
+    pr: PullRequestDetail,
+    type: MergePrType,
+  ): string | undefined {
+    if (type !== 'code') return undefined;
+    const meta = extractMeta(pr.body);
+    const reqId = typeof meta?.reqId === 'string' ? meta.reqId : undefined;
+    if (!reqId) return undefined;
+    try {
+      const revision = latestDispatchRevision(this.state.snapshot(), reqId);
+      if (revision) return `r${revision.revision}`;
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private preflightMessage(record: MergeRequestState, revisionLabel?: string): string {
     return [
       `PR #${record.prNumber} 合并预检通过`,
       `仓库: ${record.repo}`,
       `标题: ${record.prTitle}`,
       `链接: ${record.prUrl}`,
       `类型: ${record.type === 'docs' ? '文档 PR' : '代码 PR'}`,
+      ...(revisionLabel ? [`任务版本: ${revisionLabel}`] : []),
       `headSHA: ${record.headSHA}`,
       `目标: ${this.mainBranch} / ${record.baseSHA}`,
       `检查: ${record.checksSummary}`,

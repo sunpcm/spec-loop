@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { validateDispatchRevision } from './dispatch-task.ts';
 import { encodeMetaBlock, extractMeta, stripMeta } from './github.ts';
 import type { GithubClient } from './github.ts';
 import type { GitClient } from './git.ts';
@@ -9,6 +10,7 @@ import { buildIssueBody, buildRequirementMeta } from './reconciler.ts';
 import { parseSpecs } from './specs.ts';
 import type { StateStore } from './state.ts';
 import type {
+  DispatchRevision,
   JobState,
   ManagedIssue,
   ManagedPR,
@@ -26,6 +28,15 @@ export const BASELINE_JOB_RE = /^retry-baseline-[0-9a-f]{24}-job$/;
 const PREPARED_FAILURE_STAGE = 'retry-baseline';
 const PREPARED_RESUME_ACTION = 'retry-baseline';
 const STALE_FAILURE_STAGE = 'retry-baseline-stale';
+const COUNTER_REQ_ID = 'REQ-CNT-01';
+
+export interface PublishDispatchRevisionInput {
+  reqId: string;
+  issueNumber: number;
+  spec: Spec;
+  targetMainSha: string;
+  repoId: string;
+}
 
 export interface RetryBaselineDeps {
   repoDir: string;
@@ -44,6 +55,13 @@ export interface RetryBaselineDeps {
   trustedE2eRoot?: string;
   mainBranch?: string;
   hooks?: RetryBaselineHooks;
+  /**
+   * runtime 注入的 scheduler 唯一冻结发布入口。counter 的 main 已推进恢复只允许
+   * 经此回调登记新 rN 待排期，不能在本模块重建第二条发布流程。
+   */
+  publishDispatchRevision?: (
+    input: PublishDispatchRevisionInput,
+  ) => Promise<DispatchRevision>;
 }
 
 /** 仅用于测试持久阶段边界；生产调用不注入任何钩子。 */
@@ -57,7 +75,7 @@ export interface RetryBaselineHooks {
 }
 
 export interface RetryBaselineResult {
-  status: 'ready' | 'blocked' | 'pending' | 'stale' | 'retry-required' | 'completed' | 'resume-delivery';
+  status: 'ready' | 'blocked' | 'pending' | 'stale' | 'retry-required' | 'completed' | 'resume-delivery' | 'scheduled';
   message: string;
   baseline: RetryBaselineState | null;
 }
@@ -72,6 +90,7 @@ interface Preflight {
   spec: Spec;
   baseline: RetryBaselineState;
   newJob: JobState;
+  dispatchRevision?: DispatchRevision;
   /** 仅表示本次必须显式运行 ready 意图，不代表新 Job 已实际失败。 */
   executeReadyJob?: boolean;
 }
@@ -93,11 +112,15 @@ function openOrMerged(pr: ManagedPR): boolean {
 }
 
 function sameRevision(pr: ManagedPR, input: WorkerInput): boolean {
+  const expectedRevision = input.dispatchRevision?.revision;
   return (
     pr.meta?.kind === 'code-pr' &&
     pr.meta.reqId === input.reqId &&
     pr.meta.specHash === input.spec.hash &&
-    pr.meta.sourceMainSha === input.sourceMainSha
+    pr.meta.sourceMainSha === input.sourceMainSha &&
+    (expectedRevision === undefined
+      ? pr.meta.dispatchRevision === undefined
+      : pr.meta.dispatchRevision === expectedRevision)
   );
 }
 
@@ -184,7 +207,10 @@ function messageFor(baseline: RetryBaselineState, text: string): string {
   return `${text}（重试操作 ${baseline.operationId}，基线 ${baseline.fromSourceMainSha.slice(0, 8)} → ${baseline.targetSourceMainSha.slice(0, 8)}）`;
 }
 
-function expectedNewJob(baseline: RetryBaselineState): JobState {
+function expectedNewJob(
+  baseline: RetryBaselineState,
+  dispatchRevision?: DispatchRevision,
+): JobState {
   return {
     jobId: baseline.newJobId,
     reqId: baseline.reqId,
@@ -197,6 +223,7 @@ function expectedNewJob(baseline: RetryBaselineState): JobState {
     resumeAction: PREPARED_RESUME_ACTION,
     startedAt: baseline.createdAt,
     updatedAt: baseline.updatedAt,
+    ...(dispatchRevision ? { dispatchRevision: dispatchRevision.revision } : {}),
   };
 }
 
@@ -269,6 +296,293 @@ async function currentMain(deps: RetryBaselineDeps): Promise<string> {
   const sha = (await deps.git.revParse(deps.repoDir, `origin/${mainBranch}`)).trim().toLowerCase();
   if (!SHA_RE.test(sha)) throw new Error('origin/main 不是完整 SHA，拒绝继续');
   return sha;
+}
+
+function latestCounterRevision(
+  state: OrchestratorState,
+): DispatchRevision | undefined {
+  return (state.dispatchRevisions?.[COUNTER_REQ_ID] ?? []).at(-1);
+}
+
+function isPublishedRevision(revision: DispatchRevision): boolean {
+  return Boolean(
+    revision.publishedAt &&
+    revision.publicationCommentId !== undefined,
+  );
+}
+
+function sameDispatchIdentity(left: DispatchRevision, right: DispatchRevision): boolean {
+  return (
+    left.reqId === right.reqId &&
+    left.repoId === right.repoId &&
+    left.revision === right.revision &&
+    left.issueNumber === right.issueNumber &&
+    left.specHash === right.specHash &&
+    left.specPath === right.specPath &&
+    left.sourceMainSha === right.sourceMainSha &&
+    JSON.stringify(left.task) === JSON.stringify(right.task)
+  );
+}
+
+function counterRevisionForBaseline(
+  state: OrchestratorState,
+  baseline: RetryBaselineState,
+  requireGrant: boolean,
+): DispatchRevision | undefined {
+  const revision = latestCounterRevision(state);
+  if (
+    !revision ||
+    !validateDispatchRevision(revision) ||
+    !isPublishedRevision(revision) ||
+    revision.reqId !== baseline.reqId ||
+    revision.issueNumber !== baseline.issueNumber ||
+    revision.specPath !== baseline.specPath ||
+    revision.specHash !== baseline.specHash ||
+    revision.sourceMainSha !== baseline.targetSourceMainSha ||
+    (requireGrant && !revision.grant)
+  ) {
+    return undefined;
+  }
+  return revision;
+}
+
+async function currentCounterSpec(
+  deps: RetryBaselineDeps,
+  reqId: string,
+  specPath: string,
+  targetMainSha: string,
+): Promise<Spec> {
+  const specs = parsedSpecs(await deps.git.readSpecSnapshot(deps.repoDir, targetMainSha));
+  const spec = specs.find((candidate) => candidate.id === reqId && candidate.path === specPath);
+  if (!spec) throw new Error(`当前 main 缺少 ${reqId} 的已确认需求块`);
+  const contractError = trustedContractError(deps.trustedE2eRoot, spec);
+  if (contractError) throw new Error(contractError);
+  return spec;
+}
+
+async function publishCounterRevision(
+  deps: RetryBaselineDeps,
+  issueNumber: number,
+  spec: Spec,
+  targetMainSha: string,
+  repoId: string,
+): Promise<RetryBaselineResult> {
+  let issue: ManagedIssue;
+  try {
+    issue = await readIssue(deps, issueNumber);
+  } catch (error) {
+    return result('blocked', `#${issueNumber} Issue 读取失败，拒绝发布新 rN: ${errorText(error)}`);
+  }
+  if (issue.state !== 'open') {
+    return result('blocked', `#${issueNumber} Issue 已关闭，拒绝发布新 rN`);
+  }
+
+  let prs: ManagedPR[];
+  try {
+    prs = await deps.github.listPRs();
+  } catch (error) {
+    return result(
+      'blocked',
+      `#${issueNumber} 远端 PR 状态读取失败，拒绝把未知当作不存在: ${errorText(error)}`,
+    );
+  }
+  const unknown = prs.find(
+    (pr) =>
+      pr.meta?.reqId === COUNTER_REQ_ID &&
+      pr.state !== 'open' &&
+      pr.state !== 'closed',
+  );
+  if (unknown) {
+    return result(
+      'blocked',
+      `需求 ${COUNTER_REQ_ID} 的 ${prLink(unknown.number)} 状态未知，拒绝发布新 rN`,
+    );
+  }
+  if (!deps.publishDispatchRevision) {
+    return result(
+      'blocked',
+      `#${issueNumber} 执行 SHA 已变化，但 runtime 未接线 scheduler 派工发布入口，未调用 Worker`,
+    );
+  }
+
+  let published: DispatchRevision;
+  try {
+    published = await deps.publishDispatchRevision({
+      reqId: COUNTER_REQ_ID,
+      issueNumber,
+      spec,
+      targetMainSha,
+      repoId,
+    });
+  } catch (error) {
+    return result(
+      'blocked',
+      `#${issueNumber} 新 rN 发布失败，保留既有版本且未调用 Worker: ${errorText(error)}`,
+    );
+  }
+  if (
+    !validateDispatchRevision(published) ||
+    published.reqId !== COUNTER_REQ_ID ||
+    published.issueNumber !== issueNumber ||
+    published.specPath !== spec.path ||
+    published.specHash !== spec.hash ||
+    published.sourceMainSha !== targetMainSha ||
+    published.repoId !== repoId
+  ) {
+    return result(
+      'blocked',
+      `#${issueNumber} 新 rN 发布回执与当前确认规格/SHA 不一致，未更新需求绑定`,
+    );
+  }
+
+  const after = deps.state.snapshot();
+  const persisted = latestCounterRevision(after);
+  if (
+    !persisted ||
+    !sameDispatchIdentity(persisted, published) ||
+    !isPublishedRevision(persisted)
+  ) {
+    return result(
+      'blocked',
+      `#${issueNumber} 新 rN 发布后本地冻结记录回读不一致，未更新需求绑定`,
+    );
+  }
+  try {
+    await deps.state.update((state) => {
+      const current = latestCounterRevision(state);
+      if (
+        !current ||
+        !sameDispatchIdentity(current, persisted) ||
+        !isPublishedRevision(current)
+      ) {
+        throw new Error('发布回读后派工版本已变化');
+      }
+      state.requirements[COUNTER_REQ_ID] = {
+        issueNumber,
+        specHash: current.specHash,
+        specPath: current.specPath,
+        sourceMainSha: current.sourceMainSha,
+      };
+      return undefined;
+    });
+  } catch (error) {
+    return result(
+      'scheduled',
+      `#${issueNumber} 已发布 r${persisted.revision}，但本地需求绑定提交失败，请显式重试恢复: ${errorText(error)}`,
+    );
+  }
+  return result(
+    'scheduled',
+    `#${issueNumber} 已按当前 main 发布 r${persisted.revision} 待排期；请用户添加“可开工/r${persisted.revision}”，未调用 Worker`,
+  );
+}
+
+async function prepareCounterRetry(
+  deps: RetryBaselineDeps,
+  state: OrchestratorState,
+  requirement: RequirementState,
+  oldJob: JobState,
+  issueNumber: number,
+): Promise<{ revision: DispatchRevision; targetMainSha: string } | RetryBaselineResult> {
+  const revisions = state.dispatchRevisions?.[COUNTER_REQ_ID] ?? [];
+  const latest = revisions.at(-1);
+  const priorPublished = [...revisions].reverse().find(isPublishedRevision);
+  if (!latest || !priorPublished || !validateDispatchRevision(latest)) {
+    return result(
+      'blocked',
+      `#${issueNumber} 计数器尚无已发布的冻结派工版本；显式重试不能启动编码`,
+    );
+  }
+  if (
+    latest.reqId !== COUNTER_REQ_ID ||
+    latest.issueNumber !== issueNumber ||
+    latest.repoId !== priorPublished.repoId
+  ) {
+    return result(
+      'blocked',
+      `#${issueNumber} 当前冻结派工版本与 Issue/仓库绑定不一致，拒绝重试`,
+    );
+  }
+
+  let targetMainSha: string;
+  try {
+    targetMainSha = await currentMain(deps);
+  } catch (error) {
+    return result('blocked', `#${issueNumber} 当前 main 读取失败，拒绝重试: ${errorText(error)}`);
+  }
+  let repoId: string;
+  try {
+    repoId = await deps.github.getDispatchRepositoryId();
+  } catch (error) {
+    return result(
+      'blocked',
+      `#${issueNumber} 当前仓库数字 ID 读取失败，拒绝重试: ${errorText(error)}`,
+    );
+  }
+  if (!/^[0-9]+$/.test(repoId) || latest.repoId !== repoId) {
+    return result(
+      'blocked',
+      `#${issueNumber} 当前仓库数字 ID 与冻结派工版本不一致，拒绝重试`,
+    );
+  }
+
+  if (!isPublishedRevision(latest) || latest.sourceMainSha !== targetMainSha) {
+    const progress = await mainProgress(
+      deps.git,
+      deps.repoDir,
+      latest.sourceMainSha,
+      targetMainSha,
+    );
+    if (progress !== 'target') {
+      return result(
+        'blocked',
+        `#${issueNumber} 冻结来源不是当前 main 的祖先（${progress}），拒绝发布新 rN`,
+      );
+    }
+    let spec: Spec;
+    try {
+      spec = await currentCounterSpec(deps, COUNTER_REQ_ID, requirement.specPath, targetMainSha);
+    } catch (error) {
+      return result('blocked', `#${issueNumber} 当前已确认规格读取失败: ${errorText(error)}`);
+    }
+    return publishCounterRevision(deps, issueNumber, spec, targetMainSha, repoId);
+  }
+
+  if (
+    requirement.specPath !== latest.specPath ||
+    requirement.specHash !== latest.specHash ||
+    requirement.sourceMainSha !== latest.sourceMainSha ||
+    oldJob.specHash !== latest.specHash ||
+    oldJob.sourceMainSha !== latest.sourceMainSha ||
+    (oldJob.dispatchRevision !== undefined &&
+      oldJob.dispatchRevision !== latest.revision)
+  ) {
+    return result(
+      'blocked',
+      `#${issueNumber} 最新失败作业与已发布 r${latest.revision} 的冻结依据不一致，拒绝增加 attempt`,
+    );
+  }
+  let currentSpec: Spec;
+  try {
+    currentSpec = await validateLocalSpec(
+      deps,
+      COUNTER_REQ_ID,
+      latest.specPath,
+      latest.specHash,
+      targetMainSha,
+    );
+    const contractError = trustedContractError(deps.trustedE2eRoot, currentSpec);
+    if (contractError) throw new Error(contractError);
+  } catch (error) {
+    return result('blocked', `#${issueNumber} 已发布版本的当前规格核验失败: ${errorText(error)}`);
+  }
+  if (!latest.grant) {
+    return result(
+      'blocked',
+      `#${issueNumber} r${latest.revision} 尚无有效开工授权，显式重试不会增加 attempt`,
+    );
+  }
+  return { revision: structuredClone(latest), targetMainSha };
 }
 
 function parsedSpec(files: Record<string, string>, reqId: string, specPath: string, specHash: string): Spec {
@@ -541,14 +855,21 @@ export function baselineOperationId(
     .slice(0, 24)}`;
 }
 
-function deliveryInput(oldJob: JobState): WorkerInput {
+function deliveryInput(oldJob: JobState, dispatchRevision?: DispatchRevision): WorkerInput {
   return {
     jobId: oldJob.jobId,
     reqId: oldJob.reqId,
     issueNumber: oldJob.issueNumber,
-    spec: { id: oldJob.reqId, title: '', path: '', body: '', hash: oldJob.specHash },
-    sourceMainSha: oldJob.sourceMainSha,
+    spec: {
+      id: oldJob.reqId,
+      title: '',
+      path: dispatchRevision?.specPath ?? '',
+      body: '',
+      hash: dispatchRevision?.specHash ?? oldJob.specHash,
+    },
+    sourceMainSha: dispatchRevision?.sourceMainSha ?? oldJob.sourceMainSha,
     attempt: oldJob.attempt,
+    ...(dispatchRevision ? { dispatchRevision } : {}),
   };
 }
 
@@ -598,6 +919,7 @@ async function deliveryConflict(
   oldJob: JobState,
   issueNumber: number,
   prs: ManagedPR[],
+  dispatchRevision?: DispatchRevision,
 ): Promise<RetryBaselineResult | null> {
   const reqId = oldJob.reqId;
   const unknown = prs.find(
@@ -617,7 +939,7 @@ async function deliveryConflict(
         `本地已关联 ${prLink(oldJob.prNumber)}，但远端读取不到唯一 PR，拒绝把未知当作不存在`,
       );
     }
-    if (!sameRevision(associated[0]!, deliveryInput(oldJob))) {
+    if (!sameRevision(associated[0]!, deliveryInput(oldJob, dispatchRevision))) {
       return result('blocked', `${prLink(oldJob.prNumber)} 的 revision 与旧 Job 不一致，拒绝创建新基线`);
     }
     if (openOrMerged(associated[0]!)) {
@@ -636,7 +958,9 @@ async function deliveryConflict(
     }
   }
 
-  const oldDeliveries = prs.filter((pr) => codeDeliveryMatches(pr, deliveryInput(oldJob)));
+  const oldDeliveries = prs.filter(
+    (pr) => codeDeliveryMatches(pr, deliveryInput(oldJob, dispatchRevision)),
+  );
   if (oldDeliveries.length > 1) {
     return result('blocked', `旧 revision 存在多个活动代码 PR: ${oldDeliveries.map((p) => prLink(p.number)).join(', ')}`);
   }
@@ -715,7 +1039,19 @@ export async function prepareRetryBaseline(
   }
   if (active.length === 1) {
     const pending = active[0]!;
-    if (pending.stage === 'prepared') return resumePreparedBaseline(deps, pending, true);
+    const dispatchRevision = reqId === COUNTER_REQ_ID
+      ? counterRevisionForBaseline(snapshot, pending, true)
+      : undefined;
+    if (reqId === COUNTER_REQ_ID && !dispatchRevision) {
+      return result(
+        'blocked',
+        `#${issueNumber} 未决重试准备缺少当前已发布且带授权的 counter 派工版本，拒绝恢复 Worker`,
+        pending,
+      );
+    }
+    if (pending.stage === 'prepared') {
+      return resumePreparedBaseline(deps, pending, true, dispatchRevision);
+    }
     const bindingError = currentBindingError(pending, requirement);
     if (bindingError) {
       return result('blocked', `未决准备 ${pending.operationId} 与${bindingError}不一致，停止重试`, pending);
@@ -733,7 +1069,7 @@ export async function prepareRetryBaseline(
         return pendingBaselineResult(pending, pendingJob, `#${issueNumber} 新基线 Job 已执行或已结束，不重复派发`);
       }
     } else {
-      return runPreparedJob(deps, pending);
+      return runPreparedJob(deps, pending, dispatchRevision);
     }
   }
   // 当前 revision 的最新实际 attempt 是未完成的失败目标；已发布 Job
@@ -787,10 +1123,18 @@ export async function prepareRetryBaseline(
   }
 
   let targetMainSha: string;
-  try {
-    targetMainSha = await currentMain(deps);
-  } catch (error) {
-    return result('blocked', `#${issueNumber} 当前 main 读取失败，拒绝创建新基线: ${errorText(error)}`);
+  let dispatchRevision: DispatchRevision | undefined;
+  if (reqId === COUNTER_REQ_ID) {
+    const checked = await prepareCounterRetry(deps, snapshot, requirement, oldJob, issueNumber);
+    if ('status' in checked) return checked;
+    targetMainSha = checked.targetMainSha;
+    dispatchRevision = checked.revision;
+  } else {
+    try {
+      targetMainSha = await currentMain(deps);
+    } catch (error) {
+      return result('blocked', `#${issueNumber} 当前 main 读取失败，拒绝创建新基线: ${errorText(error)}`);
+    }
   }
   const sameSha = targetMainSha === oldJob.sourceMainSha;
   const progress = sameSha
@@ -822,6 +1166,7 @@ export async function prepareRetryBaseline(
     spec,
     sourceMainSha: targetMainSha,
     attempt: oldJob.attempt + 1,
+    ...(dispatchRevision ? { dispatchRevision } : {}),
   };
   const targetDeliveries = prs.filter((pr) => codeDeliveryMatches(pr, targetInput));
   if (targetDeliveries.length > 1) {
@@ -834,7 +1179,14 @@ export async function prepareRetryBaseline(
     );
   }
 
-  const conflict = await deliveryConflict(deps, snapshot, oldJob, issueNumber, prs);
+  const conflict = await deliveryConflict(
+    deps,
+    snapshot,
+    oldJob,
+    issueNumber,
+    prs,
+    dispatchRevision,
+  );
   if (conflict) return conflict;
 
   let issue: ManagedIssue;
@@ -880,7 +1232,8 @@ export async function prepareRetryBaseline(
     targetMainSha,
     spec,
     baseline,
-    newJob: expectedNewJob(baseline),
+    newJob: expectedNewJob(baseline, dispatchRevision),
+    dispatchRevision,
   };
 }
 
@@ -891,6 +1244,7 @@ function restoreBase(
   oldJob: JobState,
   spec: Spec,
   issue: ManagedIssue,
+  dispatchRevision?: DispatchRevision,
 ): Preflight {
   return {
     reqId: baseline.reqId,
@@ -902,6 +1256,7 @@ function restoreBase(
     spec,
     baseline,
     newJob,
+    ...(dispatchRevision ? { dispatchRevision } : {}),
   };
 }
 
@@ -910,6 +1265,7 @@ async function restoreIssueAndSpec(
   baseline: RetryBaselineState,
   newJob: JobState,
   oldJob: JobState,
+  dispatchRevision?: DispatchRevision,
 ): Promise<Preflight | RetryBaselineResult> {
   let spec: Spec;
   let issue: ManagedIssue;
@@ -935,7 +1291,15 @@ async function restoreIssueAndSpec(
     specPath: baseline.specPath,
     sourceMainSha: baseline.fromSourceMainSha,
   };
-  return restoreBase(baseline, newJob, requirement, oldJob, spec, issue);
+  return restoreBase(
+    baseline,
+    newJob,
+    requirement,
+    oldJob,
+    spec,
+    issue,
+    dispatchRevision,
+  );
 }
 
 async function restoreReady(
@@ -944,6 +1308,7 @@ async function restoreReady(
   newJob: JobState,
   requirement: RequirementState,
   oldJob: JobState,
+  dispatchRevision?: DispatchRevision,
 ): Promise<Preflight | RetryBaselineResult> {
   if (
     requirement.issueNumber !== baseline.issueNumber ||
@@ -953,7 +1318,13 @@ async function restoreReady(
   ) {
     return result('blocked', messageFor(baseline, 'ready 新基线缺少本地目标绑定，停止自动恢复'), baseline);
   }
-  const restored = await restoreIssueAndSpec(deps, baseline, newJob, oldJob);
+  const restored = await restoreIssueAndSpec(
+    deps,
+    baseline,
+    newJob,
+    oldJob,
+    dispatchRevision,
+  );
   if (!('oldJob' in restored)) return restored;
   const issueMeta = restored.issue.meta ?? extractMeta(restored.issue.body);
   if (
@@ -979,11 +1350,27 @@ async function resumePreparedBaseline(
   deps: RetryBaselineDeps,
   stored: RetryBaselineState,
   explicit: boolean,
+  dispatchRevision?: DispatchRevision,
 ): Promise<RetryBaselineResult> {
   const snapshot = deps.state.snapshot();
   const requirement = snapshot.requirements[stored.reqId];
   const oldJob = snapshot.jobs[stored.fromJobId];
   const newJob = snapshot.jobs[stored.newJobId];
+  const boundDispatchRevision = stored.reqId === COUNTER_REQ_ID
+    ? counterRevisionForBaseline(snapshot, stored, explicit)
+    : dispatchRevision;
+  if (stored.reqId === COUNTER_REQ_ID && !boundDispatchRevision) {
+    return result(
+      'blocked',
+      messageFor(
+        stored,
+        explicit
+          ? '当前 counter 派工版本已发布但无有效授权，拒绝恢复 Worker'
+          : '当前 counter 派工版本与未决准备不一致，停止自动恢复',
+      ),
+      stored,
+    );
+  }
   const bindingError = currentBindingError(stored, requirement);
   if (
     !oldJob ||
@@ -998,7 +1385,13 @@ async function resumePreparedBaseline(
     return result('blocked', messageFor(stored, '准备记录已终止或本地绑定已被取代，停止远端恢复'), stored);
   }
 
-  const restored = await restoreIssueAndSpec(deps, stored, newJob ?? expectedNewJob(stored), oldJob);
+  const restored = await restoreIssueAndSpec(
+    deps,
+    stored,
+    newJob ?? expectedNewJob(stored, boundDispatchRevision),
+    oldJob,
+    boundDispatchRevision,
+  );
   if (!('oldJob' in restored)) return restored;
   const binding: Preflight = { ...restored, requirement };
   const kind = remoteKind(restored.issue, binding);
@@ -1006,7 +1399,8 @@ async function resumePreparedBaseline(
     const ready = await finishReady(deps, {
       ...restored,
       issue: restored.issue,
-      newJob: newJob ?? expectedNewJob(stored),
+      newJob: newJob ?? expectedNewJob(stored, boundDispatchRevision),
+      dispatchRevision: boundDispatchRevision,
     });
     if (!('oldJob' in ready)) return ready;
     let currentSha: string | null = null;
@@ -1030,13 +1424,17 @@ async function resumePreparedBaseline(
       return result('stale', stale.error ?? '重试准备已过期', stale);
     }
     if (!explicit) return result('ready', messageFor(ready.baseline, '远端已确认 target，本地新基线已完成准备'), ready.baseline);
-    return runPreparedJob(deps, ready.baseline);
+    return runPreparedJob(deps, ready.baseline, boundDispatchRevision);
   }
   if (stored.fromSourceMainSha === stored.targetSourceMainSha) {
-    const ready = await finishReady(deps, { ...restored, issue: restored.issue });
+    const ready = await finishReady(deps, {
+      ...restored,
+      issue: restored.issue,
+      dispatchRevision: boundDispatchRevision,
+    });
     if (!('oldJob' in ready)) return ready;
     if (!explicit) return result('ready', messageFor(stored, '同 SHA 原需求元数据即为 target，本地新基线已完成准备'), ready.baseline);
-    return runPreparedJob(deps, ready.baseline);
+    return runPreparedJob(deps, ready.baseline, boundDispatchRevision);
   }
   if (kind !== 'old') {
     return result('pending', messageFor(stored, '# Issue 出现第三种绑定，保留未决准备并停止'), stored);
@@ -1080,6 +1478,7 @@ async function resumePreparedBaseline(
     spec: restored.spec,
     sourceMainSha: stored.targetSourceMainSha,
     attempt: stored.attempt,
+    ...(boundDispatchRevision ? { dispatchRevision: boundDispatchRevision } : {}),
   };
   const remoteConflict = remoteDeliveryPreflight(stored.issueNumber, targetInput, prs);
   if (remoteConflict) return remoteConflict;
@@ -1110,10 +1509,14 @@ async function resumePreparedBaseline(
   }
   const readbackKind = remoteKind(readback, binding);
   if (readbackKind === 'target') {
-    const ready = await finishReady(deps, { ...restored, issue: readback });
+    const ready = await finishReady(deps, {
+      ...restored,
+      issue: readback,
+      dispatchRevision: boundDispatchRevision,
+    });
     if (!('oldJob' in ready)) return ready;
     if (!explicit) return result('ready', messageFor(stored, '远端已确认 target，本地新基线已完成准备'), ready.baseline);
-    return runPreparedJob(deps, ready.baseline);
+    return runPreparedJob(deps, ready.baseline, boundDispatchRevision);
   }
   if (readbackKind === 'old') {
     const warning = updateError
@@ -1130,13 +1533,29 @@ async function finishReady(
   preflight: Preflight,
 ): Promise<Preflight | RetryBaselineResult> {
   deps.hooks?.beforeCommitReady?.(preflight.baseline, deps.state.snapshot());
-  const nextJob = readyJob(preflight.baseline, preflight.newJob);
+  const nextJob = {
+    ...readyJob(preflight.baseline, preflight.newJob),
+    ...(preflight.dispatchRevision
+      ? { dispatchRevision: preflight.dispatchRevision.revision }
+      : {}),
+  };
   try {
     await deps.state.update((s) => {
       const baseline = s.retryBaselines?.[preflight.baseline.operationId];
       const current = s.requirements[preflight.reqId];
       const old = s.jobs[preflight.oldJob.jobId];
       const job = s.jobs[preflight.baseline.newJobId];
+      const latestDispatch = latestCounterRevision(s);
+      const dispatchBindingError =
+        preflight.reqId === COUNTER_REQ_ID &&
+        (!preflight.dispatchRevision ||
+          !latestDispatch ||
+          latestDispatch.revision !== preflight.dispatchRevision.revision ||
+          !isPublishedRevision(latestDispatch) ||
+          !latestDispatch.grant ||
+          latestDispatch.specHash !== baseline?.specHash ||
+          latestDispatch.specPath !== baseline?.specPath ||
+          latestDispatch.sourceMainSha !== baseline?.targetSourceMainSha);
       if (
         !baseline ||
         !current ||
@@ -1148,6 +1567,7 @@ async function finishReady(
         current.sourceMainSha !== baseline.fromSourceMainSha ||
         old.sourceMainSha !== baseline.fromSourceMainSha ||
         old.specHash !== baseline.specHash ||
+        dispatchBindingError ||
         (job !== undefined && !isPreparedJob(job, baseline))
       ) {
         throw new Error('本地准备记录与新 Job 绑定不完整');
@@ -1233,12 +1653,26 @@ async function completeIfAttempted(
   }
 }
 
-async function runPreparedJob(deps: RetryBaselineDeps, stored: RetryBaselineState): Promise<RetryBaselineResult> {
+async function runPreparedJob(
+  deps: RetryBaselineDeps,
+  stored: RetryBaselineState,
+  dispatchRevision?: DispatchRevision,
+): Promise<RetryBaselineResult> {
   const snapshot = deps.state.snapshot();
   const baseline = snapshot.retryBaselines?.[stored.operationId];
   const requirement = snapshot.requirements[stored.reqId];
   const oldJob = snapshot.jobs[stored.fromJobId];
   const newJob = snapshot.jobs[stored.newJobId];
+  const boundDispatchRevision = stored.reqId === COUNTER_REQ_ID
+    ? counterRevisionForBaseline(snapshot, stored, true)
+    : dispatchRevision;
+  if (stored.reqId === COUNTER_REQ_ID && !boundDispatchRevision) {
+    return result(
+      'blocked',
+      messageFor(stored, '当前 counter 派工版本缺少已发布记录或有效授权，未调用 Worker'),
+      baseline ?? stored,
+    );
+  }
   if (!baseline || !requirement || oldJob?.jobId !== stored.fromJobId) {
     return result('blocked', messageFor(stored, '本地基线绑定不完整，停止派发'), stored);
   }
@@ -1269,7 +1703,14 @@ async function runPreparedJob(deps: RetryBaselineDeps, stored: RetryBaselineStat
     return result('stale', stale.error ?? '重试准备已过期', stale);
   }
 
-  const restored = await restoreReady(deps, baseline, newJob, requirement, oldJob);
+  const restored = await restoreReady(
+    deps,
+    baseline,
+    newJob,
+    requirement,
+    oldJob,
+    boundDispatchRevision,
+  );
   if (!('oldJob' in restored)) return restored;
   if (baseline.stage !== 'ready' || !isUnstartedBaselineJob(newJob, baseline)) {
     return pendingBaselineResult(baseline, newJob, '新基线 Job 已开始或结束，沿用统一生命周期恢复');
@@ -1277,6 +1718,13 @@ async function runPreparedJob(deps: RetryBaselineDeps, stored: RetryBaselineStat
   const fixedTarget = currentSha === baseline.targetSourceMainSha;
   if (!fixedTarget && !hasMoved) {
     return result('pending', messageFor(baseline, '执行前 main 无法核验为固定 target，未调用 Worker'), baseline);
+  }
+  if (stored.reqId === COUNTER_REQ_ID && !fixedTarget) {
+    return result(
+      'stale',
+      messageFor(baseline, '执行前 counter main 已变化，未调用 Worker；请重新显式重试发布待排期 rN'),
+      baseline,
+    );
   }
 
   let prs: ManagedPR[];
@@ -1292,6 +1740,7 @@ async function runPreparedJob(deps: RetryBaselineDeps, stored: RetryBaselineStat
     spec: restored.spec,
     sourceMainSha: baseline.targetSourceMainSha,
     attempt: baseline.attempt,
+    ...(boundDispatchRevision ? { dispatchRevision: structuredClone(boundDispatchRevision) } : {}),
   };
   const remoteConflict = remoteDeliveryPreflight(baseline.issueNumber, input, prs);
   if (remoteConflict) return { ...remoteConflict, baseline };
@@ -1312,6 +1761,47 @@ async function runPreparedJob(deps: RetryBaselineDeps, stored: RetryBaselineStat
   }
   if (await deps.github.branchExists(baseline.newJobId)) {
     return result('blocked', messageFor(baseline, '新 Job 的受管分支已存在但无匹配 PR，未调用 Worker'), baseline);
+  }
+  if (stored.reqId === COUNTER_REQ_ID) {
+    let claimedRevision: DispatchRevision | undefined;
+    try {
+      await deps.state.update((s) => {
+        const currentRevision = counterRevisionForBaseline(s, baseline, true);
+        const currentJob = s.jobs[baseline.newJobId];
+        if (
+          !currentRevision ||
+          !boundDispatchRevision ||
+          !sameDispatchIdentity(currentRevision, boundDispatchRevision) ||
+          !currentRevision.grant ||
+          !currentJob ||
+          !isUnstartedBaselineJob(currentJob, baseline)
+        ) {
+          return undefined;
+        }
+        currentJob.status = 'todo';
+        delete currentJob.failureStage;
+        delete currentJob.resumeAction;
+        currentJob.dispatchRevision = currentRevision.revision;
+        currentJob.grantEventId = currentRevision.grant.eventId;
+        currentJob.updatedAt = new Date().toISOString();
+        claimedRevision = structuredClone(currentRevision);
+        return undefined;
+      });
+    } catch (error) {
+      return result(
+        'blocked',
+        messageFor(baseline, `显式重试领取 counter Job 失败，未调用 Worker: ${errorText(error)}`),
+        baseline,
+      );
+    }
+    if (!claimedRevision) {
+      return result(
+        'blocked',
+        messageFor(baseline, '显式重试领取前 counter 版本、授权或 Job 状态已变化，未调用 Worker'),
+        baseline,
+      );
+    }
+    input.dispatchRevision = structuredClone(claimedRevision);
   }
 
   deps.hooks?.beforeWorker?.(input);
@@ -1456,6 +1946,17 @@ async function persistPrepared(deps: RetryBaselineDeps, preflight: RetryBaseline
   await deps.state.update((s) => {
     const requirement = s.requirements[preflight.reqId];
     const oldJob = s.jobs[preflight.oldJob.jobId];
+    const latestDispatch = latestCounterRevision(s);
+    const dispatchBindingError =
+      preflight.reqId === COUNTER_REQ_ID &&
+      (!preflight.dispatchRevision ||
+        !latestDispatch ||
+        latestDispatch.revision !== preflight.dispatchRevision.revision ||
+        !isPublishedRevision(latestDispatch) ||
+        !latestDispatch.grant ||
+        latestDispatch.specHash !== preflight.baseline.specHash ||
+        latestDispatch.specPath !== preflight.baseline.specPath ||
+        latestDispatch.sourceMainSha !== preflight.baseline.targetSourceMainSha);
     if (
       !requirement ||
       !oldJob ||
@@ -1465,6 +1966,7 @@ async function persistPrepared(deps: RetryBaselineDeps, preflight: RetryBaseline
       oldJob.status !== 'failed' ||
       oldJob.sourceMainSha !== preflight.baseline.fromSourceMainSha ||
       oldJob.specHash !== preflight.baseline.specHash ||
+      dispatchBindingError ||
       latestCurrentJob(s, preflight.reqId, preflight.issueNumber, requirement)?.jobId !== oldJob.jobId
     ) {
       throw new Error('持久提交前绑定已变化，拒绝覆盖');
