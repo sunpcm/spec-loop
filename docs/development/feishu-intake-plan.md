@@ -8,7 +8,7 @@
 
 1. 白名单操作者向唯一绑定会话发送 `需求：描述` 或 `/require 描述`。
 2. `spec-author` 只生成 `docs/specs/counter.md` 的候选内容，控制器创建 docs-only PR 并添加 `spec-patch` 标签。
-3. 用户确认合并文档 PR；文档进入 `main` 后自动触发现有编码闭环，产生只修改 `src/**` 的代码 PR。
+3. 用户确认合并文档 PR。计数器需求进入 `main` 后在 GitHub Issue 待排期，由用户标记当前版本“可开工”后再派发编码。版本与重试规则见 [GitHub Issue 排期与派工设计](github-issue-dispatch-design.md)。
 4. 用户确认合并代码 PR 后，现有部署流程构建并切换本地预览。
 
 首版只修改现有 `REQ-CNT-01`，不做普通闲聊、多轮澄清、多轮编辑、新增或删除需求块、写入其他文档或仓库、自动 Merge（受控二次确认入口除外）、Triage 与错误自愈。

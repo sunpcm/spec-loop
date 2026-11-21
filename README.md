@@ -39,8 +39,9 @@ flowchart TD
     A[飞书提交结构化需求] --> B[生成需求文档 PR]
     B --> C[用户审查并确认合并文档 PR]
     C --> D[main 上的需求生效]
-    D --> E[同步 GitHub Issue]
-    E --> F[Pi 编码与控制器检查]
+    D --> E[更新 GitHub Issue，等待排期]
+    E --> S[用户为这版任务添加可开工标签]
+    S --> F[控制器核验许可，派给 Pi 编码并检查]
     F --> G[生成代码 PR]
     G --> H[用户审查并确认合并代码 PR]
     H --> I[本地构建与健康检查]
@@ -56,6 +57,8 @@ flowchart TD
 也可以使用 `/require 描述`。描述长度为 1～2000 字符，首版只更新 `docs/specs/counter.md` 中现有的 `REQ-CNT-01`。文档 PR 与代码 PR 分别由用户审查并显式确认合并；可在 GitHub 网页人工执行，也可在受控飞书入口启用后，由绑定会话中的白名单用户预检并二次确认。模型和控制器不得自主合并。
 
 发送 `状态` 查看请求阶段与 PR 链接；需求请求失败后，使用 `重试需求 <请求ID>` 恢复未完成阶段。代码 Issue 的失败重试使用 `重试 #<Issue编号>`，两者不能混用。命令、权限与恢复说明见 [飞书配置](docs/development/feishu-setup.md)。
+
+计数器的排期在主 Issue 中进行。文档合并后，阅读当前任务和验收项，准备开工时才添加卡片给出的标签，例如 `可开工/r1`。新版会给出新的标签，旧版本的许可不会转移。在领取前可以撤标，让任务继续等待。控制器按 `SPEC_LOOP_DISPATCH_ALLOWED_USER_IDS` 中的 GitHub 数字用户 ID 核对打标人。[配置与验收](docs/development/demo-runbook.md#6-闭环-a飞书业务需求入口)
 
 ## 当前范围与运行方式
 
@@ -123,6 +126,7 @@ npm run demo
 | [飞书配置](docs/development/feishu-setup.md) | 应用权限、绑定会话、需求命令与重试 |
 | [飞书需求入口计划](docs/development/feishu-intake-plan.md) | 入口范围、阶段恢复与验收要求 |
 | [飞书受控确认合并 PR](docs/development/feishu-merge-plan.md) | 用户预检、二次确认、受管 PR 边界与恢复 |
+| [GitHub Issue 排期与派工设计](docs/development/github-issue-dispatch-design.md) | V1 设计稿，包含计数器模板、开工许可、Agent 交接与需求改版规则 |
 | [Vercel 静态前端](docs/development/vercel-setup.md) | 静态站配置与云端发布边界 |
 | [本机只读流程面板](docs/development/local-panel.md) | React Flow 流程视图、请求与交付证据、合成演示边界 |
 | [需求与验收](docs/development/requirements.md) | 编排系统的需求与验收设计，含后置范围 |

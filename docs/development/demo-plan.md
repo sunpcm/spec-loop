@@ -64,7 +64,7 @@
 ```text
 ✅ 已收到需求消息，候选请求ID：a1b2c3d4e5f6；检查通过后受理
 📄 文档 PR #20 等待人工 Merge：https://github.com/sunpcm/spec-loop/pull/20
-人工 Merge 文档 PR 后自动编码，代码 PR 仍需人工 Merge
+合并文档 PR 后在 GitHub Issue 待排期，添加本版“可开工”标签后开始编码，代码 PR 由你审查合并
 🔎 代码 PR #21 等待人工 Merge：https://github.com/sunpcm/spec-loop/pull/21
 🚀 代码 PR 已 Merge，部署回执：<commit SHA>
 ❌ 需求 a1b2c3d4e5f6 在 create-pr 阶段失败，可发送“重试需求 a1b2c3d4e5f6”

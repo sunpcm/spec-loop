@@ -18,6 +18,7 @@ import {
   resumeRetryBaselines,
   retryWithBaseline,
   syncRetryBaselinePrepared,
+  type PublishDispatchRevisionInput,
   type RetryBaselineHooks,
 } from '../orchestrator/retry-baseline.ts';
 import { reconcileOnce } from '../orchestrator/scheduler.ts';
@@ -25,6 +26,7 @@ import { parseSpecs } from '../orchestrator/specs.ts';
 import { StateStore, normalizeRetryBaselineLinks } from '../orchestrator/state.ts';
 import {
   emptyState,
+  type DispatchRevision,
   type ManagedIssue,
   type ManagedPR,
   type OrchestratorState,
@@ -35,13 +37,14 @@ import { loadConfig, type Config } from '../orchestrator/config.ts';
 import type { WorkerDeps, WorkerInput, WorkerOutcome } from '../orchestrator/worker.ts';
 
 const execFileAsync = promisify(execFile);
-const REQ_ID = 'REQ-CNT-01';
+const REQ_ID = 'REQ-COMPAT-01';
+const COUNTER_REQ_ID = 'REQ-CNT-01';
 const SPEC_PATH = 'docs/specs/counter.md';
 const logger: Logger = { info() {}, warn() {}, error() {}, debug() {} };
 const sourceController = new URL('../', import.meta.url).pathname;
 
-function doc(text = '计数器初始需求'): string {
-  return `### [${REQ_ID}] 计数器\n\n${text}\n`;
+function doc(text = '计数器初始需求', reqId = REQ_ID): string {
+  return `### [${reqId}] 计数器\n\n${text}\n`;
 }
 
 function specOf(text: string): Spec {
@@ -74,6 +77,8 @@ class FakeGithub {
   loseFirstIssueResponse = false;
   failIssueRead = false;
   failPRRead = false;
+  failRepoIdRead = false;
+  repoId = '9001';
   restoreOldIssueAfterUpdate = false;
   nextPRNumber = 42;
 
@@ -141,6 +146,10 @@ class FakeGithub {
     if (args[0] === 'pr' && args[1] === 'close') return { stdout: '', stderr: '', code: 0 };
     if (args[0] !== 'api') return { stdout: '', stderr: '', code: 0 };
     const path = args.find((arg) => arg.startsWith('repos/')) ?? '';
+    if (path === 'repos/owner/repo') {
+      if (this.failRepoIdRead) return { stdout: '', stderr: '模拟仓库 ID 读取失败', code: 1 };
+      return { stdout: JSON.stringify({ id: Number(this.repoId) }), stderr: '', code: 0 };
+    }
     if (/\/issues\/\d+\/comments\?/.test(path)) {
       return { stdout: JSON.stringify([[]]), stderr: '', code: 0 };
     }
@@ -183,6 +192,7 @@ interface BaselineFixture {
   repo: string;
   stateFile: string;
   trustedE2eRoot: string;
+  reqId: string;
   store: StateStore;
   oldSha: string;
   newSha: string;
@@ -197,7 +207,14 @@ interface BaselineFixture {
   dispose: () => void;
 }
 
-async function createFixture(options: { sameSha?: boolean; changedSpec?: boolean; noContract?: boolean } = {}): Promise<BaselineFixture> {
+async function createFixture(options: {
+  sameSha?: boolean;
+  changedSpec?: boolean;
+  noContract?: boolean;
+  reqId?: string;
+  counterRevision?: 'published-granted' | 'published' | 'unpublished';
+} = {}): Promise<BaselineFixture> {
+  const reqId = options.reqId ?? REQ_ID;
   const root = mkdtempSync(join(tmpdir(), 'spec-loop-retry-baseline-'));
   const repo = join(root, 'repo');
   const trustedE2eRoot = join(root, 'trusted-controller');
@@ -206,7 +223,7 @@ async function createFixture(options: { sameSha?: boolean; changedSpec?: boolean
   await git(root, ['init', '-q', repo]);
   await git(repo, ['checkout', '-q', '-b', 'main']);
   await git(repo, ['remote', 'add', 'origin', join(root, 'remote.git')]);
-  const initial = doc();
+  const initial = doc('计数器初始需求', reqId);
   writeFileSync(join(repo, SPEC_PATH), initial);
   await git(repo, ['add', SPEC_PATH]);
   await git(repo, ['commit', '-qm', 'initial docs']);
@@ -216,9 +233,9 @@ async function createFixture(options: { sameSha?: boolean; changedSpec?: boolean
   mkdirSync(join(trustedE2eRoot, 'tests', 'e2e', 'contracts'), { recursive: true });
   const oldSpec = specOf(initial);
   const contractPath = join(trustedE2eRoot, 'tests', 'e2e', 'contracts', 'counter.json');
-  if (!options.noContract) {
+  if (!options.noContract && reqId === COUNTER_REQ_ID) {
     writeFileSync(contractPath, JSON.stringify({
-      reqId: REQ_ID,
+      reqId,
       specPath: SPEC_PATH,
       specHash: oldSpec.hash,
       caseIds: ['E2E-CNT-001'],
@@ -228,7 +245,7 @@ async function createFixture(options: { sameSha?: boolean; changedSpec?: boolean
   let newSha = oldSha;
   if (!options.sameSha) {
     if (!options.changedSpec) writeFileSync(join(repo, 'README.md'), 'controller merge\n');
-    else writeFileSync(join(repo, SPEC_PATH), doc('新版本'));
+    else writeFileSync(join(repo, SPEC_PATH), doc('新版本', reqId));
     await git(repo, ['add', '.']);
     await git(repo, ['commit', '-qm', 'new main']);
     newSha = await git(repo, ['rev-parse', 'HEAD']);
@@ -248,13 +265,13 @@ async function createFixture(options: { sameSha?: boolean; changedSpec?: boolean
     schema: 1,
     system: 'spec-loop',
     kind: 'requirement',
-    reqId: REQ_ID,
+    reqId,
     specPath: SPEC_PATH,
     specHash: spec.hash,
     sourceMainSha: oldSha,
     operationKey: `${spec.hash}:${oldSha}:requirement`,
   };
-  const github = new FakeGithub(`${doc()}\n\n${encodeMetaBlock(issueMeta)}`);
+  const github = new FakeGithub(`${doc('计数器初始需求', reqId)}\n\n${encodeMetaBlock(issueMeta)}`);
   github.issue.meta = issueMeta;
   const stateFile = join(repo, '.orchestrator-state.json');
   const state: OrchestratorState = {
@@ -262,12 +279,12 @@ async function createFixture(options: { sameSha?: boolean; changedSpec?: boolean
     repo: 'owner/repo',
     cursorMainSha: oldSha,
     requirements: {
-      [REQ_ID]: { issueNumber: 12, specPath: SPEC_PATH, specHash: spec.hash, sourceMainSha: oldSha },
+      [reqId]: { issueNumber: 12, specPath: SPEC_PATH, specHash: spec.hash, sourceMainSha: oldSha },
     },
     jobs: {
       oldJob: {
         jobId: 'oldJob',
-        reqId: REQ_ID,
+        reqId,
         issueNumber: 12,
         specHash: spec.hash,
         sourceMainSha: oldSha,
@@ -279,6 +296,41 @@ async function createFixture(options: { sameSha?: boolean; changedSpec?: boolean
         updatedAt: '2026-11-15T00:00:00Z',
       },
     },
+    dispatchRevisions: options.counterRevision
+      ? {
+          [reqId]: [{
+            reqId,
+            repoId: '9001',
+            revision: 1,
+            issueNumber: 12,
+            specHash: spec.hash,
+            specPath: SPEC_PATH,
+            sourceMainSha: oldSha,
+            task: {
+              goal: '实现计数器需求',
+              steps: [{ text: '完成计数器实现', acceptanceRefs: ['A1'] }],
+              acceptance: { A1: '计数器可用' },
+              allowedPaths: ['src/**'],
+              dependsOn: [],
+            },
+            ...(options.counterRevision === 'unpublished'
+              ? {}
+              : {
+                  publishedAt: '2026-11-20T00:00:00.000Z',
+                  publicationCommentId: 7001,
+                }),
+            ...(options.counterRevision === 'published-granted'
+              ? {
+                  grant: {
+                    eventId: 8101,
+                    actorId: '4242',
+                    grantedAt: '2026-11-20T00:01:00.000Z',
+                  },
+                }
+              : {}),
+          }],
+        }
+      : {},
   };
   // 按生产顺序先加载状态，再通过 StateStore 的真实持久化路径初始化夹具。
   const store = new StateStore(stateFile);
@@ -289,6 +341,7 @@ async function createFixture(options: { sameSha?: boolean; changedSpec?: boolean
     repo,
     stateFile,
     trustedE2eRoot,
+    reqId,
     store,
     oldSha,
     newSha,
@@ -316,7 +369,11 @@ async function pushMain(repo: string): Promise<void> {
   await pushBranch(repo, 'main');
 }
 
-function baselineDeps(fx: BaselineFixture, hooks?: RetryBaselineHooks) {
+function baselineDeps(
+  fx: BaselineFixture,
+  hooks?: RetryBaselineHooks,
+  options: Pick<RetryBaselineDeps, 'publishDispatchRevision'> = {},
+) {
   const github = new GithubClient('owner/repo', fx.github.runner);
   let deployCalls = 0;
   return {
@@ -336,6 +393,7 @@ function baselineDeps(fx: BaselineFixture, hooks?: RetryBaselineHooks) {
       },
       mainBranch: 'main',
       hooks,
+      publishDispatchRevision: options.publishDispatchRevision,
     },
     github,
     deployCalls: () => deployCalls,
@@ -524,6 +582,69 @@ function coreOutcomeQueue(
     fx.workerCalls.push(structuredClone(input));
     fx.workerOutcomes.push(structuredClone(outcome));
     return outcome;
+  };
+}
+
+function counterPublisher(fx: BaselineFixture): {
+  publishDispatchRevision: NonNullable<RetryBaselineDeps['publishDispatchRevision']>;
+  calls: PublishDispatchRevisionInput[];
+} {
+  const calls: PublishDispatchRevisionInput[] = [];
+  return {
+    calls,
+    publishDispatchRevision: async (input) => {
+      calls.push(structuredClone(input));
+      let published: DispatchRevision | undefined;
+      await fx.store.update((state) => {
+        const revisions = state.dispatchRevisions?.[input.reqId] ?? [];
+        const existing = revisions.find(
+          (revision) =>
+            revision.specHash === input.spec.hash &&
+            revision.sourceMainSha === input.targetMainSha &&
+            revision.publishedAt === undefined,
+        );
+        if (existing) {
+          existing.publishedAt = '2026-11-21T01:00:00.000Z';
+          existing.publicationCommentId = 9000 + existing.revision;
+          const frozen = structuredClone(existing);
+          delete frozen.publishedAt;
+          delete frozen.publicationCommentId;
+          published = frozen;
+          return undefined;
+        }
+        const revision = Math.max(0, ...revisions.map((candidate) => candidate.revision)) + 1;
+        const created: DispatchRevision = {
+          reqId: input.reqId,
+          repoId: input.repoId,
+          revision,
+          issueNumber: input.issueNumber,
+          specHash: input.spec.hash,
+          specPath: input.spec.path,
+          sourceMainSha: input.targetMainSha,
+          task: {
+            goal: '按当前已确认规格重新排期',
+            steps: [{ text: '完成当前需求', acceptanceRefs: ['A1'] }],
+            acceptance: { A1: '当前需求验收通过' },
+            allowedPaths: ['src/**'],
+            dependsOn: [],
+          },
+          publishedAt: '2026-11-21T01:00:00.000Z',
+          publicationCommentId: 9000 + revision,
+        };
+        state.dispatchRevisions ??= {};
+        state.dispatchRevisions[input.reqId] = [...revisions, created];
+        for (const prior of state.dispatchRevisions[input.reqId]!) {
+          if (prior.revision !== revision && prior.grant) delete prior.grant;
+        }
+        const frozen = structuredClone(created);
+        delete frozen.publishedAt;
+        delete frozen.publicationCommentId;
+        published = frozen;
+        return undefined;
+      });
+      if (!published) throw new Error('测试发布器未生成冻结版本');
+      return published;
+    },
   };
 }
 
@@ -1046,7 +1167,11 @@ test('生产 commands.retry 共享 createCore 的可信资产依赖，旧高 att
 });
 
 test('生产命令入口共享可信根；恢复窗口可重载且不自动派发', async () => {
-  const fx = await createFixture();
+  const fx = await createFixture({
+    sameSha: true,
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published-granted',
+  });
   try {
     useProductionCommands(fx);
     const core = fx.core!;
@@ -1135,7 +1260,11 @@ test('ready 后执行前 main 前进：不调用 Worker、不改部署', async (
 });
 
 test('可信契约来自控制器资产而非候选规格；缺失/不匹配 fail closed', async () => {
-  const fx = await createFixture({ noContract: true });
+  const fx = await createFixture({
+    noContract: true,
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published',
+  });
   try {
     const { deps } = baselineDeps(fx);
     const noContract = await retryWithBaseline(deps, 12);
@@ -1143,7 +1272,7 @@ test('可信契约来自控制器资产而非候选规格；缺失/不匹配 fai
     assert.equal(fx.workerCalls.length, 0);
     mkdirSync(join(fx.trustedE2eRoot, 'tests', 'e2e', 'contracts'), { recursive: true });
     writeFileSync(join(fx.trustedE2eRoot, 'tests', 'e2e', 'contracts', 'counter.json'), JSON.stringify({
-      reqId: REQ_ID,
+      reqId: COUNTER_REQ_ID,
       specPath: SPEC_PATH,
       specHash: specOf(doc('不属于该候选'))!.hash,
       caseIds: ['E2E-CNT-001'],
@@ -1232,5 +1361,167 @@ test('非祖先、规格改动、satisfied 与部署恢复不建立代码重试'
     assert.deepEqual(deployFx.workerCalls, []);
   } finally {
     deployFx.dispose();
+  }
+});
+
+test('counter 已发布版本在 main 前进后只发布新 rN 待排期，不创建基线或调用 Worker', async () => {
+  const fx = await createFixture({
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published',
+  });
+  try {
+    const publisher = counterPublisher(fx);
+    const { deps } = baselineDeps(fx, undefined, publisher);
+    const result = await retryWithBaseline(deps, 12);
+    assert.match(result, /已按当前 main 发布 r2 待排期/);
+    assert.match(result, /可开工\/r2/);
+    assert.equal(publisher.calls.length, 1);
+    assert.equal(publisher.calls[0]!.reqId, COUNTER_REQ_ID);
+    assert.equal(publisher.calls[0]!.targetMainSha, fx.newSha);
+    assert.equal(publisher.calls[0]!.repoId, '9001');
+    assert.equal(fx.workerCalls.length, 0);
+    const state = fx.store.snapshot();
+    const revisions = state.dispatchRevisions?.[COUNTER_REQ_ID] ?? [];
+    assert.equal(revisions.length, 2);
+    assert.equal(revisions[1]!.revision, 2);
+    assert.equal(revisions[1]!.sourceMainSha, fx.newSha);
+    assert.equal(revisions[1]!.grant, undefined);
+    assert.equal(state.requirements[COUNTER_REQ_ID]?.sourceMainSha, fx.newSha);
+    assert.deepEqual(state.retryBaselines ?? {}, {});
+    assert.deepEqual(Object.keys(state.jobs), ['oldJob']);
+  } finally {
+    fx.dispose();
+  }
+});
+
+test('counter 同 SHA 带当前授权可经正常命令入口重试，并携带完整冻结版本', async () => {
+  const fx = await createFixture({
+    sameSha: true,
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published-granted',
+  });
+  try {
+    useRealCore(fx, coreOutcomeQueue(fx, [{ status: 'published', prNumber: 42 }]));
+    const originalJob = structuredClone(fx.store.snapshot().jobs.oldJob);
+    const result = await fx.core!.commands.retry(12);
+    assert.match(result, /已在新 main 基线上重新进入 review/);
+    assert.equal(fx.workerCalls.length, 1);
+    assert.equal(fx.workerCalls[0]!.dispatchRevision?.revision, 1);
+    assert.equal(fx.workerCalls[0]!.dispatchRevision?.grant?.eventId, 8101);
+    assert.equal(fx.workerCalls[0]!.dispatchRevision?.task.allowedPaths[0], 'src/**');
+    const state = fx.store.snapshot();
+    const baseline = Object.values(state.retryBaselines ?? {})[0]!;
+    assert.equal(state.jobs[baseline.newJobId]?.dispatchRevision, 1);
+    assert.equal(state.jobs[baseline.newJobId]?.grantEventId, 8101);
+    assert.deepEqual(state.jobs.oldJob, originalJob);
+  } finally {
+    fx.dispose();
+  }
+});
+
+test('counter 同 SHA 无已观察授权拒绝增加 attempt', async () => {
+  const fx = await createFixture({
+    sameSha: true,
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published',
+  });
+  try {
+    const { deps } = baselineDeps(fx);
+    const result = await retryWithBaseline(deps, 12);
+    assert.match(result, /尚无有效开工授权/);
+    assert.equal(fx.workerCalls.length, 0);
+    assert.deepEqual(fx.store.snapshot().retryBaselines ?? {}, {});
+  } finally {
+    fx.dispose();
+  }
+});
+
+test('counter 显式重试按当前数字仓库 ID 核对冻结版本，读取失败或漂移均 fail closed', async () => {
+  const drifted = await createFixture({
+    sameSha: true,
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published-granted',
+  });
+  try {
+    drifted.github.repoId = '9002';
+    const { deps } = baselineDeps(drifted);
+    const result = await retryWithBaseline(deps, 12);
+    assert.match(result, /当前仓库数字 ID 与冻结派工版本不一致/);
+    assert.equal(drifted.workerCalls.length, 0);
+    assert.deepEqual(drifted.store.snapshot().retryBaselines ?? {}, {});
+  } finally {
+    drifted.dispose();
+  }
+
+  const unknown = await createFixture({
+    sameSha: true,
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published-granted',
+  });
+  try {
+    unknown.github.failRepoIdRead = true;
+    const { deps } = baselineDeps(unknown);
+    const result = await retryWithBaseline(deps, 12);
+    assert.match(result, /当前仓库数字 ID 读取失败/);
+    assert.equal(unknown.workerCalls.length, 0);
+    assert.deepEqual(unknown.store.snapshot().retryBaselines ?? {}, {});
+  } finally {
+    unknown.dispose();
+  }
+});
+
+test('counter 无冻结版本或发布回调缺失时 fail closed，不借命令启动 Worker', async () => {
+  const unversioned = await createFixture({ reqId: COUNTER_REQ_ID });
+  try {
+    const { deps } = baselineDeps(unversioned);
+    const result = await retryWithBaseline(deps, 12);
+    assert.match(result, /尚无已发布的冻结派工版本/);
+    assert.equal(unversioned.workerCalls.length, 0);
+  } finally {
+    unversioned.dispose();
+  }
+
+  const changed = await createFixture({
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published',
+  });
+  try {
+    const { deps } = baselineDeps(changed);
+    const result = await retryWithBaseline(deps, 12);
+    assert.match(result, /未接线 scheduler 派工发布入口/);
+    assert.equal(changed.workerCalls.length, 0);
+    const state = changed.store.snapshot();
+    assert.equal(state.requirements[COUNTER_REQ_ID]?.sourceMainSha, changed.oldSha);
+    assert.equal(state.dispatchRevisions?.[COUNTER_REQ_ID]?.length, 1);
+    assert.deepEqual(state.retryBaselines ?? {}, {});
+  } finally {
+    changed.dispose();
+  }
+});
+
+test('counter 重启恢复只完成 prepared→ready，不自动调用 Worker', async () => {
+  const fx = await createFixture({
+    sameSha: true,
+    reqId: COUNTER_REQ_ID,
+    counterRevision: 'published-granted',
+  });
+  try {
+    const { deps } = baselineDeps(fx);
+    const prepared = await prepareRetryBaseline(deps, 12);
+    assert.ok('oldJob' in prepared);
+    await persistRetryBaselinePrepared(deps, prepared);
+    await resumeRetryBaselines(deps);
+    assert.equal(fx.workerCalls.length, 0);
+    const state = fx.store.snapshot();
+    assert.equal(
+      state.retryBaselines?.[prepared.baseline.operationId]?.stage,
+      'ready',
+    );
+    assert.equal(
+      state.jobs[prepared.baseline.newJobId]?.dispatchRevision,
+      1,
+    );
+  } finally {
+    fx.dispose();
   }
 });

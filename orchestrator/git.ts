@@ -74,6 +74,11 @@ export class GitClient {
     return files;
   }
 
+  /** 读取某个 ref 下单个文件的完整内容；文件缺失或读取失败时直接抛出。 */
+  async showFile(cwd: string, ref: string, path: string): Promise<string> {
+    return this.raw(['show', `${ref}:${path}`], cwd);
+  }
+
   async createWorktree(cwd: string, dir: string, base: string, branch: string): Promise<void> {
     await this.raw(['worktree', 'add', '-b', branch, dir, base], cwd);
   }
@@ -157,5 +162,26 @@ export class GitClient {
   async stagedMode(cwd: string, path: string): Promise<string> {
     const out = await this.raw(['ls-files', '--stage', '--', path], cwd);
     return out.trim().split(/\s+/, 1)[0] ?? '';
+  }
+
+  /** 从 from 到 to（不含 from、含 to）沿第一父链的提交列表，旧到新。 */
+  async firstParentCommits(cwd: string, from: string, to: string): Promise<string[]> {
+    const out = await this.raw(['rev-list', '--first-parent', '--reverse', `${from}..${to}`], cwd);
+    return out.split('\n').map((line) => line.trim()).filter(Boolean);
+  }
+
+  /** 该提交相对第一父（合并提交也只对比第一父）改动的文件路径。 */
+  async changedPathsFirstParent(cwd: string, sha: string): Promise<string[]> {
+    const out = await this.raw(['show', '--first-parent', '--name-only', '--format=', sha], cwd);
+    return out.split('\n').map((line) => line.trim()).filter(Boolean);
+  }
+
+  /**
+   * 判断 ancestor 是否为 descendant 的祖先。git 无法判定或出错时返回 false（fail closed），
+   * 调用方据此拒绝继续领取，而不是把未知历史当作满足条件。
+   */
+  async isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
+    const res = await this.runner(['merge-base', '--is-ancestor', ancestor, descendant], cwd);
+    return res.code === 0;
   }
 }

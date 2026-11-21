@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import type { DispatchLabelEvent } from './dispatch-grant.ts';
 import type { ManagedIssue, ManagedMeta, ManagedPR } from './types.ts';
 
 const execFileAsync = promisify(execFile);
@@ -91,9 +92,24 @@ interface GhIssue {
   title: string;
   body?: string;
   state: 'open' | 'closed';
-  labels?: Array<{ name: string }>;
+  labels?: Array<{ name?: string }>;
   html_url?: string;
   pull_request?: unknown;
+}
+
+interface GhDispatchLabelEvent {
+  id?: unknown;
+  event?: unknown;
+  actor?: { id?: unknown } | null;
+  label?: { name?: unknown } | null;
+  created_at?: unknown;
+}
+
+interface GhComment {
+  id?: unknown;
+  body?: unknown;
+  user?: { id?: unknown } | null;
+  created_at?: unknown;
 }
 
 interface GhPr {
@@ -138,7 +154,10 @@ export class GithubClient {
     const raw = await this.gh(['api', '--paginate', '--slurp', path]);
     const pages = JSON.parse(raw) as unknown;
     if (!Array.isArray(pages)) throw new Error('gh api --slurp 输出不是页数组');
-    return JSON.stringify(pages.flat());
+    if (pages.length > 0 && pages.some((page) => Array.isArray(page)) && !pages.every((page) => Array.isArray(page))) {
+      throw new Error('gh api --slurp 输出包含非数组页，拒绝使用不完整分页');
+    }
+    return JSON.stringify(pages.every((page) => Array.isArray(page)) ? pages.flat() : pages);
   }
 
   async listIssues(): Promise<ManagedIssue[]> {
@@ -147,13 +166,7 @@ export class GithubClient {
     return parsed
       .filter((i) => !i.pull_request)
       .map((i) => ({
-        number: i.number,
-        title: i.title,
-        body: i.body ?? '',
-        state: i.state,
-        labels: (i.labels ?? []).map((l) => l.name),
-        meta: extractMeta(i.body ?? ''),
-        url: i.html_url,
+        ...toManagedIssue(i),
       }));
   }
 
@@ -250,6 +263,182 @@ export class GithubClient {
     return parsed.map((c) => ({ id: c.id, body: c.body ?? '' }));
   }
 
+  /** 读取受管仓库的稳定数字 ID，用于把开工许可绑定到具体仓库。 */
+  async getDispatchRepositoryId(): Promise<string> {
+    const raw = await this.gh(['api', `repos/${this.repo}`]);
+    let parsed: { id?: unknown };
+    try {
+      parsed = JSON.parse(raw) as { id?: unknown };
+    } catch {
+      throw new Error('读取仓库 ID 返回非法 JSON');
+    }
+    const id = githubId(parsed.id);
+    if (!id) throw new Error('仓库响应缺少有效数字 ID');
+    return id;
+  }
+
+  /** 读取单张受管 Issue；PR 即使共享 issues 路径也必须明确拒绝。 */
+  async getDispatchIssue(number: number): Promise<ManagedIssue> {
+    assertIssueNumber(number);
+    const raw = await this.gh(['api', `repos/${this.repo}/issues/${number}`]);
+    let parsed: GhIssue;
+    try {
+      parsed = JSON.parse(raw) as GhIssue;
+    } catch {
+      throw new Error(`读取 Issue #${number} 返回非法 JSON`);
+    }
+    if (!parsed || typeof parsed !== 'object') throw new Error(`Issue #${number} 响应不是对象`);
+    if (parsed.pull_request !== undefined) throw new Error(`#${number} 是 PR，不是受管 Issue`);
+    if (parsed.number !== number) throw new Error(`Issue 响应编号与 #${number} 不一致`);
+    if (parsed.state !== 'open' && parsed.state !== 'closed') {
+      throw new Error(`Issue #${number} 响应缺少有效状态`);
+    }
+    return toManagedIssue(parsed);
+  }
+
+  /** 读取完整分页的标签事件；任何标签事件字段残缺都 fail closed。 */
+  async listDispatchLabelEvents(number: number): Promise<DispatchLabelEvent[]> {
+    assertIssueNumber(number);
+    const raw = await this.ghApiPaginate(`repos/${this.repo}/issues/${number}/events?per_page=100`);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`读取 Issue #${number} 事件返回非法 JSON`);
+    }
+    if (!Array.isArray(parsed)) throw new Error(`Issue #${number} 事件响应不是数组`);
+
+    const result: DispatchLabelEvent[] = [];
+    for (const item of parsed as GhDispatchLabelEvent[]) {
+      if (!item || typeof item !== 'object') {
+        throw new Error(`Issue #${number} 事件包含非对象记录`);
+      }
+      if (typeof item.event !== 'string') {
+        throw new Error(`Issue #${number} 事件缺少有效类型`);
+      }
+      if (item.event !== 'labeled' && item.event !== 'unlabeled') continue;
+
+      const id = positiveSafeInteger(item.id);
+      const name = item.label?.name;
+      const createdAt = item.created_at;
+      if (!id || typeof name !== 'string' || name.length === 0) {
+        throw new Error(`Issue #${number} 标签事件字段残缺`);
+      }
+      if (typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))) {
+        throw new Error(`Issue #${number} 标签事件时间无效`);
+      }
+
+      const actorId = item.actor === null
+        ? null
+        : githubId(item.actor?.id);
+      if (item.actor !== null && item.actor !== undefined && actorId === null) {
+        throw new Error(`Issue #${number} 标签事件操作者 ID 无效`);
+      }
+      result.push({
+        id,
+        actorId,
+        name,
+        event: item.event,
+        createdAt,
+      });
+    }
+    return result;
+  }
+
+  /** 只确保全仓共享的标签定义存在，不改写既有定义，也不向任何 Issue 添加标签。 */
+  async ensureDispatchLabel(label: string): Promise<void> {
+    const normalized = label.trim();
+    if (!normalized || normalized !== label || /[\r\n]/.test(label)) {
+      throw new Error('开工标签名必须是非空单行精确文本');
+    }
+
+    const path = `repos/${this.repo}/labels/${encodeURIComponent(label)}`;
+    const readDefinition = async (): Promise<'exists' | 'missing'> => {
+      const result = await this.runner(['api', path]);
+      if (result.code !== 0) {
+        if (/\bHTTP 404\b/i.test(result.stderr)) return 'missing';
+        throw new Error(`读取开工标签定义失败: ${result.stderr.trim() || `退出码 ${result.code}`}`);
+      }
+      let parsed: { name?: unknown };
+      try {
+        parsed = JSON.parse(result.stdout) as { name?: unknown };
+      } catch {
+        throw new Error('读取开工标签定义返回非法 JSON');
+      }
+      if (parsed.name !== label) throw new Error('开工标签定义回读名称不精确匹配');
+      return 'exists';
+    };
+
+    if (await readDefinition() === 'exists') return;
+
+    const createResult = await this.runner(['label', 'create', label, '--repo', this.repo]);
+    if (createResult.code === 0) return;
+
+    if (await readDefinition() === 'exists') return;
+    const detail = createResult.stderr.trim() || `退出码 ${createResult.code}`;
+    throw new Error(`创建开工标签定义失败: ${detail}`);
+  }
+
+  /**
+   * 用当前 gh 认证身份写入唯一 marker 评论。
+   *
+   * marker 必须独占 body 中的一行。已有可信评论只认当前认证用户，且正文必须与
+   * 本次冻结预期完全一致；重复可信评论、同 marker 不同依据、未知作者或创建结果
+   * 不明且无法唯一恢复时均拒绝继续。
+   */
+  async ensureDispatchComment(
+    number: number,
+    marker: string,
+    body: string,
+  ): Promise<{ id: number; createdAt: string }> {
+    assertIssueNumber(number);
+    if (!marker || marker !== marker.trim() || /[\r\n]/.test(marker)) {
+      throw new Error('评论 marker 必须是非空单行精确文本');
+    }
+    if (!bodyHasExactMarker(body, marker)) {
+      throw new Error('评论正文必须包含独占一行的精确 marker');
+    }
+
+    const controllerId = await this.dispatchControllerId();
+    const path = `repos/${this.repo}/issues/${number}/comments`;
+    const existing = selectTrustedDispatchComment(
+      await this.listDispatchCommentRecords(number),
+      marker,
+      body,
+      controllerId,
+    );
+    if (existing) return existing;
+
+    let createResult: GhResult;
+    try {
+      createResult = await this.runner(
+        ['api', '--method', 'POST', path, '--input', '-'],
+        { input: JSON.stringify({ body }) },
+      );
+    } catch {
+      createResult = { stdout: '', stderr: '', code: 1 };
+    }
+
+    if (createResult.code === 0) {
+      const created = parseDispatchComment(createResult.stdout, controllerId, marker, body);
+      if (created) return created;
+    }
+
+    const recovered = selectTrustedDispatchComment(
+      await this.listDispatchCommentRecords(number),
+      marker,
+      body,
+      controllerId,
+    );
+    if (recovered) return recovered;
+
+    if (createResult.code !== 0) {
+      const detail = createResult.stderr.trim() || `退出码 ${createResult.code}`;
+      throw new Error(`创建派工评论失败且未恢复: ${detail}`);
+    }
+    throw new Error('创建派工评论结果不明，回读后未找到唯一可信评论');
+  }
+
   async closePR(number: number): Promise<void> {
     await this.gh(['pr', 'close', String(number), '--repo', this.repo]);
   }
@@ -296,6 +485,139 @@ export class GithubClient {
     }
     return sha;
   }
+
+  private async dispatchControllerId(): Promise<string> {
+    const raw = await this.gh(['api', 'user']);
+    let parsed: { id?: unknown };
+    try {
+      parsed = JSON.parse(raw) as { id?: unknown };
+    } catch {
+      throw new Error('读取 gh 认证身份返回非法 JSON');
+    }
+    const id = githubId(parsed.id);
+    if (!id) throw new Error('无法确认 gh 认证用户的数字 ID');
+    return id;
+  }
+
+  private async listDispatchCommentRecords(number: number): Promise<Array<{
+    id: number;
+    body: string;
+    userId: string | null;
+    createdAt: string;
+  }>> {
+    const raw = await this.ghApiPaginate(`repos/${this.repo}/issues/${number}/comments?per_page=100`);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`读取 Issue #${number} 评论返回非法 JSON`);
+    }
+    if (!Array.isArray(parsed)) throw new Error(`Issue #${number} 评论响应不是数组`);
+
+    return (parsed as GhComment[]).map((comment) => {
+      if (!comment || typeof comment !== 'object') {
+        throw new Error(`Issue #${number} 评论包含非对象记录`);
+      }
+      const id = positiveSafeInteger(comment.id);
+      if (!id || typeof comment.body !== 'string') {
+        throw new Error(`Issue #${number} 评论字段残缺`);
+      }
+      if (typeof comment.created_at !== 'string' || !Number.isFinite(Date.parse(comment.created_at))) {
+        throw new Error(`Issue #${number} 评论时间无效`);
+      }
+      return {
+        id,
+        body: comment.body,
+        userId: comment.user === null ? null : githubId(comment.user?.id),
+        createdAt: comment.created_at,
+      };
+    });
+  }
+}
+
+function toManagedIssue(issue: GhIssue): ManagedIssue {
+  return {
+    number: issue.number,
+    title: issue.title,
+    body: issue.body ?? '',
+    state: issue.state,
+    labels: (issue.labels ?? []).flatMap((label) => (
+      typeof label.name === 'string' ? [label.name] : []
+    )),
+    meta: extractMeta(issue.body ?? ''),
+    url: issue.html_url,
+  };
+}
+
+function positiveSafeInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function githubId(value: unknown): string | null {
+  const id = positiveSafeInteger(value);
+  return id === null ? null : String(id);
+}
+
+function assertIssueNumber(number: number): void {
+  if (!Number.isSafeInteger(number) || number <= 0) throw new Error('Issue 编号必须是正整数');
+}
+
+function bodyHasExactMarker(body: string, marker: string): boolean {
+  return body.split(/\r?\n/).some((line) => line === marker);
+}
+
+function parseDispatchComment(
+  raw: string,
+  controllerId: string,
+  marker: string,
+  expectedBody: string,
+): { id: number; createdAt: string } | null {
+  let parsed: GhComment;
+  try {
+    parsed = JSON.parse(raw) as GhComment;
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const id = positiveSafeInteger(parsed.id);
+  const userId = githubId(parsed.user?.id);
+  const createdAt = parsed.created_at;
+  if (
+    !id
+    || userId !== controllerId
+    || typeof parsed.body !== 'string'
+    || !bodyHasExactMarker(parsed.body, marker)
+    || parsed.body !== expectedBody
+    || typeof createdAt !== 'string'
+    || !Number.isFinite(Date.parse(createdAt))
+  ) {
+    return null;
+  }
+  return { id, createdAt };
+}
+
+function selectTrustedDispatchComment(
+  comments: Array<{
+    id: number;
+    body: string;
+    userId: string | null;
+    createdAt: string;
+  }>,
+  marker: string,
+  expectedBody: string,
+  controllerId: string,
+): { id: number; createdAt: string } | null {
+  const matching = comments.filter((comment) => bodyHasExactMarker(comment.body, marker));
+  if (matching.some((comment) => comment.userId === null)) {
+    throw new Error('存在无法确认作者身份的 marker 评论，拒绝继续');
+  }
+  const trusted = matching.filter((comment) => comment.userId === controllerId);
+  if (trusted.some((comment) => comment.body !== expectedBody)) {
+    throw new Error('同一 marker 的认证评论正文与预期冻结依据不一致，拒绝继续');
+  }
+  if (trusted.length > 1) throw new Error('存在重复的可信 marker 评论，拒绝继续');
+  const comment = trusted[0];
+  return comment ? { id: comment.id, createdAt: comment.createdAt } : null;
 }
 
 function writeBodyFile(body: string): string {

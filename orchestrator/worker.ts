@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, matchesGlob } from 'node:path';
 import {
   resolveBrowserCacheDir,
   runBrowserGate,
@@ -26,7 +26,7 @@ import {
   verificationPassed,
   type VerificationResult,
 } from './validate.ts';
-import type { Spec } from './types.ts';
+import type { DispatchRevision, Spec } from './types.ts';
 
 export interface WorkerDeps {
   repoDir: string;
@@ -37,6 +37,7 @@ export interface WorkerDeps {
   verify?: (cwd: string) => Promise<VerificationResult[]>;
   checkCurrent?: (spec: Spec) => Promise<boolean>;
   checkSatisfiedRevisionCurrent?: (sourceMainSha: string, candidateTreeSha: string) => Promise<boolean>;
+  checkDispatchCurrent?: (revision: DispatchRevision) => Promise<boolean>;
   logger: Logger;
   notify?: (text: string) => Promise<void>;
   mainBranch?: string;
@@ -62,6 +63,7 @@ export interface WorkerInput {
   spec: Spec;
   sourceMainSha: string;
   attempt: number;
+  dispatchRevision?: DispatchRevision;
 }
 
 export type WorkerStatus = 'published' | 'failed' | 'stale' | 'satisfied';
@@ -90,8 +92,109 @@ export function buildWorkerBranchName(
   specHash: string,
   sourceMainSha: string,
   attempt: number,
+  revision?: number,
 ): string {
-  return `pi/${slugify(reqId)}-i${issueNumber}-r${specHash.slice(0, 8)}-a${attempt}-s${sourceMainSha.slice(0, 8)}`;
+  if (revision !== undefined && (!Number.isSafeInteger(revision) || revision <= 0)) {
+    throw new Error('派工版本号必须是正整数');
+  }
+  const branch = `pi/${slugify(reqId)}-i${issueNumber}-r${specHash.slice(0, 8)}-a${attempt}-s${sourceMainSha.slice(0, 8)}`;
+  return revision === undefined ? branch : `${branch}-v${revision}`;
+}
+
+function normalizeSha(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/** 静态核对冻结记录与本次 Worker 输入，防止把别的版本的任务交给当前作业。 */
+function dispatchBindingError(input: WorkerInput): string | undefined {
+  const revision = input.dispatchRevision;
+  if (!revision) return undefined;
+  if (typeof revision.repoId !== 'string' || revision.repoId.trim() === '') {
+    return '冻结派工记录缺少有效 repoId';
+  }
+  if (!Number.isSafeInteger(revision.revision) || revision.revision <= 0) {
+    return '冻结派工记录缺少有效 revision';
+  }
+  if (!Number.isSafeInteger(revision.issueNumber) || revision.issueNumber <= 0) {
+    return '冻结派工记录缺少有效 issueNumber';
+  }
+  if (
+    revision.reqId !== input.reqId ||
+    revision.issueNumber !== input.issueNumber ||
+    revision.specPath !== input.spec.path ||
+    revision.specHash !== input.spec.hash ||
+    normalizeSha(revision.sourceMainSha) !== normalizeSha(input.sourceMainSha)
+  ) {
+    return `冻结派工 r${revision.revision} 与 Worker 输入的需求、Issue、规格或来源 SHA 不一致`;
+  }
+  if (
+    !revision.task ||
+    !Array.isArray(revision.task.allowedPaths) ||
+    revision.task.allowedPaths.length === 0 ||
+    revision.task.allowedPaths.some((path) => typeof path !== 'string' || path.trim() === '')
+  ) {
+    return `冻结派工 r${revision.revision} 缺少有效 allowedPaths`;
+  }
+  return undefined;
+}
+
+function dispatchPreflightOutcome(deps: WorkerDeps, input: WorkerInput): WorkerOutcome | undefined {
+  if (!input.dispatchRevision) return undefined;
+  const bindingError = dispatchBindingError(input);
+  if (bindingError) {
+    return {
+      status: 'stale',
+      error: `${bindingError}，拒绝启动或发布`,
+      failureStage: 'publish',
+    };
+  }
+  if (!deps.checkDispatchCurrent) {
+    return {
+      status: 'failed',
+      error: `派工 r${input.dispatchRevision.revision} 缺少 checkDispatchCurrent 核实能力，按 fail closed 停止`,
+      failureStage: 'publish',
+      resumeAction: 'worker',
+    };
+  }
+  return undefined;
+}
+
+/**
+ * 版本化作业在每个发布边界重新核对冻结记录；核验能力异常同样停止，
+ * 不把“无法证明当前”当作“仍然有效”。
+ */
+async function dispatchCurrentFailure(
+  deps: WorkerDeps,
+  input: WorkerInput,
+  checkpoint: string,
+): Promise<WorkerOutcome | undefined> {
+  const revision = input.dispatchRevision;
+  if (!revision) return undefined;
+  const checker = deps.checkDispatchCurrent;
+  if (!checker) {
+    return {
+      status: 'failed',
+      error: `派工 r${revision.revision} 在${checkpoint}前缺少版本核验能力`,
+      failureStage: 'publish',
+      resumeAction: 'worker',
+    };
+  }
+  try {
+    if (await checker(revision)) return undefined;
+    return {
+      status: 'stale',
+      error: `派工 ${revision.reqId} r${revision.revision}（Issue #${revision.issueNumber}）在${checkpoint}前已不是当前版本`,
+      failureStage: 'publish',
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      status: 'failed',
+      error: `派工 r${revision.revision} 在${checkpoint}前核验失败，停止后续动作：${redact(detail)}`,
+      failureStage: 'publish',
+      resumeAction: 'worker',
+    };
+  }
 }
 
 export async function checkSpecCurrent(
@@ -175,12 +278,44 @@ function readSrcSnapshot(workDir: string): Record<string, string> {
   return result;
 }
 
-function buildWorkerPrompt(spec: Spec, srcSnapshot: Record<string, string>): string {
+function buildFrozenDispatchPrompt(revision: DispatchRevision): string {
+  return `## 冻结派工（唯一实施依据）
+\`\`\`json
+${JSON.stringify(
+  {
+    repoId: revision.repoId,
+    reqId: revision.reqId,
+    issueNumber: revision.issueNumber,
+    revision: revision.revision,
+    specPath: revision.specPath,
+    specHash: revision.specHash,
+    sourceMainSha: revision.sourceMainSha,
+    task: revision.task,
+  },
+  null,
+  2,
+)}
+\`\`\`
+
+`;
+}
+
+function buildWorkerPrompt(
+  spec: Spec,
+  srcSnapshot: Record<string, string>,
+  dispatchRevision?: DispatchRevision,
+): string {
   const srcText = Object.entries(srcSnapshot)
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([path, content]) => `### ${path}\n\`\`\`ts\n${content}\n\`\`\``)
     .join('\n\n');
-  return `${WORKER_PROMPT}\n\n## 当前需求\n${spec.body}\n\n需求 ID: ${spec.id}\n需求哈希: ${spec.hash}\n\n## 当前 src 快照\n${srcText || '(无 src 文件)'}`;
+  const dispatchSection = dispatchRevision ? buildFrozenDispatchPrompt(dispatchRevision) : '';
+  const specHeading = dispatchRevision ? '## 原规格（同版完整需求块）' : '## 当前需求';
+  const specPathLine = dispatchRevision ? `规格路径: ${spec.path}\n` : '';
+  const sourceHeading = dispatchRevision
+    ? `## 固定来源 SHA \`${dispatchRevision.sourceMainSha}\` 的 src 快照`
+    : '## 当前 src 快照';
+  return `${WORKER_PROMPT}\n\n${dispatchSection}${specHeading}\n${specPathLine}${spec.body}\n\n需求 ID: ${spec.id}\n需求哈希: ${spec.hash}\n\n${sourceHeading}\n${srcText || '(无 src 文件)'}`;
 }
 
 const MAX_PI_LOG_BYTES = 64 * 1024;
@@ -213,8 +348,13 @@ export function summarizePiFailure(pi: PiResult): string {
   return redact(parts.join('；') || '未知错误');
 }
 
-function buildWorkerRetryPrompt(spec: Spec, srcSnapshot: Record<string, string>, failureSummary: string): string {
-  return `${buildWorkerPrompt(spec, srcSnapshot)}\n\n## 上一次尝试失败摘要\n${failureSummary}\n\n请修正上述问题后，重新输出完整 JSON 对象。`;
+function buildWorkerRetryPrompt(
+  spec: Spec,
+  srcSnapshot: Record<string, string>,
+  failureSummary: string,
+  dispatchRevision?: DispatchRevision,
+): string {
+  return `${buildWorkerPrompt(spec, srcSnapshot, dispatchRevision)}\n\n## 上一次尝试失败摘要\n${failureSummary}\n\n请修正上述问题后，重新输出完整 JSON 对象。`;
 }
 
 /**
@@ -245,12 +385,15 @@ export function buildVerifierSandboxSpec(
 export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promise<WorkerOutcome> {
   const logger = deps.logger;
   const mainBranch = deps.mainBranch ?? 'main';
+  const dispatchPreflight = dispatchPreflightOutcome(deps, input);
+  if (dispatchPreflight) return dispatchPreflight;
   const branch = buildWorkerBranchName(
     input.reqId,
     input.issueNumber,
     input.spec.hash,
     input.sourceMainSha,
     input.attempt,
+    input.dispatchRevision?.revision,
   );
   const workDir = join(deps.runDir, 'worktrees', input.jobId);
   const snapshotDir = join(deps.runDir, 'verify', input.jobId);
@@ -286,7 +429,7 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
 
     const srcSnapshot = readSrcSnapshot(workDir);
     mkdirSync(jobLogDir, { recursive: true });
-    const basePrompt = buildWorkerPrompt(input.spec, srcSnapshot);
+    const basePrompt = buildWorkerPrompt(input.spec, srcSnapshot, input.dispatchRevision);
     const piAttempts = Math.max(1, deps.piAttempts ?? DEFAULT_PI_ATTEMPTS);
     const totalBudgetMs = deps.piTotalBudgetMs ?? DEFAULT_PI_TOTAL_BUDGET_MS;
     const piTimeoutMs = deps.piTimeoutMs ?? Number.parseInt(process.env.SPEC_LOOP_PI_TIMEOUT_MS ?? '300000', 10);
@@ -304,7 +447,9 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
         attemptError = 'Pi 总预算耗尽，未再尝试';
         break;
       }
-      const prompt = n === 0 ? basePrompt : buildWorkerRetryPrompt(input.spec, srcSnapshot, attemptError);
+      const prompt = n === 0
+        ? basePrompt
+        : buildWorkerRetryPrompt(input.spec, srcSnapshot, attemptError, input.dispatchRevision);
       const invocation: PiInvocation = {
         role: 'worker',
         prompt,
@@ -351,6 +496,26 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
         resumeAction: 'worker',
       };
     }
+
+    if (input.dispatchRevision) {
+      const disallowed = files.filter(
+        (file) =>
+          !input.dispatchRevision!.task.allowedPaths.some((pattern) =>
+            matchesGlob(file.relPath, pattern),
+          ),
+      );
+      if (disallowed.length > 0) {
+        return {
+          status: 'failed',
+          error: `Worker 输出超出冻结任务 allowedPaths：${disallowed.map((file) => file.relPath).join(', ')}`,
+          failureStage: 'write',
+          resumeAction: 'worker',
+        };
+      }
+    }
+
+    const dispatchBeforeWrite = await dispatchCurrentFailure(deps, input, '写入候选源码');
+    if (dispatchBeforeWrite) return dispatchBeforeWrite;
 
     for (const file of files) {
       mkdirSync(dirname(file.absPath), { recursive: true });
@@ -444,6 +609,11 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
         failureStage: 'publish',
       };
     }
+    const dispatchBeforeBrowser = await dispatchCurrentFailure(deps, input, '浏览器验收');
+    if (dispatchBeforeBrowser) {
+      await deps.git.reset(workDir);
+      return dispatchBeforeBrowser;
+    }
 
     // 固定检查通过后、commit/push/PR 前强制浏览器验收；失败走既有 verify 失败路径，不产生 PR。
     const browserCacheDir = deps.browserCacheDir ?? resolveBrowserCacheDir();
@@ -522,6 +692,11 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
         failureStage: 'publish',
       };
     }
+    const dispatchBeforePublish = await dispatchCurrentFailure(deps, input, '发布或确认无变更');
+    if (dispatchBeforePublish) {
+      await deps.git.reset(workDir);
+      return dispatchBeforePublish;
+    }
 
     if (noCodeChange) {
       satisfied = true;
@@ -533,12 +708,29 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
     if (!/^[0-9a-f]{40}$/.test(headSHA)) {
       throw new Error(`提交后的 HEAD 不是完整 40 位 SHA: ${headSHA || '(空)'}`);
     }
+    const dispatchAfterCommit = await dispatchCurrentFailure(deps, input, '推送');
+    if (dispatchAfterCommit) {
+      return { ...dispatchAfterCommit, branch, headSHA };
+    }
     await deps.git.push(workDir, branch);
+    const dispatchAfterPush = await dispatchCurrentFailure(deps, input, '创建 PR');
+    if (dispatchAfterPush) {
+      return { ...dispatchAfterPush, branch, headSHA };
+    }
 
     const prBody = buildPrBody(input, verification, gateResult, treeSha);
     const prNumber = await deps.github.createPR(`[${input.reqId}] ${input.spec.title}`, prBody, branch, mainBranch);
 
     published = true;
+    const dispatchBeforeNotify = await dispatchCurrentFailure(deps, input, '发送 PR 通知');
+    if (dispatchBeforeNotify) {
+      return {
+        ...dispatchBeforeNotify,
+        prNumber,
+        branch,
+        headSHA,
+      };
+    }
     await deps.notify?.(`🔎 PR #${prNumber} 等待审查`);
     return { status: 'published', prNumber, branch, headSHA, piAttempts: attemptsRun };
   } catch (error) {
@@ -578,6 +770,7 @@ function buildPrBody(
   const browserEvidence = browserGate.reportDir
     ? `\n浏览器报告：\`${browserGate.reportDir}\``
     : '';
+  const dispatch = input.dispatchRevision;
   const meta = encodeMetaBlock({
     schema: 1,
     system: 'spec-loop',
@@ -589,7 +782,19 @@ function buildPrBody(
     candidateTreeSha,
     jobId: input.jobId,
     attempt: input.attempt,
-    operationKey: `${input.spec.hash}:${input.sourceMainSha}:${input.attempt}`,
+    ...(dispatch
+      ? {
+          repoId: dispatch.repoId,
+          issueNumber: dispatch.issueNumber,
+          dispatchRevision: dispatch.revision,
+        }
+      : {}),
+    operationKey: `${input.spec.hash}:${input.sourceMainSha}:${input.attempt}${
+      dispatch ? `:dispatch:r${dispatch.revision}` : ''
+    }`,
   });
-  return `Closes #${input.issueNumber}\n\n需求 ID：\`${input.reqId}\`\n需求哈希：\`${input.spec.hash}\`\n来源 SHA：\`${input.sourceMainSha}\`\n候选树 SHA：\`${candidateTreeSha}\`\n\n验证结果：\n${checks}\n${browserCheck}${browserEvidence}\n\n${meta}`;
+  const dispatchText = dispatch
+    ? `\n仓库 ID：\`${dispatch.repoId}\`\nIssue：#${dispatch.issueNumber}\n派工版本：\`r${dispatch.revision}\``
+    : '';
+  return `Closes #${input.issueNumber}\n\n需求 ID：\`${input.reqId}\`${dispatchText}\n需求哈希：\`${input.spec.hash}\`\n来源 SHA：\`${input.sourceMainSha}\`\n候选树 SHA：\`${candidateTreeSha}\`\n\n验证结果：\n${checks}\n${browserCheck}${browserEvidence}\n\n${meta}`;
 }

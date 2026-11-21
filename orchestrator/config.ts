@@ -25,6 +25,7 @@ export interface Config {
   revisionBudget: number;
   logRetentionDays: number;
   reportToken: string;
+  dispatchAllowedUserIds?: string[];
   feishu: FeishuSettings;
 }
 
@@ -135,6 +136,7 @@ export function loadConfig(repoDir: string = process.cwd()): Config {
     revisionBudget: intEnv('SPEC_LOOP_REVISION_BUDGET', 2),
     logRetentionDays: intEnv('SPEC_LOOP_LOG_RETENTION_DAYS', 7),
     reportToken: strEnv('SPEC_LOOP_REPORT_TOKEN', ''),
+    dispatchAllowedUserIds: splitCsv(process.env.SPEC_LOOP_DISPATCH_ALLOWED_USER_IDS),
     feishu: {
       enabled: process.env.FEISHU_ENABLED === 'true',
       appId: process.env.FEISHU_APP_ID,
