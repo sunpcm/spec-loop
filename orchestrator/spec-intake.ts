@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { validateDispatchRevision } from './dispatch-task.ts';
 import { encodeMetaBlock, type GithubClient } from './github.ts';
 import type { GitClient } from './git.ts';
 import { redact, type Logger } from './log.ts';
@@ -15,7 +16,13 @@ import {
 } from './spec-identity.ts';
 import { parseSpecs } from './specs.ts';
 import type { StateStore } from './state.ts';
-import type { ManagedPR, SpecRequest, SpecRequestStage } from './types.ts';
+import type {
+  JobState,
+  ManagedPR,
+  OrchestratorState,
+  SpecRequest,
+  SpecRequestStage,
+} from './types.ts';
 
 const TARGET_REQ_ID = 'REQ-CNT-01';
 const TARGET_SPEC_PATH = 'docs/specs/counter.md';
@@ -23,6 +30,8 @@ const SPEC_LABEL = 'spec-patch';
 const MAX_CONTENT = 64 * 1024;
 const MAX_SUMMARY = 10_000;
 const MAX_NOTIFIED_ERROR = 500;
+const SHA_RE = /^[0-9a-f]{40}$/;
+const SPEC_HASH_RE = /^[0-9a-f]{64}$/;
 
 export interface SpecIntakeDeps {
   repoDir: string;
@@ -99,7 +108,7 @@ function isActiveStage(stage: SpecRequestStage): boolean {
 }
 
 function specRequestMessage(deps: SpecIntakeDeps, req: SpecRequest): string {
-  if (req.stage === 'pr-merged') return `需求请求 ${req.requestId} 的文档 PR 已合并`;
+  if (req.stage === 'pr-merged') return documentMergedMessage(req.requestId);
   if (req.stage === 'pr-closed') return `需求请求 ${req.requestId} 的文档 PR 已关闭，未合并`;
   if (req.stage === 'stale') {
     return `需求请求 ${req.requestId} 已因 main 漂移或状态过期失效，请重新发送需求`;
@@ -139,9 +148,53 @@ function activeSpecRequest(deps: SpecIntakeDeps): SpecRequest | undefined {
   return Object.values(deps.state.snapshot().specRequests ?? {}).find((req) => isActiveStage(req.stage));
 }
 
-function activeWorkerJob(deps: SpecIntakeDeps): { issueNumber: number; status: string } | undefined {
+function activeWorkerJob(deps: SpecIntakeDeps): JobState | undefined {
   return Object.values(deps.state.snapshot().jobs).find(
     (job) => job.status === 'todo' || job.status === 'processing' || job.status === 'in-review',
+  );
+}
+
+/**
+ * 只复用控制器已经落盘的当前 counter 版本事实：需求绑定与最新冻结派工必须逐项
+ * 对齐，且发布评论已经回读。缺失、错链或残缺时按旧数据 fail closed，不另建状态。
+ */
+function hasTrustedFrozenCurrentCounterDelivery(state: OrchestratorState): boolean {
+  const requirement = state.requirements[TARGET_REQ_ID];
+  const revisions = state.dispatchRevisions?.[TARGET_REQ_ID];
+  if (
+    !requirement
+    || !revisions?.length
+    || !Number.isSafeInteger(requirement.issueNumber)
+    || requirement.issueNumber <= 0
+    || requirement.specPath !== TARGET_SPEC_PATH
+    || !SPEC_HASH_RE.test(requirement.specHash)
+    || !SHA_RE.test(requirement.sourceMainSha)
+  ) {
+    return false;
+  }
+
+  let previousRevision = 0;
+  for (const revision of revisions) {
+    if (
+      !validateDispatchRevision(revision)
+      || revision.reqId !== TARGET_REQ_ID
+      || revision.revision <= previousRevision
+    ) {
+      return false;
+    }
+    previousRevision = revision.revision;
+  }
+
+  const current = revisions.at(-1);
+  return Boolean(
+    current
+    && current.reqId === TARGET_REQ_ID
+    && current.issueNumber === requirement.issueNumber
+    && current.specHash === requirement.specHash
+    && current.specPath === requirement.specPath
+    && current.sourceMainSha === requirement.sourceMainSha
+    && current.publishedAt
+    && current.publicationCommentId,
   );
 }
 
@@ -162,6 +215,14 @@ function findOpenSpecPR(prs: ManagedPR[]): ManagedPR | undefined {
       (pr.headRefName.startsWith('pi/spec-') ||
         (pr.meta?.kind === 'spec-request' && pr.meta?.reqId === TARGET_REQ_ID)),
   );
+}
+
+function documentMergedMessage(requestId: string): string {
+  return `需求请求 ${requestId} 的文档 PR 已合并；GitHub Issue 待排期，用户为当前版本添加“可开工/rN”后控制器才派工，代码 PR 由用户确认合并`;
+}
+
+function documentPRCreatedMessage(requestId: string, url: string): string {
+  return `需求请求 ${requestId} 已创建文档 PR ${url}；文档合并后 GitHub Issue 待排期，用户为当前版本添加“可开工/rN”后控制器才派工，代码 PR 由用户确认合并`;
 }
 
 function assertSpecPRBinding(req: SpecRequest, pr: ManagedPR): void {
@@ -254,7 +315,7 @@ async function applyRemotePRState(deps: SpecIntakeDeps, req: SpecRequest, pr: Ma
         target.updatedAt = now();
       }
     });
-    return `需求请求 ${req.requestId} 的文档 PR 已合并`;
+    return documentMergedMessage(req.requestId);
   }
   if (pr.state === 'closed') {
     await deps.state.update((state) => {
@@ -294,7 +355,7 @@ async function applyRemotePRState(deps: SpecIntakeDeps, req: SpecRequest, pr: Ma
       }
     });
   }
-  return `需求请求 ${req.requestId} 已创建文档 PR ${pr.url ?? prUrl(deps, pr.number)}；人工合并后自动编码，代码 PR 仍需人工合并。`;
+  return documentPRCreatedMessage(req.requestId, pr.url ?? prUrl(deps, pr.number));
 }
 
 export async function reconcileSpecRequests(deps: SpecIntakeDeps): Promise<void> {
@@ -766,7 +827,7 @@ async function finishOpenPR(deps: SpecIntakeDeps, req: SpecRequest): Promise<str
   if (final?.stage === 'pr-open') {
     await notifyBestEffort(
       deps,
-      `📄 需求文档 PR ${final.prUrl} 已创建（spec-patch）。人工合并文档 PR 后自动编码，代码 PR 仍人工合并。`,
+      `📄 需求文档 PR ${final.prUrl} 已创建（spec-patch）。文档合并后 GitHub Issue 待排期，用户为当前版本添加“可开工/rN”后控制器才派工，代码 PR 由用户确认合并。`,
     );
   }
   return result;
@@ -868,9 +929,9 @@ async function runSpecRequest(deps: SpecIntakeDeps, requestId: string): Promise<
     if (final?.stage === 'pr-open') {
       await notifyBestEffort(
         deps,
-        `📄 需求文档 PR ${final.prUrl} 已创建（spec-patch）。人工合并文档 PR 后自动编码，代码 PR 仍人工合并。`,
+        `📄 需求文档 PR ${final.prUrl} 已创建（spec-patch）。文档合并后 GitHub Issue 待排期，用户为当前版本添加“可开工/rN”后控制器才派工，代码 PR 由用户确认合并。`,
       );
-      return `需求请求 ${requestId} 已创建文档 PR ${final.prUrl}；人工合并后自动编码，代码 PR 仍需人工合并。`;
+      return documentPRCreatedMessage(requestId, final.prUrl ?? prUrl(deps, final.prNumber!));
     }
     return specRequestMessage(deps, final ?? req);
   } catch (error) {
@@ -923,8 +984,9 @@ export async function submitSpecRequirement(
       return `需求 ${TARGET_REQ_ID} 有未结束的显式重试准备，请先完成或等待恢复后再提需求`;
     }
 
+    const trustedCurrentDelivery = hasTrustedFrozenCurrentCounterDelivery(deps.state.snapshot());
     const workerJob = activeWorkerJob(deps);
-    if (workerJob) {
+    if (workerJob && (!trustedCurrentDelivery || workerJob.reqId !== TARGET_REQ_ID)) {
       return `已有活动 Worker #${workerJob.issueNumber}（${workerJob.status}），请先完成后再提需求`;
     }
 
@@ -934,7 +996,7 @@ export async function submitSpecRequirement(
       return `已有进行中的文档 PR ${openSpecPr.url ?? `#${openSpecPr.number}`}，请先人工合并或关闭`;
     }
     const activeCodePr = findActiveCodePR(prs);
-    if (activeCodePr) {
+    if (activeCodePr && !trustedCurrentDelivery) {
       return `当前已有活动代码交付 PR ${activeCodePr.url ?? `#${activeCodePr.number}`}，请先完成后再提需求`;
     }
 
@@ -956,14 +1018,19 @@ export async function retrySpecRequirement(deps: SpecIntakeDeps, requestId: stri
     if (hasActiveRetryBaseline(state, TARGET_REQ_ID)) {
       return `需求 ${TARGET_REQ_ID} 有未结束的显式重试准备，请先完成代码重试恢复`;
     }
-    const activeWorker = Object.values(state.jobs).find(
-      (job) => job.status === 'todo' || job.status === 'processing' || job.status === 'in-review',
-    );
-    if (activeWorker) {
+    const activeWorker = activeWorkerJob(deps);
+    await reconcileSpecRequests(deps);
+    const current = deps.state.snapshot();
+    if (
+      activeWorker
+      && (
+        !hasTrustedFrozenCurrentCounterDelivery(current)
+        || activeWorker.reqId !== TARGET_REQ_ID
+      )
+    ) {
       return `已有活动 Worker #${activeWorker.issueNumber}（${activeWorker.status}），请先完成后再重试需求`;
     }
-    await reconcileSpecRequests(deps);
-    const req = deps.state.snapshot().specRequests?.[requestId];
+    const req = current.specRequests?.[requestId];
     if (!req) return `找不到需求请求 ${requestId}`;
     if (req.stage === 'pr-merged') return `需求请求 ${requestId} 已合并，无需重试`;
     if (req.stage === 'pr-closed') return `需求请求 ${requestId} 的文档 PR 已关闭，请重新发送需求`;

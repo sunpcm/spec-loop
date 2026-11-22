@@ -41,6 +41,7 @@ SPEC_LOOP_DEV_PORT=5174
 # Vercel 独立静态站正式入口；当前需账号登录
 SPEC_LOOP_PUBLIC_URL=https://spec-loop.biubiuniu.com/
 ```
+计数器的开工许可使用 GitHub 账号的数字 ID。用负责手动排期的账号执行 `gh api user --jq '.id'`，将返回的数字写入本地 `SPEC_LOOP_DISPATCH_ALLOWED_USER_IDS`，多个 ID 用英文逗号分隔。空名单时任务仍可登记，Worker 等待授权。飞书用户 ID 和 GitHub 数字 ID 分开配置。
 加载配置的进程必须显式指定文件。每个运行 `demo:*` 的终端都执行：
 ```bash
 export SPEC_LOOP_ENV_FILE="$PWD/.env.local"
@@ -136,8 +137,9 @@ curl --fail --silent --show-error http://127.0.0.1:5173/__version
 1. 白名单操作者在唯一绑定会话发送单条 `需求：描述` 或 `/require 描述`，长度 1～2000 字符。
 2. 服务快速 ACK 并进入全局串行队列；`spec-author` 只生成 `counter.md` 中现有 `REQ-CNT-01` 的候选变化。
 3. 控制器检查 JSON、路径、大小、既有需求块保留、格式和实际变化，在确定性分支 `pi/spec-<请求ID>` 上提交唯一文件，创建带 `spec-patch` 标签的 docs-only PR。
-4. 用户人工 Merge 文档 PR。文档进入 `main` 后才自动触发现有编码闭环，产生只修改 `src/**` 的代码 PR。
-5. 用户再次人工 Merge 代码 PR，进入第 7 节部署。
+4. 用户确认合并文档 PR。需求进入 `main` 后，控制器在同一张受管 Issue 发布任务版本和验收项。先让控制器轮询，确认任务仍待排期且没有新编码作业。
+5. 准备开工时，由白名单用户在 Issue 添加卡片标明的标签，例如 `可开工/r1`。核验通过后控制器领取当前版本，Worker 只交付 `src/**` 的改动。重复打标、继续轮询时应指向同一份交付。
+6. 用户确认合并代码 PR，进入第 7 节部署。
 
 未启用新入口时，可继续使用人工文档路径验证既有 A/C 闭环。人工路径的基线命令为：
 ```bash
@@ -161,7 +163,7 @@ gh pr list --repo sunpcm/spec-loop --state open --limit 20
 - 文档 PR 只修改 `docs/specs/counter.md`，保留现有 `REQ-CNT-01`，并带 `spec-patch` 标签与确定性元数据；不得使用 `Closes`。
 - 同一飞书 `messageId`、重复描述和进程重启不重复调用 Pi/建 PR；冲突请求返回现有请求链接。
 - 当前 `main` 与原请求 `baseSHA` 不一致时 fail closed，提示基于新主重新提需求。
-- 文档 PR 由用户确认合并；Merge 后自动触发的代码 PR 只修改 `src/**`，仍等待用户确认合并。
+- 文档 PR 合并后 Issue 待排期。需求改版后，给旧版添加标签应保持零次新版派工。白名单用户在新版卡片添加对应标签后才可领取。
 - Issue 进入处理中及 review 状态，并记录需求 ID、需求哈希和来源 `main` SHA。
 - PR 只修改 `src/**`，等待人工审查，不自动 Merge。
 - 飞书收到对应阶段通知。通知失败不回滚 GitHub 主链路。

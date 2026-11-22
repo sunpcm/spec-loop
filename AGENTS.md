@@ -10,7 +10,7 @@
 - 主 Agent 负责架构、独立评审、Git 集成与真实链路验收；实施子 Agent 负责其任务说明指定的代码、测试和交付报告。
 - 实施节点仅修改指定 worktree 和文件范围；不 commit/push/merge、不操作远端、不读取凭据，不自行扩大范围。
 - 运行时 Planner 只输出任务计划，Worker 只输出 `src` 文件变更，`spec-author` 只输出需求文档 JSON；控制器验证路径、需求版本和检查结果后执行 git/gh。任何 Agent 不得自主 Merge。
-- 每次飞书业务需求先由用户确认合并 docs-only 文档 PR；只有文档进入 `main` 后才自动触发既有编码流程，代码 PR 再由用户确认合并发布。受控飞书入口只允许绑定会话中的白名单用户通过显式预检/确认触发，首版仅支持受管同仓 `pi/spec-*` 或 `pi/req-*`、base 为 `main` 的 PR。模型或实施 Agent 不得自主选择、发起或代做 Merge。
+- 计数器的文档 PR 由用户确认合并。需求进入 `main` 并登记到 GitHub 主 Issue 后停在待排期，由有权限的用户为当前任务版本添加“可开工/rN”标签。控制器验证许可和版本后才派发 Worker。需求改版需要新的开工许可，重复打标只领取一次。代码 PR 再由用户确认合并发布。受控飞书入口只允许绑定会话中的白名单用户通过显式预检/确认触发，首版仅支持受管同仓 `pi/spec-*` 或 `pi/req-*`、base 为 `main` 的 PR。模型或实施 Agent 不得自主选择、发起或代做 Merge。
 - 模型路由按用户本次授权：workbuddy/deepseek-v4-pro、workbuddy/deepseek-v4.1-flash、zcode/GLM-5.3、zcode/GLM-5.3-Flash；四者均失败才回退内置 GPT。调用失败不丢弃 WIP，后续有界复检、可用后切回。
 
 ## 第一轮最小保障

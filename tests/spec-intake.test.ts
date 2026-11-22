@@ -13,6 +13,7 @@ import test from 'node:test';
 
 import type { Config } from '../orchestrator/config.ts';
 import { createCommands } from '../orchestrator/commands.ts';
+import { HELP_TEXT } from '../orchestrator/feishu-help.ts';
 import { GitClient } from '../orchestrator/git.ts';
 import {
   encodeMetaBlock,
@@ -36,6 +37,7 @@ import {
 } from '../orchestrator/spec-identity.ts';
 import { StateStore } from '../orchestrator/state.ts';
 import type {
+  DispatchRevision,
   JobState,
   ManagedPR,
   OrchestratorState,
@@ -164,6 +166,69 @@ function makeJob(
     startedAt: `2026-11-14T00:0${attempt}:00.000Z`,
     updatedAt: `2026-11-14T00:0${attempt}:30.000Z`,
   };
+}
+
+const CURRENT_SPEC_HASH = 'a'.repeat(64);
+
+function trustedCurrentDelivery(
+  baseSHA: string,
+  workerStatus: JobState['status'] = 'in-review',
+): {
+  state: OrchestratorState;
+  revision: DispatchRevision;
+  job: JobState;
+} {
+  const revision: DispatchRevision = {
+    reqId: 'REQ-CNT-01',
+    repoId: '123456',
+    revision: 1,
+    issueNumber: 3,
+    specHash: CURRENT_SPEC_HASH,
+    specPath: 'docs/specs/counter.md',
+    sourceMainSha: baseSHA,
+    task: {
+      goal: '实现当前计数器需求',
+      steps: [{ text: '完成全部验收', acceptanceRefs: ['A1'] }],
+      acceptance: { A1: '计数器行为符合当前规格' },
+      allowedPaths: ['src/**'],
+      dependsOn: [],
+    },
+    publishedAt: '2026-11-21T00:00:00.000Z',
+    publicationCommentId: 81,
+  };
+  const job: JobState = {
+    ...makeJob('current-delivery', 1, workerStatus, baseSHA),
+    issueNumber: revision.issueNumber,
+    specHash: revision.specHash,
+    dispatchRevision: revision.revision,
+  };
+  return {
+    state: baseState(baseSHA, {
+      requirements: {
+        'REQ-CNT-01': {
+          issueNumber: revision.issueNumber,
+          specHash: revision.specHash,
+          specPath: revision.specPath,
+          sourceMainSha: revision.sourceMainSha,
+        },
+      },
+      jobs: { [job.jobId]: job },
+      dispatchRevisions: { 'REQ-CNT-01': [revision] },
+    }),
+    revision,
+    job,
+  };
+}
+
+async function createTrustedHarness(
+  workerStatus: JobState['status'] = 'in-review',
+): Promise<{ harness: Harness; current: ReturnType<typeof trustedCurrentDelivery> }> {
+  const harness = createHarness();
+  const current = trustedCurrentDelivery(harness.fixture.baseSHA, workerStatus);
+  await harness.state.update((state) => {
+    Object.assign(state, current.state);
+  });
+  return { harness, current };
 }
 
 function baseState(baseSHA: string, overrides: Partial<OrchestratorState> = {}): OrchestratorState {
@@ -560,6 +625,123 @@ test('同 target 的 failed 请求、活动 Worker 与 open 代码 PR 都阻止�
   const staleReleased = await submitSpecRequirement(staleHarness.deps, '新需求', 'om-new-after-stale');
   assert.match(staleReleased, /已创建文档 PR/);
   assert.equal(staleHarness.piInvocations.length, 1);
+});
+
+test('可信当前版本有活动代码交付时仍可起草 r2 文档，旧作业、PR 与冻结记录不变', async () => {
+  const { harness, current } = await createTrustedHarness();
+  harness.fakeGithub.addPR({
+    number: 41,
+    title: '[REQ-CNT-01] 当前代码交付',
+    body: '',
+    state: 'open',
+    merged: false,
+    headRefName: 'pi/req-current-r1',
+    baseRefName: 'main',
+    meta: {
+      kind: 'code-pr',
+      reqId: 'REQ-CNT-01',
+      specHash: current.revision.specHash,
+      specPath: current.revision.specPath,
+      sourceMainSha: current.revision.sourceMainSha,
+      jobId: current.job.jobId,
+      dispatchRevision: current.revision.revision,
+    },
+    labels: ['status:in-review', '可开工/r1'],
+  });
+  const stateBefore = harness.state.snapshot();
+  const jobBefore = structuredClone(stateBefore.jobs[current.job.jobId]);
+  const revisionsBefore = structuredClone(stateBefore.dispatchRevisions);
+  const requirementsBefore = structuredClone(stateBefore.requirements);
+  const codePRBefore = structuredClone(harness.fakeGithub.prs[0]);
+
+  const result = await submitSpecRequirement(harness.deps, '按当前策略调整计数器', 'om-next-doc');
+
+  assert.match(result, /已创建文档 PR/);
+  assert.match(result, /GitHub Issue 待排期/);
+  assert.match(result, /可开工\/rN/);
+  assert.doesNotMatch(result, /自动编码/);
+  assert.equal(harness.piInvocations.length, 1);
+  assert.equal(harness.fakeGithub.prCreateCalls, 1);
+  assert.equal(harness.fakeGithub.prs.length, 2);
+  const after = harness.state.snapshot();
+  assert.deepEqual(after.jobs[current.job.jobId], jobBefore);
+  assert.deepEqual(after.dispatchRevisions, revisionsBefore);
+  assert.deepEqual(after.requirements, requirementsBefore);
+  assert.deepEqual(harness.fakeGithub.prs[0], codePRBefore);
+});
+
+test('可信当前版本有 todo 作业时只起草文档草案，不派工且不建代码 PR', async () => {
+  const { harness, current } = await createTrustedHarness('todo');
+  const jobsBefore = structuredClone(harness.state.snapshot().jobs);
+
+  const result = await submitSpecRequirement(harness.deps, '排期前准备下一版草案', 'om-next-todo');
+
+  assert.match(result, /已创建文档 PR/);
+  assert.doesNotMatch(result, /自动编码/);
+  assert.equal(harness.piInvocations.length, 1);
+  assert.equal(harness.fakeGithub.prCreateCalls, 1);
+  assert.deepEqual(harness.state.snapshot().jobs, jobsBefore);
+  assert.equal(harness.state.snapshot().jobs[current.job.jobId]?.status, 'todo');
+  assert.equal(harness.fakeGithub.prs.some((pr) => pr.meta?.kind === 'code-pr'), false);
+});
+
+test('可信当前版本有活动 Worker 时，显式恢复新文档请求不被旧作业误阻断', async () => {
+  const { harness, current } = await createTrustedHarness('processing');
+  const request = specRequestState(
+    computeSpecRequestId('om-recover-doc'),
+    'om-recover-doc',
+    '恢复下一版文档草案',
+    harness.fixture.baseSHA,
+  );
+  request.stage = 'failed';
+  request.failureStage = 'pi';
+  request.error = '临时 Pi 失败';
+  await harness.state.update((state) => {
+    state.specRequests[request.requestId] = request;
+  });
+  const jobBefore = structuredClone(harness.state.snapshot().jobs[current.job.jobId]);
+
+  const result = await retrySpecRequirement(harness.deps, request.requestId);
+
+  assert.match(result, /已创建文档 PR/);
+  assert.equal(harness.piInvocations.length, 1);
+  assert.equal(harness.state.snapshot().specRequests[request.requestId]?.stage, 'pr-open');
+  assert.deepEqual(harness.state.snapshot().jobs[current.job.jobId], jobBefore);
+});
+
+test('可信当前版本不绕过另一非终态文档请求和 GitHub 未知状态', async () => {
+  const { harness } = await createTrustedHarness();
+  const failed = specRequestState(
+    computeSpecRequestId('om-active-doc'),
+    'om-active-doc',
+    '尚未恢复的文档请求',
+    harness.fixture.baseSHA,
+  );
+  failed.stage = 'failed';
+  failed.failureStage = 'pi';
+  await harness.state.update((state) => {
+    state.specRequests[failed.requestId] = failed;
+  });
+
+  const blocked = await submitSpecRequirement(harness.deps, '另一份草案', 'om-blocked-doc');
+  assert.match(blocked, /重试需求/);
+  assert.equal(harness.piInvocations.length, 0);
+
+  await harness.state.update((state) => {
+    delete state.specRequests[failed.requestId];
+  });
+  harness.fakeGithub.failList = true;
+  const unknown = await submitSpecRequirement(harness.deps, '未知状态下不提交', 'om-unknown-prs');
+  assert.match(unknown, /需求提交失败/);
+  assert.equal(harness.piInvocations.length, 0);
+  assert.equal(Object.keys(harness.state.snapshot().specRequests).length, 0);
+});
+
+test('帮助与文档合并回执统一说明待排期和用户标签开工，不再宣称自动编码', () => {
+  assert.match(HELP_TEXT, /GitHub Issue 待排期/);
+  assert.match(HELP_TEXT, /可开工\/rN/);
+  assert.match(HELP_TEXT, /代码 PR 由用户确认合并/);
+  assert.doesNotMatch(HELP_TEXT, /自动编码/);
 });
 
 const invalidOutputs: Array<{ name: string; output: unknown }> = [

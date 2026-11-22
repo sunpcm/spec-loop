@@ -6,11 +6,13 @@ import {
 } from './retry-baseline.ts';
 import {
   emptyState,
+  type DispatchRevision,
   type RetryBaselineState,
   type MergeRequestState,
   type OrchestratorState,
   type SpecRequest,
 } from './types.ts';
+import { validateDispatchRevision } from './dispatch-task.ts';
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const SPEC_HASH_RE = /^[0-9a-f]{64}$/;
@@ -63,6 +65,7 @@ export class StateStore {
           normalizeRetryBaseline(baseline);
         }
         normalizeRetryBaselineLinks(parsed);
+        normalizeDispatchRevisions(parsed);
         parsed.opLog ??= [];
         this.state = parsed;
       } else {
@@ -121,6 +124,38 @@ function normalizeSpecRequest(req: SpecRequest): void {
 function normalizeMergeRequest(merge: MergeRequestState): void {
   merge.preflightMessageIds ??= [merge.originalMessageId];
   merge.confirmationMessageIds ??= [];
+}
+
+/** 派工历史必须按 revision 升序、键与 reqId 一致；任何畸形记录 fail closed。 */
+function normalizeDispatchRevisions(state: OrchestratorState): void {
+  if (state.dispatchRevisions === undefined) {
+    state.dispatchRevisions = {};
+    return;
+  }
+  if (
+    state.dispatchRevisions === null
+    || typeof state.dispatchRevisions !== 'object'
+    || Array.isArray(state.dispatchRevisions)
+  ) {
+    throw new Error('dispatchRevisions 必须是对象容器');
+  }
+  for (const [reqId, list] of Object.entries(state.dispatchRevisions)) {
+    if (!reqId || !Array.isArray(list)) {
+      throw new Error(`dispatchRevisions 记录畸形: ${reqId}`);
+    }
+    const sorted = [...list].sort((a, b) => a.revision - b.revision);
+    let previous = 0;
+    for (const rev of sorted) {
+      if (!validateDispatchRevision(rev) || rev.reqId !== reqId) {
+        throw new Error(`dispatchRevisions 记录畸形: ${reqId}`);
+      }
+      if (rev.revision <= previous) {
+        throw new Error(`dispatchRevisions 版本号必须严格升序且唯一: ${reqId}`);
+      }
+      previous = rev.revision;
+    }
+    state.dispatchRevisions![reqId] = sorted;
+  }
 }
 
 function normalizeRetryBaseline(baseline: RetryBaselineState): void {
