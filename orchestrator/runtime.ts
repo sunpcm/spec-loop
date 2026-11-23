@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import {
   browserGateTimeoutMs,
+  readCandidateSpecFile,
   resolveBrowserCacheDir,
   runBrowserGate,
   readSpecFilesFromDir,
@@ -11,15 +12,37 @@ import {
 } from './browser-gate.ts';
 import { createCommands } from './commands.ts';
 import type { Config } from './config.ts';
-import { deployOnce, retryDeployForIssue, type DeployDeps, type DeployResult } from './deploy.ts';
+import {
+  clearPanelActivePointer,
+  deployOnce,
+  panelReleaseDir,
+  retryDeployForIssue,
+  writePanelActivePointer,
+  type DeployDeliveryContext,
+  type DeployDeps,
+  type DeployResult,
+} from './deploy.ts';
+import {
+  PANEL_REQ_ID,
+  deliveryProfile,
+  isPanelReqId,
+  isValidPanelBinding,
+  sameRepositoryId,
+  type PanelBinding,
+  type DeliveryProfile,
+} from './delivery-profile.ts';
 import type { DispatchLabelEvent } from './dispatch-grant.ts';
-import { evaluateDispatchClaim } from './dispatch-task.ts';
+import {
+  evaluateDispatchClaim,
+  evaluateDispatchObservation,
+} from './dispatch-task.ts';
 import type { FeishuCommands } from './feishu-contract.ts';
 import { GitClient } from './git.ts';
 import { encodeMetaBlock, GithubClient } from './github.ts';
 import { createLogger, type Logger } from './log.ts';
-import { MergeService } from './merge.ts';
+import { MergeService, type MergeServiceDeps } from './merge.ts';
 import { Notifier } from './notifier.ts';
+import { validateRegisteredPanelIssue } from './panel-registration.ts';
 import { deriveDispatchTask, deriveIssueBody } from './planner.ts';
 import { buildRequirementMeta } from './reconciler.ts';
 import {
@@ -108,6 +131,45 @@ function symlinkNodeModules(repoDir: string, workDir: string): void {
       // Optional convenience; verification still resolves modules from the parent where possible.
     }
   }
+}
+
+/**
+ * 从本版实际归档读取交付 profile 指定的精确规格文件。
+ *
+ * `readSpecFilesFromDir` 只扫描 docs/specs 的直属文件，不能覆盖受信的
+ * docs/specs/pending/panel.md。合并构建必须使用候选归档中的原文，并核对
+ * 冻结身份；缺失、符号链接或哈希不符都在执行构建前 fail closed。
+ */
+function readArchivedGateSpecFiles(
+  snapshotDir: string,
+  context: DeployDeliveryContext,
+): Record<string, string> {
+  const parts = context.specPath.split('/');
+  let cursor = snapshotDir;
+  let stat: ReturnType<typeof lstatSync>;
+  for (let index = 0; index < parts.length; index += 1) {
+    cursor = join(cursor, parts[index]!);
+    try {
+      stat = lstatSync(cursor);
+    } catch {
+      throw new Error(`本版归档缺少受信规格 ${context.specPath}`);
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`本版归档中的受信规格路径包含符号链接: ${context.specPath}`);
+    }
+    const last = index === parts.length - 1;
+    if ((!last && !stat.isDirectory()) || (last && !stat.isFile())) {
+      throw new Error(`本版归档中的受信规格不是普通文件: ${context.specPath}`);
+    }
+  }
+  return {
+    ...readSpecFilesFromDir(snapshotDir),
+    ...readCandidateSpecFile(snapshotDir, {
+      reqId: context.reqId,
+      specPath: context.specPath,
+      specHash: context.specHash,
+    }),
+  };
 }
 
 async function listenOnEphemeralPort(server: import('node:http').Server): Promise<number> {
@@ -208,13 +270,57 @@ export function createBuild(
   git: GitClient,
   runnerOverride?: CommandRunner,
   browserGateOverride?: (opts: BrowserGateOptions) => Promise<BrowserGateResult>,
-): (sha: string) => Promise<{ ok: boolean; detail: string }> {
-  return async (sha: string) => {
-    const outDir = join(config.runDir, 'releases', sha);
-    const snapshotDir = join(config.runDir, 'build', sha);
-    const jobTmp = join(config.runDir, 'tmp', sha);
-    const browserJobTmp = join(config.runDir, 'browser', sha);
+): (
+  sha: string,
+  context?: DeployDeliveryContext,
+) => Promise<{ ok: boolean; detail: string }> {
+  return async (sha: string, context?: DeployDeliveryContext) => {
     try {
+      let profile: DeliveryProfile | undefined;
+      let candidateTreeSha: string | null = null;
+      if (context) {
+        profile = deliveryProfile(context.reqId, config.panelBinding);
+        if (
+          !profile
+          || (profile.project === 'panel' && !isValidPanelBinding(config.panelBinding))
+          || context.profile.reqId !== profile.reqId
+          || context.profile.specPath !== profile.specPath
+          || context.profile.sourceDir !== profile.sourceDir
+          || context.profile.project !== profile.project
+          || context.profile.buildScript !== profile.buildScript
+          || context.specPath !== profile.specPath
+          || !/^[0-9a-f]{40}$/i.test(context.sourceMainSha)
+          || !/^[0-9a-f]{64}$/i.test(context.specHash)
+          || !context.jobId.trim()
+          || !Number.isSafeInteger(context.issueNumber)
+          || context.issueNumber <= 0
+          || !Number.isSafeInteger(context.prNumber)
+          || context.prNumber <= 0
+          || (
+            context.dispatchRevision !== undefined
+            && (!Number.isSafeInteger(context.dispatchRevision) || context.dispatchRevision <= 0)
+          )
+        ) {
+          return { ok: false, detail: '构建上下文缺少可信 profile、版本或作业身份，拒绝构建' };
+        }
+        candidateTreeSha = (await git.revParse(config.repoDir, `${sha}^{tree}`)).trim().toLowerCase();
+        if (!/^[0-9a-f]{40}$/.test(candidateTreeSha)) {
+          return { ok: false, detail: '合并提交的实际 tree SHA 无效，拒绝构建' };
+        }
+      }
+
+      const outDir = profile?.project === 'panel'
+        ? panelReleaseDir(config.runDir, sha)
+        : join(config.runDir, 'releases', sha);
+      const snapshotDir = profile
+        ? join(config.runDir, 'build', profile.project, sha)
+        : join(config.runDir, 'build', sha);
+      const jobTmp = profile
+        ? join(config.runDir, 'tmp', profile.project, sha)
+        : join(config.runDir, 'tmp', sha);
+      const browserJobTmp = profile
+        ? join(config.runDir, 'browser', profile.project, sha)
+        : join(config.runDir, 'browser', sha);
       rmSync(outDir, { recursive: true, force: true });
       // Vite 不负责创建输出目录祖先；在沙箱生效前创建受控输出根，
       // 避免只读验证环境内因 EPERM 无法创建 releases/<sha>。
@@ -223,6 +329,9 @@ export function createBuild(
       mkdirSync(jobTmp, { recursive: true });
       await git.archive(config.repoDir, sha, snapshotDir);
       symlinkNodeModules(config.repoDir, snapshotDir);
+      const gateSpecFiles = context
+        ? readArchivedGateSpecFiles(snapshotDir, context)
+        : readSpecFilesFromDir(snapshotDir);
 
       const isolation = buildIsolationPaths(config.repoDir);
       const spec: SandboxProfileSpec = {
@@ -241,7 +350,7 @@ export function createBuild(
       };
       const runner = runnerOverride ?? makeSandboxedRunner(spec, { timeoutMs: config.buildTimeoutMs });
       const results = await runVerification(
-        defaultVerificationCommands(),
+        defaultVerificationCommands(profile?.buildScript ?? 'build'),
         snapshotDir,
         runner,
         buildVerifierEnv(
@@ -263,11 +372,13 @@ export function createBuild(
               version: sha,
               startedAt: null,
               finishedAt: new Date().toISOString(),
-              jobId: null,
-              reqId: null,
-              specHash: null,
-              sourceMainSha: sha,
-              candidateTreeSha: null,
+              jobId: context?.jobId ?? null,
+              reqId: context?.reqId ?? null,
+              specHash: context?.specHash ?? null,
+              specPath: context?.specPath ?? null,
+              dispatchRevision: context?.dispatchRevision ?? null,
+              sourceMainSha: context?.sourceMainSha ?? sha,
+              candidateTreeSha,
               ok: buildTestResult.ok,
               stdout: `${buildTestResult.stdout}\n${buildTestResult.stderr}`,
             }),
@@ -292,8 +403,17 @@ export function createBuild(
         artifactDir: outDir,
         mountPath: `/releases/${sha}/`,
         version: sha,
-        project: 'counter',
-        specFiles: readSpecFilesFromDir(snapshotDir),
+        project: profile?.project ?? 'counter',
+        ...(context
+          ? {
+              reqId: context.reqId,
+              specPath: context.specPath,
+              ...(context.dispatchRevision === undefined
+                ? {}
+                : { dispatchRevision: context.dispatchRevision }),
+            }
+          : {}),
+        specFiles: gateSpecFiles,
         jobTmp: browserJobTmp,
         browserCacheDir: resolveBrowserCacheDir(),
         globalAgentDir: config.piAgentDir,
@@ -302,7 +422,13 @@ export function createBuild(
         timeoutMs: browserGateTimeoutMs(),
         testRunsRoot: join(config.runDir, 'test-runs'),
         evidenceStage: 'build',
-        sourceMainSha: sha,
+        ...(context
+          ? {
+              jobId: context.jobId,
+              sourceMainSha: context.sourceMainSha,
+              candidateTreeSha: candidateTreeSha!,
+            }
+          : { sourceMainSha: sha }),
       });
       if (!gateResult.ok) {
         return { ok: false, detail: `浏览器验收失败：${gateResult.detail}` };
@@ -314,15 +440,80 @@ export function createBuild(
   };
 }
 
+function activePanelBinding(config: Config | undefined): PanelBinding | undefined {
+  return config?.panelBinding && isValidPanelBinding(config.panelBinding)
+    ? config.panelBinding
+    : undefined;
+}
+
+/**
+ * 受管 revision 的本地身份门禁。面板首版确认锚点只保存在 binding；
+ * r2+ 继续使用各 revision 自己的 sourceMainSha/specHash，不能被锚点覆盖。
+ */
+function dispatchRevisionBindingError(
+  revision: DispatchRevision,
+  panelBinding: PanelBinding | undefined,
+  state: OrchestratorState,
+  repo: string | null,
+  mainBranch: string,
+): string | null {
+  const profile = deliveryProfile(revision.reqId, panelBinding);
+  if (!profile || revision.specPath !== profile.specPath) {
+    return 'revision 与当前交付 profile 不一致';
+  }
+  const allowedPath = `${profile.sourceDir}/**`;
+  if (
+    revision.task.allowedPaths.length !== 1
+    || revision.task.allowedPaths[0] !== allowedPath
+  ) {
+    return `revision 写入范围不是受信路径 ${allowedPath}`;
+  }
+  const requirement = state.requirements[revision.reqId];
+  const latest = latestDispatchRevisionFor(state, revision.reqId);
+  if (
+    !requirement
+    || requirement.issueNumber !== revision.issueNumber
+    || requirement.specHash !== revision.specHash
+    || requirement.specPath !== revision.specPath
+    || requirement.sourceMainSha !== revision.sourceMainSha
+    || !latest
+    || latest.revision !== revision.revision
+  ) {
+    return 'revision 与当前 requirement/最新版本不一致';
+  }
+  if (profile.project === 'panel') {
+    if (!panelBinding) return '面板绑定未启用';
+    if (mainBranch !== panelBinding.mainBranch) return '当前主线与面板绑定不一致';
+    if (!repo || repo.toLowerCase() !== panelBinding.repo.toLowerCase()) {
+      return '当前仓库名与面板绑定不一致';
+    }
+    if (!sameRepositoryId(revision.repoId, panelBinding.repositoryId)) {
+      return 'revision 数字仓库 ID 与面板绑定不一致';
+    }
+    if (revision.issueNumber !== panelBinding.issueNumber) {
+      return 'revision Issue 与面板绑定不一致';
+    }
+  }
+  return null;
+}
+
+function isPublishedDispatchRevision(revision: DispatchRevision): boolean {
+  return (
+    revision.publishedAt !== undefined
+    && revision.publicationCommentId !== undefined
+  );
+}
+
 export function createCore(
   config: Config,
   repo: string | null,
   notify?: (text: string) => Promise<void>,
 ): Core {
   const logger = createLogger('INIT');
+  const panelBinding = activePanelBinding(config);
   const state = new StateStore(config.stateFile);
   state.load();
-  const git = new GitClient();
+  const git = new GitClient(undefined, panelBinding);
   const github = new GithubClient(repo ?? '');
   const notifier = new Notifier(null, logger);
   const emitNotify = async (text: string): Promise<void> => {
@@ -346,6 +537,7 @@ export function createCore(
     }
   };
 
+  let runtimeCore: Core | undefined;
   const workerDeps: WorkerDeps = {
     repoDir: config.repoDir,
     runDir: config.runDir,
@@ -354,6 +546,7 @@ export function createCore(
     logger: createLogger('WORKER'),
     notify: emitNotify,
     mainBranch: config.mainBranch,
+    ...(panelBinding ? { panelBinding } : {}),
     piProvider: config.piProvider,
     piModel: config.piModel,
     piAgentDir: config.piAgentDir,
@@ -368,8 +561,20 @@ export function createCore(
         sourceMainSha,
         candidateTreeSha,
       ),
-    checkDispatchCurrent: (revision: DispatchRevision) =>
-      checkDispatchRevisionCurrent(git, config.repoDir, config.mainBranch, revision),
+    checkDispatchCurrent: (revision: DispatchRevision) => {
+      if (!runtimeCore) return Promise.resolve(false);
+      return checkDispatchRevisionCurrent(
+        git,
+        runtimeCore.github,
+        runtimeCore.state,
+        runtimeCore.config.repoDir,
+        runtimeCore.config.mainBranch,
+        runtimeCore.repo,
+        activePanelBinding(runtimeCore.config),
+        runtimeCore.config.dispatchAllowedUserIds ?? [],
+        revision,
+      );
+    },
   };
 
   const build = createBuild(config, git);
@@ -384,9 +589,44 @@ export function createCore(
     notify: emitNotify,
     mainBranch: config.mainBranch,
     publicUrl: config.publicUrl,
+    ...(config.panelBinding ? { panelBinding: config.panelBinding } : {}),
     build,
-    healthCheck: async (sha) => verifyReleaseOverHttp(join(config.runDir, 'releases', sha), sha),
-    switchPreview: async (sha, releaseDir) => {
+    healthCheck: async (sha, releaseDir, context) => {
+      if (context?.profile.project === 'panel') {
+        if (!releaseDir) return false;
+        const expected = panelReleaseDir(config.runDir, sha);
+        if (releaseDir !== expected) return false;
+        return verifyReleaseOverHttp(expected, sha);
+      }
+      return verifyReleaseOverHttp(join(config.runDir, 'releases', sha), sha);
+    },
+    switchPreview: async (sha, releaseDir, context) => {
+      if (context?.profile.project === 'panel') {
+        if (sha === null) {
+          clearPanelActivePointer(config.runDir);
+          return;
+        }
+        if (!releaseDir || releaseDir !== panelReleaseDir(config.runDir, sha)) {
+          throw new Error('面板发布目录不是受控版本目录，拒绝切换');
+        }
+        writePanelActivePointer(config.runDir, {
+          schemaVersion: 1,
+          project: 'panel',
+          reqId: context.reqId,
+          issueNumber: context.issueNumber,
+          prNumber: context.prNumber,
+          ...(context.dispatchRevision === undefined
+            ? {}
+            : { dispatchRevision: context.dispatchRevision }),
+          jobId: context.jobId,
+          activeSha: sha,
+          releaseDir,
+          specHash: context.specHash,
+          sourceMainSha: context.sourceMainSha,
+          recordedAt: new Date().toISOString(),
+        });
+        return;
+      }
       await state.update((s) => {
         s.deploy.activeSha = sha;
         s.deploy.releaseDir = releaseDir;
@@ -396,13 +636,17 @@ export function createCore(
   };
 
   const dispatchDeps: DispatchReconcileDeps = {
-    // 门禁只绑定需求 ID，不绑定可改名的 owner/repo。仓库身份由发布和领取时的
-    // GitHub 数字 repoId 核验；未配置仓库时远端核验失败并 fail closed。
-    isGated: (reqId) => reqId === 'REQ-CNT-01',
-    allowedPaths: () => ['src/**'],
+    // 计数器始终走门禁；面板只有显式合法绑定才进入同一门禁，绝不回退旧处理。
+    isGated: (reqId) => deliveryProfile(reqId, panelBinding) !== undefined,
+    allowedPaths: (spec) => {
+      const profile = deliveryProfile(spec.id, panelBinding);
+      return profile?.specPath === spec.path ? [`${profile.sourceDir}/**`] : [];
+    },
     dependsOn: () => [],
-    deriveTask: (spec, options) =>
-      deriveDispatchTask(
+    deriveTask: (spec, options) => {
+      const profile = deliveryProfile(spec.id, panelBinding);
+      if (!profile || profile.specPath !== spec.path) return Promise.resolve(null);
+      return deriveDispatchTask(
         spec,
         {
           repoDir: config.repoDir,
@@ -415,7 +659,8 @@ export function createCore(
           logger: createLogger('DISPATCH-PLANNER'),
         },
         options,
-      ),
+      );
+    },
   };
 
   const reconcileContext: ReconcileContext = {
@@ -425,6 +670,7 @@ export function createCore(
     state,
     logger: createLogger('RECONCILER'),
     mainBranch: config.mainBranch,
+    ...(panelBinding ? { panelBinding } : {}),
     dispatch: dispatchDeps,
   };
 
@@ -443,18 +689,19 @@ export function createCore(
     piGraceMs: config.piGraceMs,
   };
 
-  const mergeService = repo
-    ? new MergeService({
-        repo,
-        repoDir: config.repoDir,
-        state,
-        git,
-        github,
-        logger: createLogger('MERGE'),
-        notify: emitNotify,
-        mainBranch: config.mainBranch,
-      })
-    : null;
+  const mergeDeps: MergeServiceDeps & { panelBinding?: PanelBinding } = {
+    repo: repo ?? '',
+    repoDir: config.repoDir,
+    state,
+    git,
+    github,
+    logger: createLogger('MERGE'),
+    notify: emitNotify,
+    mainBranch: config.mainBranch,
+    trustedE2eRoot: workerDeps.browserE2eRoot ?? config.repoDir,
+    ...(panelBinding ? { panelBinding } : {}),
+  };
+  const mergeService = repo ? new MergeService(mergeDeps) : null;
 
   // 先建立可变的 core 引用，供 retryWorker 闭包回指统一作业生命周期。
   const core: Core = {
@@ -474,6 +721,7 @@ export function createCore(
     repo,
     workerRunner: runWorkerJob,
   };
+  runtimeCore = core;
 
   const retryBaselineDeps: RetryBaselineDeps = {
     repoDir: config.repoDir,
@@ -486,6 +734,7 @@ export function createCore(
     findExistingDelivery: (input) => findExistingDelivery(core, input),
     trustedE2eRoot: workerDeps.browserE2eRoot ?? config.repoDir,
     mainBranch: config.mainBranch,
+    ...(panelBinding ? { panelBinding } : {}),
     publishDispatchRevision: (input) => publishDispatchRevision(reconcileContext, input),
   };
   const commands = createCommands({
@@ -532,7 +781,10 @@ export async function reconcileWithPlanner(
   ctx: ReconcileContext,
   planner: ((spec: Spec) => Promise<string | null>) | null,
 ): Promise<ReconcileSummary | null> {
-  if (ctx.dispatch && !planner) {
+  // 统一派工路径自身会在冻结发布前调用 Planner 派生任务。即使 createCore
+  // 同时配置了旧版 Issue 正文 Planner，也必须经过同一 apply 路径，才能让
+  // 面板对账失败从 summary.specs 中剔除，避免旧路径绕过门禁。
+  if (ctx.dispatch) {
     return reconcileWithDispatch(ctx, ctx.dispatch);
   }
   const summary = await planForMain(ctx);
@@ -540,7 +792,6 @@ export async function reconcileWithPlanner(
   if (planner) {
     for (const op of summary.ops) {
       if ((op.kind === 'create' || op.kind === 'update') && op.spec) {
-        if (ctx.dispatch?.isGated(op.reqId)) continue;
         if (hasActiveRetryBaseline(ctx.state.snapshot(), op.reqId)) continue;
         const body = await planner(op.spec);
         if (body) {
@@ -635,15 +886,44 @@ async function refreshDispatchClaim(
   reqId: string,
   issueNumber: number,
 ): Promise<RefreshedDispatchClaim | null> {
+  const state = core.state.snapshot();
+  const localRevision = latestDispatchRevisionFor(state, reqId);
+  if (
+    !localRevision
+    || localRevision.issueNumber !== issueNumber
+    || dispatchRevisionBindingError(
+      localRevision,
+      activePanelBinding(core.config),
+      state,
+      core.repo,
+      core.config.mainBranch,
+    )
+  ) {
+    return null;
+  }
   let issue: ManagedIssue;
   let repoId: string;
   let events: DispatchLabelEvent[];
   try {
-    [issue, repoId, events] = await Promise.all([
-      core.github.getDispatchIssue(issueNumber),
+    const panelBinding = activePanelBinding(core.config);
+    const [remoteIssue, remoteRepoId, remoteEvents] = await Promise.all([
+      panelBinding && isPanelReqId(reqId)
+        ? core.github.listIssues().then((issues) => {
+            const selection = validateRegisteredPanelIssue({
+              binding: panelBinding,
+              issues,
+              state,
+            });
+            if (!selection.ok) throw new Error(selection.reason);
+            return selection.issue;
+          })
+        : core.github.getDispatchIssue(issueNumber),
       core.github.getDispatchRepositoryId(),
       core.github.listDispatchLabelEvents(issueNumber),
     ]);
+    issue = remoteIssue;
+    repoId = remoteRepoId;
+    events = remoteEvents;
   } catch (error) {
     core.logger.warn(
       `派工 ${reqId} 远端许可刷新失败，暂停领取: ${errorText(error)}`,
@@ -652,7 +932,8 @@ async function refreshDispatchClaim(
   }
   if (issue.state !== 'open' || issue.number !== issueNumber) return null;
 
-  const decision = evaluateDispatchClaim(core.state.snapshot(), reqId, {
+  const refreshedState = core.state.snapshot();
+  const decision = evaluateDispatchClaim(refreshedState, reqId, {
     repoId,
     issueNumber,
     labels: issue.labels,
@@ -660,6 +941,18 @@ async function refreshDispatchClaim(
     allowedActorIds: core.config.dispatchAllowedUserIds ?? [],
   });
   if (!decision.claimable) return null;
+  if (
+    decision.revision.issueNumber !== issue.number
+    || dispatchRevisionBindingError(
+      decision.revision,
+      activePanelBinding(core.config),
+      refreshedState,
+      core.repo,
+      core.config.mainBranch,
+    )
+  ) {
+    return null;
+  }
   return { revision: decision.revision, grant: decision.grant };
 }
 
@@ -667,11 +960,24 @@ async function refreshDispatchClaim(
  * 生产运行时唯一的计数器开工门禁。远端标签与事件只决定是否可领取，
  * 本地状态更新再原子占用全局 Pi 名额和本版作业，避免并发轮询重复启动。
  */
-async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<WorkerTarget | null> {
+async function claimDispatchTarget(
+  core: Core,
+  target: WorkerTarget,
+): Promise<WorkerTarget | null> {
   const deps = core.reconcileContext.dispatch;
+  const panelBinding = activePanelBinding(core.config);
+  const profile = deliveryProfile(target.reqId, panelBinding);
+  if (
+    (isPanelReqId(target.reqId) && !profile)
+    || (profile !== undefined && profile.specPath !== target.spec.path)
+  ) {
+    return null;
+  }
   if (!deps?.isGated(target.reqId)) {
     // 已有派工历史但门禁已失效时 fail closed，不能退回旧 REQ 直通路径。
-    if (hasDispatchHistory(core.state.snapshot(), target.reqId)) return null;
+    if (isPanelReqId(target.reqId) || hasDispatchHistory(core.state.snapshot(), target.reqId)) {
+      return null;
+    }
     return target;
   }
 
@@ -680,6 +986,13 @@ async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<Wo
   if (
     !revision ||
     !dispatchTargetMatchesRevision(target, revision) ||
+    dispatchRevisionBindingError(
+      revision,
+      panelBinding,
+      initial,
+      core.repo,
+      core.config.mainBranch,
+    ) ||
     hasActivePiJob(initial) ||
     hasJobForRevision(initial, target.reqId, revision.revision)
   ) {
@@ -714,6 +1027,13 @@ async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<Wo
       return undefined;
     }
     current.grant = refreshed.grant;
+    current.observation = {
+      state: 'authorized',
+      observedAt: observationTime(
+        current.publishedAt!,
+        current.observation?.observedAt,
+      ),
+    };
     state.jobs[jobId] = {
       jobId,
       reqId: target.reqId,
@@ -735,7 +1055,28 @@ async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<Wo
   return {
     ...target,
     jobId,
-    dispatchRevision: refreshed.revision,
+    dispatchRevision: canonicalDispatchRevision(refreshed.revision),
+  };
+}
+
+/**
+ * Worker 只接收稳定冻结身份和任务。observation 会随每轮核验刷新，grant 则属于
+ * 当次真实领取，两者都留在 state/job 供审计，不能混入 Worker 的冻结输入。
+ */
+function canonicalDispatchRevision(revision: DispatchRevision): DispatchRevision {
+  return {
+    reqId: revision.reqId,
+    repoId: revision.repoId,
+    revision: revision.revision,
+    issueNumber: revision.issueNumber,
+    specHash: revision.specHash,
+    specPath: revision.specPath,
+    sourceMainSha: revision.sourceMainSha,
+    task: revision.task,
+    ...(revision.publishedAt === undefined ? {} : { publishedAt: revision.publishedAt }),
+    ...(revision.publicationCommentId === undefined
+      ? {}
+      : { publicationCommentId: revision.publicationCommentId }),
   };
 }
 
@@ -745,21 +1086,62 @@ async function claimDispatchTarget(core: Core, target: WorkerTarget): Promise<Wo
  */
 async function checkDispatchRevisionCurrent(
   git: GitClient,
+  github: GithubClient,
+  state: StateStore,
   repoDir: string,
   mainBranch: string,
+  repo: string | null,
+  panelBinding: PanelBinding | undefined,
+  allowedActorIds: readonly string[],
   revision: DispatchRevision,
 ): Promise<boolean> {
   try {
+    const snapshot = state.snapshot();
+    if (dispatchRevisionBindingError(revision, panelBinding, snapshot, repo, mainBranch)) {
+      return false;
+    }
+    const [issue, repoId, events] = await Promise.all([
+      github.getDispatchIssue(revision.issueNumber),
+      github.getDispatchRepositoryId(),
+      github.listDispatchLabelEvents(revision.issueNumber),
+    ]);
+    if (issue.state !== 'open' || issue.number !== revision.issueNumber) return false;
+    const claim = evaluateDispatchClaim(snapshot, revision.reqId, {
+      repoId,
+      issueNumber: revision.issueNumber,
+      labels: issue.labels,
+      events,
+      allowedActorIds,
+    });
+    if (
+      !claim.claimable
+      || claim.revision.reqId !== revision.reqId
+      || claim.revision.revision !== revision.revision
+      || claim.revision.issueNumber !== revision.issueNumber
+      || claim.revision.specPath !== revision.specPath
+      || claim.revision.specHash !== revision.specHash
+      || claim.revision.sourceMainSha !== revision.sourceMainSha
+    ) {
+      return false;
+    }
     await git.fetch(repoDir, mainBranch);
     const current = (await git.revParse(repoDir, `origin/${mainBranch}`)).trim().toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(current)) return false;
     if (!(await git.isAncestor(repoDir, revision.sourceMainSha, current))) return false;
-    // 沿第一父链检查冻结 SHA 之后到当前 HEAD 之间是否改过本需求块；
-    // 哪怕内容改后再改回（A→B→A）也必须视为过期，不能只看旧快照。
+    // 沿第一父链检查冻结 SHA 之后到当前 HEAD 之间的本需求块。同一份规格文件的
+    // 前言或其他需求可以演进，但目标块在任一触及该文件的提交里发生变化都必须
+    // 失效；内容改后再改回（A→B→A）也因中间提交不匹配而无法复用旧版本。
     const commits = await git.firstParentCommits(repoDir, revision.sourceMainSha, current);
     for (const sha of commits) {
       const changed = await git.changedPathsFirstParent(repoDir, sha);
-      if (changed.includes(revision.specPath)) return false;
+      if (!changed.includes(revision.specPath)) continue;
+      const content = await git.showFile(repoDir, sha, revision.specPath);
+      const parsedCommit = parseSpecs({ [revision.specPath]: content });
+      if (parsedCommit.errors.length > 0) return false;
+      const matches = parsedCommit.specs.filter(
+        (spec) => spec.id === revision.reqId && spec.path === revision.specPath,
+      );
+      if (matches.length !== 1 || matches[0]?.hash !== revision.specHash) return false;
     }
     // 当前 HEAD 的需求块仍须与冻结记录同一身份（需求 ID / 路径 / 哈希）。
     const files = await git.readSpecSnapshot(repoDir, current);
@@ -770,6 +1152,140 @@ async function checkDispatchRevisionCurrent(
     );
   } catch {
     return false;
+  }
+}
+
+function observationTime(publishedAt: string, previousObservedAt?: string): string {
+  const now = Date.now();
+  const published = Date.parse(publishedAt);
+  const previous = previousObservedAt === undefined
+    ? Number.NEGATIVE_INFINITY
+    : Date.parse(previousObservedAt);
+  const lowerBound = Number.isFinite(published) ? published : now;
+  const previousBound = Number.isFinite(previous) ? previous + 1 : Number.NEGATIVE_INFINITY;
+  return new Date(Math.max(now, lowerBound, previousBound)).toISOString();
+}
+
+async function persistDispatchObservation(
+  core: Core,
+  reqId: string,
+  revisionNumber: number,
+  state: 'awaiting-label' | 'authorized' | 'unverified',
+): Promise<void> {
+  await core.state.update((current) => {
+    const requirement = current.requirements[reqId];
+    const revision = latestDispatchRevisionFor(current, reqId);
+    if (
+      !requirement ||
+      !revision ||
+      revision.revision !== revisionNumber ||
+      hasJobForRevision(current, reqId, revisionNumber) ||
+      revision.issueNumber !== requirement.issueNumber ||
+      revision.specHash !== requirement.specHash ||
+      revision.specPath !== requirement.specPath ||
+      revision.sourceMainSha !== requirement.sourceMainSha
+    ) {
+      return undefined;
+    }
+    revision.observation = {
+      state,
+      observedAt: observationTime(
+        revision.publishedAt!,
+        revision.observation?.observedAt,
+      ),
+    };
+    return undefined;
+  });
+}
+
+async function observeDispatchRevision(core: Core, revision: DispatchRevision): Promise<void> {
+  const panelBinding = activePanelBinding(core.config);
+  const snapshot = core.state.snapshot();
+  const bindingError = dispatchRevisionBindingError(
+    revision,
+    panelBinding,
+    snapshot,
+    core.repo,
+    core.config.mainBranch,
+  );
+  if (bindingError) {
+    await persistDispatchObservation(
+      core,
+      revision.reqId,
+      revision.revision,
+      'unverified',
+    );
+    return;
+  }
+
+  try {
+    const [issue, repoId, events] = await Promise.all([
+      panelBinding && isPanelReqId(revision.reqId)
+        ? core.github.listIssues().then((issues) => {
+            const selection = validateRegisteredPanelIssue({
+              binding: panelBinding,
+              issues,
+              state: snapshot,
+            });
+            if (!selection.ok) throw new Error(selection.reason);
+            return selection.issue;
+          })
+        : core.github.getDispatchIssue(revision.issueNumber),
+      core.github.getDispatchRepositoryId(),
+      core.github.listDispatchLabelEvents(revision.issueNumber),
+    ]);
+    if (issue.state !== 'open' || issue.number !== revision.issueNumber) {
+      await persistDispatchObservation(
+        core,
+        revision.reqId,
+        revision.revision,
+        'unverified',
+      );
+      return;
+    }
+    const decision = evaluateDispatchObservation(revision, {
+      repoId,
+      issueNumber: revision.issueNumber,
+      labels: issue.labels,
+      events,
+      allowedActorIds: core.config.dispatchAllowedUserIds ?? [],
+    });
+    await persistDispatchObservation(
+      core,
+      revision.reqId,
+      revision.revision,
+      decision.state,
+    );
+  } catch (error) {
+    core.logger.warn(
+      `派工 ${revision.reqId} r${revision.revision} 观察失败，记录待核实: ${errorText(error)}`,
+    );
+    await persistDispatchObservation(
+      core,
+      revision.reqId,
+      revision.revision,
+      'unverified',
+    );
+  }
+}
+
+/**
+ * 在判断全局 Pi 名额之前观察所有已公布且尚未领取的最新版本。
+ * 标签繁忙/名额占用只影响真实领取，不得让等待面板永远停留在无 observation。
+ */
+async function observePublishedDispatchRevisions(core: Core): Promise<void> {
+  const snapshot = core.state.snapshot();
+  for (const [reqId, revisions] of Object.entries(snapshot.dispatchRevisions ?? {})) {
+    const revision = revisions.at(-1);
+    if (
+      !revision
+      || revision.reqId !== reqId
+      || !isPublishedDispatchRevision(revision)
+      || hasJobForRevision(snapshot, reqId, revision.revision)
+    ) {
+      continue;
+    }
+    await observeDispatchRevision(core, revision);
   }
 }
 
@@ -1141,6 +1657,20 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
   const jobId = input.jobId;
   const snapshot = core.state.snapshot();
   const requirement = snapshot.requirements[input.reqId];
+  const panelBinding = activePanelBinding(core.config);
+  const profile = deliveryProfile(input.reqId, panelBinding);
+  if (
+    (isPanelReqId(input.reqId) && !profile)
+    || (profile !== undefined && profile.specPath !== input.spec.path)
+  ) {
+    const stale: WorkerOutcome = {
+      status: 'stale',
+      error: `需求 ${input.reqId} 的规格路径不属于当前受信交付 profile，拒绝启动`,
+      failureStage: 'publish',
+    };
+    await notifyBestEffort(core, `⏭️ ${input.reqId} 未配置受信交付绑定，Worker 未启动`);
+    return stale;
+  }
   // 受管派工需求以生产门禁 isGated 为准，并用已存在历史兜底，防止首次发布记录
   // 落盘前的直接重试绕过领取。旧 REQ 需求既无门禁也无历史，保持原直通行为。
   const isGatedReq = core.reconcileContext?.dispatch?.isGated(input.reqId) ?? false;
@@ -1189,6 +1719,7 @@ export async function runOneWorkerForInput(core: Core, input: WorkerInput): Prom
   if (
     !requirement ||
     requirement.issueNumber !== input.issueNumber ||
+    requirement.specPath !== input.spec.path ||
     requirement.specHash !== input.spec.hash ||
     requirement.sourceMainSha !== input.sourceMainSha ||
     (input.dispatchRevision !== undefined &&
@@ -1399,7 +1930,12 @@ export async function runOneWorker(core: Core, target: WorkerTarget): Promise<Wo
   return runOneWorkerForInput(core, input);
 }
 
-const runOnceQueues = new WeakMap<Core, Promise<void>>();
+/**
+ * runOnce 的互斥键是受管状态文件，而不是 Core 实例。
+ * 测试和受支持的单进程入口可能为同一状态文件创建多个 Core；只按实例加锁会让
+ * 两个旧快照同时领取同一需求并产生重复 Worker/PR。
+ */
+const runOnceQueues = new Map<string, Promise<void>>();
 
 async function runOnceUnlocked(core: Core): Promise<{
   summary: ReconcileSummary | null;
@@ -1428,6 +1964,7 @@ async function runOnceUnlocked(core: Core): Promise<{
   // applyReconciliation 关键操作失败会抛错（不推进游标），此处不捕获：
   // 异常向上传播，跳过 Worker 派发与部署，等待下轮重放差量。
   const summary = await reconcileWithPlanner(core.reconcileContext, core.planner);
+  await observePublishedDispatchRevisions(core);
   const workers: WorkerOutcome[] = [];
   if (summary) {
     const targets = pickWorkerTargets(core.state.snapshot(), summary.specs);
@@ -1441,26 +1978,30 @@ async function runOnceUnlocked(core: Core): Promise<{
   return { summary, workers, deploy };
 }
 
-/** 同一 Core 的轮询串行执行，避免并发 fetch 抢同一个 origin/main 跟踪引用。 */
+/** 同一受管状态文件的轮询串行执行，避免并发 fetch 与跨实例旧快照重复领取。 */
 export async function runOnce(core: Core): Promise<{
   summary: ReconcileSummary | null;
   workers: WorkerOutcome[];
   deploy: DeployResult;
 }> {
-  const previous = runOnceQueues.get(core) ?? Promise.resolve();
+  const stateFile = resolve(core.config.stateFile);
+  const previous = runOnceQueues.get(stateFile) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
   const tail = previous.then(() => current);
-  runOnceQueues.set(core, tail);
+  runOnceQueues.set(stateFile, tail);
   await previous;
   try {
+    // Core 构造时读取的状态可能已被前一个实例的完整轮次推进；取得文件级队列后
+    // 必须从同一受管文件重读，不能继续使用领取前的旧内存快照。
+    core.state.load();
     return await runOnceUnlocked(core);
   } finally {
     release();
-    if (runOnceQueues.get(core) === tail) {
-      runOnceQueues.delete(core);
+    if (runOnceQueues.get(stateFile) === tail) {
+      runOnceQueues.delete(stateFile);
     }
   }
 }

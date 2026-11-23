@@ -5,6 +5,11 @@ import {
   BASELINE_OPERATION_RE,
 } from './retry-baseline.ts';
 import {
+  PANEL_REQ_ID,
+  PANEL_SPEC_PATH,
+  isRegisteredSpecPath,
+} from './delivery-profile.ts';
+import {
   emptyState,
   type DispatchRevision,
   type RetryBaselineState,
@@ -44,10 +49,16 @@ export class StateStore {
     try {
       const parsed = JSON.parse(raw) as OrchestratorState;
       if (parsed && typeof parsed === 'object' && parsed.schemaVersion === 1) {
+        // schemaVersion=1 的旧状态可能没有 requirements 字段，按空容器兼容；
+        // 显式 null、数组或畸形容器仍由 normalizeRequirements fail closed。
+        if (parsed.requirements === undefined) {
+          parsed.requirements = {};
+        }
         parsed.specRequests ??= {};
         for (const req of Object.values(parsed.specRequests)) {
           normalizeSpecRequest(req);
         }
+        normalizeRequirements(parsed.requirements);
         parsed.mergeRequests ??= {};
         for (const merge of Object.values(parsed.mergeRequests)) {
           normalizeMergeRequest(merge);
@@ -114,6 +125,27 @@ export class StateStore {
   }
 }
 
+/** 需求只能绑定直属规格或唯一受信 pending 面板路径；任何未登记子路径立即拒绝加载。 */
+function normalizeRequirements(requirements: OrchestratorState['requirements']): void {
+  if (!requirements || typeof requirements !== 'object' || Array.isArray(requirements)) {
+    throw new Error('requirements 必须是对象容器');
+  }
+  for (const [reqId, requirement] of Object.entries(requirements)) {
+    if (
+      !reqId ||
+      !requirement ||
+      typeof requirement !== 'object' ||
+      Array.isArray(requirement) ||
+      typeof requirement.specPath !== 'string' ||
+      !isRegisteredSpecPath(requirement.specPath) ||
+      (requirement.specPath === PANEL_SPEC_PATH && reqId !== PANEL_REQ_ID) ||
+      (reqId === PANEL_REQ_ID && requirement.specPath !== PANEL_SPEC_PATH)
+    ) {
+      throw new Error(`requirements 记录畸形或规格路径未登记: ${reqId || 'unknown'}`);
+    }
+  }
+}
+
 function normalizeSpecRequest(req: SpecRequest): void {
   req.hasValidDoc ??= Boolean(req.docContent);
   req.labelsSynced ??= false;
@@ -169,7 +201,9 @@ function normalizeRetryBaseline(baseline: RetryBaselineState): void {
     !Number.isSafeInteger(baseline.issueNumber) ||
     baseline.issueNumber <= 0 ||
     typeof baseline.specPath !== 'string' ||
-    !/^docs\/specs\/[^/]+\.md$/.test(baseline.specPath) ||
+    !isRegisteredSpecPath(baseline.specPath) ||
+    (baseline.specPath === PANEL_SPEC_PATH && baseline.reqId !== PANEL_REQ_ID) ||
+    (baseline.reqId === PANEL_REQ_ID && baseline.specPath !== PANEL_SPEC_PATH) ||
     typeof baseline.specHash !== 'string' ||
     !SPEC_HASH_RE.test(baseline.specHash) ||
     typeof baseline.fromJobId !== 'string' ||

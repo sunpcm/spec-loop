@@ -6,12 +6,23 @@ import {
   nextDispatchRevision,
   validateDispatchTask,
 } from './dispatch-task.ts';
+import {
+  PANEL_REQ_ID,
+  PANEL_SPEC_PATH,
+  isValidPanelBinding,
+  sameRepositoryId,
+  type PanelBinding,
+} from './delivery-profile.ts';
 import type { GithubClient } from './github.ts';
 import type { GitClient } from './git.ts';
 import type { Logger } from './log.ts';
+import { selectPanelIssue } from './panel-registration.ts';
 import {
   buildDispatchIssueBody,
   buildDispatchRevisionComment,
+  extractHumanArea,
+  HUMAN_AREA_BEGIN,
+  HUMAN_AREA_END,
   preserveHumanArea,
   planReconciliation,
   type ReconcileOp,
@@ -43,6 +54,8 @@ export interface ReconcileContext {
   logger: Logger;
   mainBranch?: string;
   retryBaselines?: RetryBaselineDeps;
+  /** 仅在显式受信配置下启用 REQ-PANEL-01；未配置时不得回退旧版面板处理。 */
+  panelBinding?: PanelBinding;
   /** 派工门禁依赖；未配置时走旧版 Issue 对账，配置后门禁需求走冻结发布。 */
   dispatch?: DispatchReconcileDeps;
 }
@@ -86,16 +99,123 @@ export function previousSpecsFromState(
   }));
 }
 
+function panelBindingForContext(ctx: ReconcileContext): PanelBinding | undefined {
+  if (!ctx.panelBinding) return undefined;
+  if (!isValidPanelBinding(ctx.panelBinding)) {
+    ctx.logger.warn('面板绑定形态非法，本轮忽略面板需求；其他需求继续对账');
+    return undefined;
+  }
+  return ctx.panelBinding;
+}
+
+function splitPanelSnapshot(
+  files: Record<string, string>,
+  panelEnabled: boolean,
+): { direct: Record<string, string>; panelText?: string } {
+  const direct: Record<string, string> = {};
+  for (const [path, content] of Object.entries(files)) {
+    if (path !== PANEL_SPEC_PATH) direct[path] = content;
+  }
+  return panelEnabled && files[PANEL_SPEC_PATH] !== undefined
+    ? { direct, panelText: files[PANEL_SPEC_PATH] }
+    : { direct };
+}
+
+function parsePanelText(
+  ctx: ReconcileContext,
+  panelText: string | undefined,
+): Spec | undefined {
+  if (panelText === undefined) return undefined;
+  const parsed = parseSpecs({ [PANEL_SPEC_PATH]: panelText });
+  if (parsed.errors.length > 0) {
+    ctx.logger.warn(
+      `面板需求解析失败，仅跳过面板: ${parsed.errors.map((error) => error.reason).join('; ')}`,
+    );
+    return undefined;
+  }
+  const matches = parsed.specs.filter((spec) => spec.id === PANEL_REQ_ID);
+  if (matches.length !== 1) {
+    ctx.logger.warn(`面板暂存文件必须恰含一个 ${PANEL_REQ_ID}，仅跳过面板`);
+    return undefined;
+  }
+  return matches[0];
+}
+
+async function planPanelOperation(
+  ctx: ReconcileContext,
+  binding: PanelBinding,
+  targetMainSha: string,
+  spec: Spec,
+  issues: Awaited<ReturnType<GithubClient['listIssues']>>,
+): Promise<ReconcileOp | null> {
+  try {
+    if (!ctx.dispatch) {
+      throw new Error('未配置统一派工门禁，不能登记或发布面板需求');
+    }
+    const mainBranch = ctx.mainBranch ?? 'main';
+    if (mainBranch !== binding.mainBranch) {
+      throw new Error(`当前主线 ${mainBranch} 与面板绑定 ${binding.mainBranch} 不一致`);
+    }
+    const state = ctx.state.snapshot();
+    if (state.repo !== binding.repo) {
+      throw new Error(`本地状态仓库 ${state.repo ?? '未设置'} 与面板绑定 ${binding.repo} 不一致`);
+    }
+    const repoId = await ctx.github.getDispatchRepositoryId();
+    if (!sameRepositoryId(repoId, binding.repositoryId)) {
+      throw new Error(`远端仓库 ID ${repoId} 与面板绑定 ${binding.repositoryId} 不一致`);
+    }
+    const selection = selectPanelIssue({ binding, issues, state });
+    if (!selection.ok) throw new Error(selection.reason);
+    // 来源 SHA/哈希只用于证明首次接续对象的可信性。登记后允许同一 Issue
+    // 随主线改版，并由既有派工版本与第一父链变更检查约束。
+    if (!selection.registered) {
+      if (!(await ctx.git.isAncestor(ctx.repoDir, binding.confirmedMainSha, targetMainSha))) {
+        throw new Error(`确认锚点 ${binding.confirmedMainSha} 不是当前主线的祖先`);
+      }
+      const anchorFiles = await ctx.git.readSpecSnapshot(ctx.repoDir, binding.confirmedMainSha);
+      const anchorText = anchorFiles[PANEL_SPEC_PATH];
+      if (anchorText === undefined) {
+        throw new Error(`确认锚点未提供受信路径 ${PANEL_SPEC_PATH}`);
+      }
+      const anchorSpec = parsePanelText(ctx, anchorText);
+      if (!anchorSpec || anchorSpec.hash !== binding.specHash) {
+        throw new Error('确认锚点的面板需求块哈希与受信绑定不一致');
+      }
+    }
+    return {
+      kind: 'panel',
+      reqId: PANEL_REQ_ID,
+      issueNumber: selection.issue.number,
+      spec,
+      title: selection.issue.title,
+      operationKey: `${spec.hash}:panel:${binding.issueNumber}`,
+    };
+  } catch (error) {
+    ctx.logger.warn(
+      `面板需求保持待核实，不影响其他需求: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
+}
+
 export async function planForMain(ctx: ReconcileContext): Promise<ReconcileSummary | null> {
   const mainBranch = ctx.mainBranch ?? 'main';
+  const panelBinding = panelBindingForContext(ctx);
+  const panelEnabled = panelBinding !== undefined;
   await ctx.git.fetch(ctx.repoDir, mainBranch);
   const targetMainSha = await ctx.git.revParse(ctx.repoDir, `origin/${mainBranch}`);
-  const files = await ctx.git.readSpecSnapshot(ctx.repoDir, targetMainSha);
-  const parsed = parseSpecs(files);
+  const targetFiles = await ctx.git.readSpecSnapshot(ctx.repoDir, targetMainSha);
+  const targetSnapshot = splitPanelSnapshot(targetFiles, panelEnabled);
+  const parsed = parseSpecs(targetSnapshot.direct);
   if (parsed.errors.length > 0) {
     ctx.logger.warn(`需求解析失败，本轮不执行对账: ${parsed.errors.map((e) => e.reason).join('; ')}`);
     return null;
   }
+  if (parsed.specs.some((spec) => spec.id === PANEL_REQ_ID)) {
+    ctx.logger.warn(`${PANEL_REQ_ID} 出现在未受信路径，仅忽略该面板需求`);
+  }
+  const directSpecs = parsed.specs.filter((spec) => spec.id !== PANEL_REQ_ID);
+  const panelSpec = parsePanelText(ctx, targetSnapshot.panelText);
   const state = ctx.state.snapshot();
   const cursor = state.cursorMainSha;
   let previous: Spec[] = [];
@@ -107,18 +227,30 @@ export async function planForMain(ctx: ReconcileContext): Promise<ReconcileSumma
       return null;
     }
     const baselineFiles = await ctx.git.readSpecSnapshot(ctx.repoDir, cursor);
-    const baselineParsed = parseSpecs(baselineFiles);
+    const baselineSnapshot = splitPanelSnapshot(baselineFiles, panelEnabled);
+    const baselineParsed = parseSpecs(baselineSnapshot.direct);
     if (baselineParsed.errors.length > 0) {
       ctx.logger.warn(`游标基线解析失败，跳过本轮对账: ${baselineParsed.errors.map((e) => e.reason).join('; ')}`);
       return null;
     }
-    previous = baselineParsed.specs;
+    previous = baselineParsed.specs.filter((spec) => spec.id !== PANEL_REQ_ID);
   }
-  const diff = diffSpecs(previous, parsed.specs);
+  const diff = diffSpecs(previous, directSpecs);
   const issues = await ctx.github.listIssues();
   const prs = await ctx.github.listPRs();
   const ops = planReconciliation(diff, issues, targetMainSha, prs);
-  return { targetMainSha, ops, specs: parsed.specs };
+  let panelEligible = false;
+  if (panelBinding && panelSpec) {
+    const panelOp = await planPanelOperation(ctx, panelBinding, targetMainSha, panelSpec, issues);
+    if (panelOp) {
+      ops.push(panelOp);
+      panelEligible = true;
+    }
+  }
+  // 面板只有在本轮唯一核对通过并形成独立操作时才进入 Worker 候选。
+  // 歧义、错卡或错来源不得借旧 requirement/rN 继续走普通派工。
+  const specs = panelEligible && panelSpec ? [...directSpecs, panelSpec] : directSpecs;
+  return { targetMainSha, ops, specs };
 }
 
 /** 单个旧版对账操作的落地；失败直接抛出，由外层统一决定是否推进游标。 */
@@ -221,6 +353,10 @@ export async function applyReconciliation(
   let failed = false;
   for (const op of ops) {
     try {
+      if (op.kind === 'panel') {
+        ctx.logger.warn('未配置统一派工门禁，拒绝回退旧版面板处理');
+        continue;
+      }
       await applyLegacyOperation(ctx, op, targetMainSha);
     } catch (error) {
       failed = true;
@@ -256,7 +392,15 @@ export async function reconcileWithDispatch(
 ): Promise<ReconcileSummary | null> {
   const summary = await planForMain(ctx);
   if (!summary) return null;
-  await applyReconciliationWithDispatch(ctx, summary.ops, summary.targetMainSha, deps);
+  const panelEligible = await applyReconciliationWithDispatch(
+    ctx,
+    summary.ops,
+    summary.targetMainSha,
+    deps,
+  );
+  if (!panelEligible) {
+    summary.specs = summary.specs.filter((spec) => spec.id !== PANEL_REQ_ID);
+  }
   return summary;
 }
 
@@ -289,7 +433,7 @@ async function applyReconciliationWithDispatch(
   ops: ReconcileOp[],
   targetMainSha: string,
   deps: DispatchReconcileDeps,
-): Promise<void> {
+): Promise<boolean> {
   const blocked = ops.find(
     (op) =>
       (op.kind === 'create' || op.kind === 'update' || op.kind === 'close') &&
@@ -307,12 +451,32 @@ async function applyReconciliationWithDispatch(
     ? await specBlockChangedInWindow(ctx, cursor, targetMainSha)
     : async () => false;
 
-  const needsRepoId = ops.some((op) => isGatedDispatchOp(op, deps));
+  const needsRepoId = ops.some(
+    (op) => op.kind === 'panel' || isGatedDispatchOp(op, deps),
+  );
   const repoId = needsRepoId ? await ctx.github.getDispatchRepositoryId() : undefined;
 
   let failed = false;
+  let panelEligible = true;
   for (const op of ops) {
     try {
+      if (op.kind === 'panel') {
+        panelEligible = false;
+        if (hasActiveRetryBaseline(ctx.state.snapshot(), op.reqId)) {
+          ctx.logger.warn(`需求 ${op.reqId} 有未决显式重试准备，暂不接续面板卡`);
+          continue;
+        }
+        await applyPanelRequirement(
+          ctx,
+          deps,
+          op,
+          targetMainSha,
+          repoId!,
+          blockChangedInWindow,
+        );
+        panelEligible = true;
+        continue;
+      }
       if (op.kind === 'close' && deps.isGated(op.reqId)) {
         await applyLegacyOperation(ctx, op, targetMainSha);
         ctx.logger.info(`关闭任务并保留派工历史 #${op.issueNumber ?? '?'}（${op.reqId}）`);
@@ -324,6 +488,12 @@ async function applyReconciliationWithDispatch(
       }
       await applyLegacyOperation(ctx, op, targetMainSha);
     } catch (error) {
+      if (op.kind === 'panel') {
+        ctx.logger.warn(
+          `面板对账失败，仅暂停面板并保留后续轮询修复: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        continue;
+      }
       failed = true;
       ctx.logger.warn(`对账操作 ${op.kind}(${op.reqId}) 失败: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -338,6 +508,7 @@ async function applyReconciliationWithDispatch(
     s.cursorMainSha = targetMainSha;
     return undefined;
   });
+  return panelEligible;
 }
 
 function isGatedDispatchOp(op: ReconcileOp, deps: DispatchReconcileDeps): boolean {
@@ -376,12 +547,108 @@ async function specBlockHashAt(
   id: string,
   sha: string,
 ): Promise<string> {
-  const content = await ctx.git.showFile(ctx.repoDir, sha, path);
+  // 明确缺失的路径应表达为空需求块；Git 执行或快照读取故障仍由 GitClient 抛出。
+  const snapshot = await ctx.git.readSpecSnapshot(ctx.repoDir, sha);
+  const content = snapshot[path];
+  if (content === undefined) return '';
   const parsed = parseSpecs({ [path]: content });
   if (parsed.errors.length > 0) {
     throw new Error(`需求块解析失败（${id} @ ${sha}），拒绝推进对账`);
   }
   return parsed.specs.find((candidate) => candidate.id === id)?.hash ?? '';
+}
+
+/**
+ * 面板独立对账：只接续受信编号上的既有卡，并复用统一冻结/发布。
+ * 已完成同版发布时只修复本地绑定；尚未发布、改版或离线 A→B→A 时走原门禁。
+ */
+async function applyPanelRequirement(
+  ctx: ReconcileContext,
+  deps: DispatchReconcileDeps,
+  op: ReconcileOp,
+  _targetMainSha: string,
+  repoId: string,
+  blockChangedInWindow: (spec: Spec) => Promise<boolean>,
+): Promise<void> {
+  const binding = ctx.panelBinding;
+  if (!binding || !isValidPanelBinding(binding)) {
+    throw new Error('面板绑定缺失或非法，拒绝处理面板需求');
+  }
+  if ((ctx.mainBranch ?? 'main') !== binding.mainBranch) {
+    throw new Error('当前主线与面板绑定不一致，拒绝处理面板需求');
+  }
+  const state = ctx.state.snapshot();
+  if (state.repo !== binding.repo) {
+    throw new Error('当前状态仓库与面板绑定不一致，拒绝处理面板需求');
+  }
+  if (!sameRepositoryId(repoId, binding.repositoryId)) {
+    throw new Error('当前仓库数字 ID 与面板绑定不一致，拒绝处理面板需求');
+  }
+  if (
+    op.reqId !== PANEL_REQ_ID
+    || op.issueNumber !== binding.issueNumber
+    || !op.spec
+    || op.spec.id !== PANEL_REQ_ID
+    || op.spec.path !== PANEL_SPEC_PATH
+  ) {
+    throw new Error('面板对账操作身份不完整或越出受信绑定');
+  }
+
+  const currentIssue = await ctx.github.getDispatchIssue(binding.issueNumber);
+  const currentSelection = selectPanelIssue({
+    binding,
+    issues: [currentIssue],
+    state,
+  });
+  if (!currentSelection.ok) throw new Error(currentSelection.reason);
+
+  const latest = latestRevisionFor(ctx, PANEL_REQ_ID);
+  if (latest && latest.issueNumber !== binding.issueNumber) {
+    throw new Error(`面板历史绑定 #${latest.issueNumber}，与受信卡 #${binding.issueNumber} 不一致`);
+  }
+  const sameCurrentVersion = Boolean(
+    latest
+    && latest.specHash === op.spec.hash
+    && latest.specPath === PANEL_SPEC_PATH,
+  );
+  const changedInWindow = sameCurrentVersion
+    ? await blockChangedInWindow(op.spec)
+    : false;
+
+  if (
+    latest
+    && sameCurrentVersion
+    && !changedInWindow
+    && latest.publishedAt !== undefined
+    && latest.publicationCommentId !== undefined
+  ) {
+    const requirement = state.requirements[PANEL_REQ_ID];
+    if (
+      !requirement
+      || requirement.issueNumber !== binding.issueNumber
+      || requirement.specHash !== latest.specHash
+      || requirement.specPath !== latest.specPath
+      || requirement.sourceMainSha !== latest.sourceMainSha
+    ) {
+      await persistRequirement(
+        ctx,
+        PANEL_REQ_ID,
+        binding.issueNumber,
+        op.spec,
+        latest.sourceMainSha,
+      );
+    }
+    return;
+  }
+
+  await applyGatedRequirement(
+    ctx,
+    deps,
+    { ...op, kind: 'update' },
+    _targetMainSha,
+    repoId,
+    blockChangedInWindow,
+  );
 }
 
 /** 门禁需求的 create/update/noop 落地；create 先建 Issue，update 先修复状态，再冻结发布。 */
@@ -599,10 +866,10 @@ async function applyGatedDispatch(
   }
 
   const currentIssue = await ctx.github.getDispatchIssue(issueNumber);
-  const nextBody = preserveHumanArea(
-    currentIssue.body,
-    buildDispatchIssueBody(spec, targetMainSha, revision),
-  );
+  const generatedBody = buildDispatchIssueBody(spec, targetMainSha, revision);
+  const nextBody = spec.id === PANEL_REQ_ID
+    ? preservePanelHandover(currentIssue.body, generatedBody)
+    : preserveHumanArea(currentIssue.body, generatedBody);
   await ctx.github.updateIssueBody(issueNumber, nextBody);
   await ctx.github.ensureDispatchLabel(dispatchLabel(revision.revision));
   const staleLabels = staleDispatchLabels(currentIssue.labels, revision.revision);
@@ -626,6 +893,27 @@ async function applyGatedDispatch(
   }
   ctx.logger.info(`发布派工版本 r${revision.revision}（${spec.id}，Issue #${issueNumber}）`);
   return finalRevision;
+}
+
+/** 首次接续普通卡时把原正文完整收进人工区，后续版本继续按既有标记保留。 */
+function preservePanelHandover(existingBody: string, nextBody: string): string {
+  if (extractHumanArea(existingBody) !== null) {
+    return preserveHumanArea(existingBody, nextBody);
+  }
+  const handover = existingBody.trim();
+  if (!handover) return nextBody;
+  const start = nextBody.indexOf(HUMAN_AREA_BEGIN);
+  const end = nextBody.indexOf(HUMAN_AREA_END, start);
+  if (start < 0 || end < 0) {
+    throw new Error('面板派工正文缺少人工区标记，拒绝覆盖原卡');
+  }
+  return [
+    nextBody.slice(0, start + HUMAN_AREA_BEGIN.length),
+    '',
+    handover,
+    '',
+    nextBody.slice(end),
+  ].join('\n');
 }
 
 /**

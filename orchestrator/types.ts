@@ -52,6 +52,16 @@ export interface ManagedPR {
 
 export type StatusLabel = 'todo' | 'processing' | 'in-review' | 'done' | 'failed' | 'satisfied';
 
+/** 健康检查通过后，经 GitHub 幂等回读并确认属于同一作业、PR 与任务版本的部署回执。 */
+export interface JobDeployReceipt {
+  issueNumber: number;
+  prNumber: number;
+  dispatchRevision?: number;
+  mergeSha: string;
+  commentId: number;
+  recordedAt: string;
+}
+
 export interface JobState {
   jobId: string;
   reqId: string;
@@ -73,6 +83,11 @@ export interface JobState {
   dispatchRevision?: number;
   /** 领取本次作业的许可事件 ID，用于持久去重。 */
   grantEventId?: number;
+  /**
+   * 部署或回执重试完成健康检查后写入；仅在 GitHub 评论已按确定 marker 幂等回读、
+   * 且 Issue/PR/版本/merge SHA 均与同一作业一致时存在。
+   */
+  deployReceipt?: JobDeployReceipt;
 }
 
 export interface RequirementState {
@@ -108,6 +123,22 @@ export interface DispatchGrant {
 }
 
 /**
+ * 发布后一次已核验的本版许可读取结果。
+ *
+ * - awaiting-label：当次读取成功，并确认当前 Issue 没有有效本版许可；
+ * - authorized：当次读取成功，并确认存在有效本版许可，领取时仍须重新核验；
+ * - unverified：当次读取失败、状态不明或证据冲突，不能据此推断等待谁。
+ *
+ * observation 只代表 observedAt 当时的可信观察，不把授权状态提升为长期许可。
+ * 已发布 revision 缺少 observation 时，读取方必须退化为“待核实”；旧 grant、
+ * 当前标签缺失或控制器离线都不能反推出 awaiting-label。
+ */
+export interface DispatchObservation {
+  state: 'awaiting-label' | 'authorized' | 'unverified';
+  observedAt: string;
+}
+
+/**
  * 一个 `repo + reqId` 的历版冻结派工记录。revision 单调递增、永久占用；
  * repoId 绑定受管仓库数字 ID，runtime 可据此核对 Issue 归属。
  */
@@ -126,6 +157,8 @@ export interface DispatchRevision {
   publicationCommentId?: number;
   /** 已观察到的有效本版许可（尚未领取或已领取）；由标签事件 ID 持久去重。 */
   grant?: DispatchGrant;
+  /** 发布后已核验的当版许可读取快照；不替代领取前的现时核验。 */
+  observation?: DispatchObservation;
 }
 
 export type RetryBaselineStage = 'prepared' | 'ready' | 'stale' | 'completed';

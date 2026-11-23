@@ -181,6 +181,8 @@ export function createNodeTestRunRecord(input: {
   jobId?: string | null;
   reqId?: string | null;
   specHash?: string | null;
+  specPath?: string | null;
+  dispatchRevision?: number | null;
   sourceMainSha?: string | null;
   candidateTreeSha?: string | null;
   suiteFingerprint?: string | null;
@@ -198,6 +200,8 @@ export function createNodeTestRunRecord(input: {
     jobId: input.jobId ?? null,
     reqId: input.reqId ?? null,
     specHash: input.specHash ?? null,
+    specPath: input.specPath ?? null,
+    dispatchRevision: input.dispatchRevision ?? null,
     sourceMainSha: input.sourceMainSha ?? null,
     candidateTreeSha: input.candidateTreeSha ?? null,
     suiteFingerprint: input.suiteFingerprint ?? null,

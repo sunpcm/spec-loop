@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
-import { dirname, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
+import { panelReleasesRoot, readPanelActivePointer } from './deploy.ts';
 import { createPanelServer } from './panel-server.ts';
 import { buildPanelView, parsePanelState, type PanelView } from './panel-view.ts';
 import { createTestEvidenceStore } from './test-evidence.ts';
@@ -13,6 +14,17 @@ export interface PanelCliArgs {
   controlPort: number;
   controlEnabled: boolean;
   stateFile: string;
+}
+
+/**
+ * 兼容默认根目录状态文件和显式 `.orchestrator/state.json` 两种布局。
+ * 静态发布、测试证据与活动指针必须与控制器实际 runDir 保持一致。
+ */
+export function panelRunDirForStateFile(stateFile: string): string {
+  const stateRoot = dirname(resolve(stateFile));
+  return basename(stateRoot) === '.orchestrator'
+    ? stateRoot
+    : join(stateRoot, '.orchestrator');
 }
 
 function isPort(value: string): boolean {
@@ -91,7 +103,7 @@ async function probeController(controlPort: number): Promise<boolean> {
   }
 }
 
-function createReader(args: PanelCliArgs): () => Promise<PanelView> {
+function createReader(args: PanelCliArgs, runDir: string): () => Promise<PanelView> {
   let controllerOnline = false;
   let lastProbeAt = 0;
   const controlTtlMs = 1500;
@@ -122,11 +134,14 @@ function createReader(args: PanelCliArgs): () => Promise<PanelView> {
       controllerOnline = false;
     }
 
+    const panelActive = readPanelActivePointer(runDir);
     return buildPanelView(state, {
       observedAt,
       stateUpdatedAt: file.stateUpdatedAt,
       stateKind,
       controllerOnline,
+      panelActiveSha: panelActive?.activeSha ?? null,
+      panelActiveObservedAt: panelActive?.recordedAt ?? null,
     });
   };
 }
@@ -158,13 +173,15 @@ async function main(): Promise<void> {
   }
 
   const assetsDir = resolve(process.cwd(), '.orchestrator/panel-dist');
-  const stateRoot = dirname(args.stateFile);
+  const runDir = panelRunDirForStateFile(args.stateFile);
   const testEvidence = createTestEvidenceStore({
-    rootDir: resolve(stateRoot, '.orchestrator', 'test-runs'),
+    rootDir: join(runDir, 'test-runs'),
   });
   const server = createPanelServer({
-    readView: createReader(args),
+    readView: createReader(args, runDir),
     assetsDir,
+    panelReleaseRootDir: panelReleasesRoot(runDir),
+    readActivePanelSha: () => readPanelActivePointer(runDir)?.activeSha ?? null,
     testEvidence,
   });
 

@@ -2,6 +2,11 @@ import { execFile } from 'node:child_process';
 import { mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import {
+  PANEL_SPEC_PATH,
+  isValidPanelBinding,
+  type PanelBinding,
+} from './delivery-profile.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -32,9 +37,14 @@ export const defaultGitRunner: GitRunner = async (args, cwd) => {
 
 export class GitClient {
   private readonly runner: GitRunner;
+  private readonly panelBinding?: PanelBinding;
 
-  constructor(runner: GitRunner = defaultGitRunner) {
+  constructor(runner: GitRunner = defaultGitRunner, panelBinding?: PanelBinding) {
+    if (panelBinding !== undefined && !isValidPanelBinding(panelBinding)) {
+      throw new Error('GitClient 面板绑定格式非法');
+    }
     this.runner = runner;
+    this.panelBinding = panelBinding;
   }
 
   async raw(args: string[], cwd: string): Promise<string> {
@@ -60,18 +70,53 @@ export class GitClient {
   }
 
   async readSpecSnapshot(cwd: string, ref: string): Promise<Record<string, string>> {
-    // ls-tree 输出的是仓库根起的完整路径（如 docs/specs/REQ-A-01.md），
-    // 用 -z 空分隔避免文件名含空格/换行被错误拆分；读取失败直接抛出而非伪装空快照。
-    const list = await this.raw(['ls-tree', '-z', '--name-only', ref, 'docs/specs/'], cwd);
-    const paths = list.split('\0').map((s) => s.trim()).filter(Boolean);
+    // 默认不递归 docs/specs；只有显式有效的面板绑定才额外精确读取唯一 pending 路径。
+    const entries = await this.readTreeEntries(cwd, ref, 'docs/specs/');
     const files: Record<string, string> = {};
-    for (const path of paths) {
-      if (!path.endsWith('.md')) continue;
-      const rel = path.slice('docs/specs/'.length);
+    for (const entry of entries) {
+      if (!entry.path.endsWith('.md')) continue;
+      const rel = entry.path.slice('docs/specs/'.length);
       if (!rel || rel.includes('/')) continue;
-      files[path] = await this.raw(['show', `${ref}:${path}`], cwd);
+      assertRegularBlob(entry);
+      files[entry.path] = await this.raw(['show', `${ref}:${entry.path}`], cwd);
+    }
+    if (this.panelBinding) {
+      const matches = (await this.readTreeEntries(cwd, ref, PANEL_SPEC_PATH))
+        .filter((entry) => entry.path === PANEL_SPEC_PATH);
+      if (matches.length > 1) {
+        throw new Error(`Git 快照返回重复受信规格路径: ${PANEL_SPEC_PATH}`);
+      }
+      const panel = matches[0];
+      if (panel) {
+        assertRegularBlob(panel);
+        files[PANEL_SPEC_PATH] = await this.raw(['show', `${ref}:${PANEL_SPEC_PATH}`], cwd);
+      }
     }
     return files;
+  }
+
+  /**
+   * 读取一条 `ls-tree -z` 记录并保留 mode/type，避免把符号链接、子模块或目录
+   * 当成普通 Markdown。`git ls-tree <tree> -- <dir>` 默认只返回该层条目。
+   */
+  private async readTreeEntries(cwd: string, ref: string, path: string): Promise<TreeEntry[]> {
+    const list = await this.raw(
+      ['ls-tree', '-z', '--full-tree', ref, '--', path],
+      cwd,
+    );
+    const entries: TreeEntry[] = [];
+    for (const record of list.split('\0')) {
+      if (!record) continue;
+      const tab = record.indexOf('\t');
+      if (tab < 1) throw new Error(`Git 树条目格式非法: ${path}`);
+      const [mode, type, sha] = record.slice(0, tab).split(' ');
+      const entryPath = record.slice(tab + 1);
+      if (!mode || !type || !sha || !entryPath) {
+        throw new Error(`Git 树条目格式非法: ${path}`);
+      }
+      entries.push({ mode, type, sha, path: entryPath });
+    }
+    return entries;
   }
 
   /** 读取某个 ref 下单个文件的完整内容；文件缺失或读取失败时直接抛出。 */
@@ -183,5 +228,18 @@ export class GitClient {
   async isAncestor(cwd: string, ancestor: string, descendant: string): Promise<boolean> {
     const res = await this.runner(['merge-base', '--is-ancestor', ancestor, descendant], cwd);
     return res.code === 0;
+  }
+}
+
+interface TreeEntry {
+  mode: string;
+  type: string;
+  sha: string;
+  path: string;
+}
+
+function assertRegularBlob(entry: TreeEntry): void {
+  if (entry.type !== 'blob' || (entry.mode !== '100644' && entry.mode !== '100755')) {
+    throw new Error(`受信规格不是普通文件: ${entry.path} (${entry.mode} ${entry.type})`);
   }
 }

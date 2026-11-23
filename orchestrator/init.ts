@@ -190,7 +190,7 @@ export async function publishBaselinePreview(
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger('INIT');
-  const git = new GitClient();
+  const git = new GitClient(undefined, config.panelBinding);
   const repo = config.repo ?? (await resolveRepoFromOrigin(git, config.repoDir));
 
   const lock = acquireInstanceLock(join(config.runDir, 'daemon.lock'));

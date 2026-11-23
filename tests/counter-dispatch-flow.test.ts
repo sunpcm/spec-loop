@@ -326,6 +326,15 @@ function counterDoc(change: string, acceptance: string): string {
 `;
 }
 
+function counterDocWithUnrelatedRequirement(change: string, acceptance: string): string {
+  return `${counterDoc(change, acceptance)}
+### [REQ-CNT-02] 面板说明
+
+#### 功能
+- 该需求只用于验证同文件的其他需求变化不会改写目标块。
+`;
+}
+
 function createGitFixture(): GitFixture {
   const root = mkdtempSync(join(tmpdir(), 'spec-loop-dispatch-flow-'));
   const remote = join(root, 'remote.git');
@@ -547,11 +556,16 @@ function assertFrozenInput(
   assert.equal(input.issueNumber, revision.issueNumber);
   assert.equal(input.spec.hash, revision.specHash);
   assert.equal(input.sourceMainSha, revision.sourceMainSha);
+  const stableRevision = JSON.parse(JSON.stringify(revision)) as DispatchRevision;
+  delete stableRevision.observation;
+  delete stableRevision.grant;
   assert.deepEqual(
     input.dispatchRevision,
-    revision,
-    'WorkerInput 必须携带完整冻结记录，不能只带版本号或临时任务',
+    stableRevision,
+    'WorkerInput 必须携带完整稳定冻结记录，不能带动态观察或领取许可',
   );
+  assert.equal(input.dispatchRevision?.observation, undefined);
+  assert.equal(input.dispatchRevision?.grant, undefined);
   const persisted = JSON.parse(JSON.stringify(revision)) as DispatchRevision;
   assert.deepEqual(persisted, revision, '发布 JSON 必须是稳定、可持久化的任务快照');
   const published = publishedTask(github, revision);
@@ -605,7 +619,17 @@ test('真实 Git/runOnce：待排期不放行，白名单精确许可后并发/�
     const r1Sha = fixture.mergeDoc(r1Doc, 'docs/counter-r1', 'merge counter dispatch r1');
 
     await runOnce(fixture.core);
+    const firstAwaiting = latestRevision(fixture.core).observation;
+    assert.equal(firstAwaiting?.state, 'awaiting-label');
+    await new Promise((resolve) => setTimeout(resolve, 5));
     await runOnce(fixture.core);
+    const refreshedAwaiting = latestRevision(fixture.core).observation;
+    assert.equal(refreshedAwaiting?.state, 'awaiting-label');
+    assert.ok(firstAwaiting?.observedAt && refreshedAwaiting?.observedAt);
+    assert.ok(
+      Date.parse(refreshedAwaiting.observedAt) > Date.parse(firstAwaiting.observedAt),
+      '同一待排期状态的每次成功观察都必须刷新 observedAt',
+    );
     await runOnce(fixture.core);
     assert.equal(fixture.workerInputs.length, 0, '合并后无开工标签必须连续三轮零派工');
     assert.equal(fixture.github.createPRCalls, 0);
@@ -646,8 +670,21 @@ test('真实 Git/runOnce：待排期不放行，白名单精确许可后并发/�
     await Promise.all([runOnce(fixture.core), runOnce(fixture.core)]);
     assert.equal(fixture.workerInputs.length, 1, '重复标签与并发轮询只能产生一次 Worker');
     assert.equal(fixture.github.createPRCalls, 1, '重复标签与并发轮询只能产生一个 PR');
-    assertFrozenInput(fixture.github, fixture.workerInputs[0]!, revision1);
-    assert.equal(fixture.workerInputs[0]!.sourceMainSha, r1Sha, '无关主线提交不得改写冻结来源');
+    const claimedInput = fixture.workerInputs[0]!;
+    const claimedRevision = latestRevision(fixture.core);
+    assert.equal(claimedRevision.observation?.state, 'authorized');
+    assert.ok(
+      claimedRevision.observation
+      && Date.parse(claimedRevision.observation.observedAt) >= Date.parse(claimedRevision.publishedAt!),
+      '真实领取必须留下不早于发布时间的最新授权观察',
+    );
+    assert.ok(claimedRevision.grant, '真实领取必须在 revision 上留下 grant');
+    const claimedJob = fixture.core.state.snapshot().jobs[claimedInput.jobId];
+    assert.ok(claimedJob, '真实领取必须留下对应作业');
+    assert.equal(claimedJob.grantEventId, claimedRevision.grant.eventId);
+    assert.equal(claimedJob.dispatchRevision, claimedRevision.revision);
+    assertFrozenInput(fixture.github, claimedInput, claimedRevision);
+    assert.equal(claimedInput.sourceMainSha, r1Sha, '无关主线提交不得改写冻结来源');
 
     await runOnce(fixture.core);
     fixture.github.addLabelByUser(number, latestLabel(revision1), ALLOWED_USER_ID);
@@ -714,6 +751,124 @@ test('新版发布后旧标签和迟到事件为零，当前版本标签仍使�
   }
 });
 
+test('同文件仅前言和其他需求变化不失效，目标块实变必须拒绝旧版本派工', async () => {
+  const fixture = await createFlowFixture();
+  try {
+    await runOnce(fixture.core);
+    const r1Doc = counterDoc(
+      '新增翻倍操作。',
+      '当前值为 3 时翻倍显示 6。',
+    );
+    const r1Sha = fixture.mergeDoc(r1Doc, 'docs/counter-context-r1', 'merge counter dispatch r1');
+    await runOnce(fixture.core);
+    const number = issueNumber(fixture.core);
+    const r1 = latestRevision(fixture.core);
+    assert.equal(r1.sourceMainSha, r1Sha);
+    fixture.github.addLabelByUser(number, latestLabel(r1), ALLOWED_USER_ID);
+
+    const contextOnlyDoc = counterDoc(
+      '新增翻倍操作。',
+      '当前值为 3 时翻倍显示 6。',
+    ).replace(
+      '# 计数器需求\n',
+      '# 计数器需求\n\n> 仅刷新文件前言，不改变目标需求块。\n',
+    );
+    assert.equal(
+      fixture.specHash(contextOnlyDoc),
+      r1.specHash,
+      '回归夹具必须保持目标需求块哈希不变',
+    );
+    const contextOnlySha = fixture.mergeDoc(
+      contextOnlyDoc,
+      'docs/counter-context-only',
+      'merge counter context-only edits',
+    );
+    assert.notEqual(contextOnlySha, r1Sha);
+
+    await runOnce(fixture.core);
+    assert.equal(
+      fixture.workerInputs.length,
+      1,
+      '同文件其他位置变化时，冻结 r1 的合法许可仍必须能够派工',
+    );
+    assertFrozenInput(fixture.github, fixture.workerInputs[0]!, r1);
+    assert.equal(
+      fixture.workerInputs[0]!.sourceMainSha,
+      r1Sha,
+      'Worker 必须继续使用 r1 的冻结来源，而不是同文件无关变更后的 HEAD',
+    );
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+
+  const changedFixture = await createFlowFixture();
+  try {
+    await runOnce(changedFixture.core);
+    const r1Doc = counterDoc(
+      '新增翻倍操作。',
+      '当前值为 3 时翻倍显示 6。',
+    );
+    changedFixture.mergeDoc(
+      r1Doc,
+      'docs/counter-changed-r1',
+      'merge counter dispatch r1',
+    );
+    await runOnce(changedFixture.core);
+    const number = issueNumber(changedFixture.core);
+    const r1 = latestRevision(changedFixture.core);
+    changedFixture.github.addLabelByUser(number, latestLabel(r1), ALLOWED_USER_ID);
+
+    const unrelatedRequirementDoc = counterDocWithUnrelatedRequirement(
+      '新增翻倍操作。',
+      '当前值为 3 时翻倍显示 6。',
+    );
+    assert.equal(
+      changedFixture.specHash(unrelatedRequirementDoc),
+      r1.specHash,
+      '新增其他需求时目标块哈希必须不变',
+    );
+    changedFixture.mergeDoc(
+      unrelatedRequirementDoc,
+      'docs/counter-unrelated-requirement',
+      'merge counter unrelated requirement',
+    );
+    const checkDispatchCurrent = changedFixture.core.workerDeps.checkDispatchCurrent;
+    assert.ok(checkDispatchCurrent, 'createCore 必须装配派前核验');
+    assert.equal(
+      await checkDispatchCurrent(r1),
+      true,
+      '同文件新增其他需求后，目标块未变时旧 r1 仍可派前核验',
+    );
+
+    const changedDoc = counterDoc(
+      '新增翻倍操作，并把步长限制为偶数。',
+      '当前值为 3、步长为 2 时翻倍显示 6。',
+    );
+    assert.notEqual(changedFixture.specHash(changedDoc), r1.specHash);
+    const changedSha = changedFixture.mergeDoc(
+      changedDoc,
+      'docs/counter-changed-target',
+      'merge counter target change',
+    );
+    assert.notEqual(changedSha, r1.sourceMainSha);
+    assert.equal(
+      await checkDispatchCurrent(r1),
+      false,
+      '目标块实变后，旧 r1 的派前核对必须 fail closed',
+    );
+
+    await runOnce(changedFixture.core);
+    assert.equal(
+      changedFixture.workerInputs.length,
+      0,
+      '目标块实变后旧 r1 标签不得派发 Worker',
+    );
+    assert.equal(changedFixture.github.createPRCalls, 0);
+  } finally {
+    rmSync(changedFixture.root, { recursive: true, force: true });
+  }
+});
+
 test('离线 A→B→A 必须发布更高版本，无关提交不失效，原 r1 许可不复用', async () => {
   const fixture = await createFlowFixture();
   try {
@@ -738,6 +893,13 @@ test('离线 A→B→A 必须发布更高版本，无关提交不失效，原 r1
     fixture.mergeDoc(docB, 'docs/counter-b', 'merge counter dispatch B');
     const shaAFinal = fixture.mergeDoc(docA, 'docs/counter-a-return', 'merge counter dispatch A again');
     assert.notEqual(shaAFinal, shaA);
+    const checkDispatchCurrent = fixture.core.workerDeps.checkDispatchCurrent;
+    assert.ok(checkDispatchCurrent, 'createCore 必须装配派前核验');
+    assert.equal(
+      await checkDispatchCurrent(r1),
+      false,
+      'A→B→A 的中间块实变必须使旧 r1 派前核对失效',
+    );
 
     await runOnce(fixture.core);
     assert.equal(fixture.workerInputs.length, 0, '离线期间内容回到 A 也必须重新排期');

@@ -1,5 +1,19 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { latestDispatchRevision } from './dispatch-task.ts';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { parseE2eContract, verifyPanelAcceptanceCoverage } from './browser-gate.ts';
+import {
+  COUNTER_REQ_ID,
+  COUNTER_SPEC_PATH,
+  PANEL_REQ_ID,
+  PANEL_SPEC_PATH,
+  deliveryProfile,
+  isValidPanelBinding,
+  sameRepositoryId,
+  type DeliveryProfile,
+  type PanelBinding,
+} from './delivery-profile.ts';
+import { latestDispatchRevision, validateDispatchRevision } from './dispatch-task.ts';
 import type { FeishuActorContext } from './feishu-contract.ts';
 import type { GitClient } from './git.ts';
 import { extractMeta, type GhResult, type GithubClient } from './github.ts';
@@ -20,7 +34,7 @@ const CONFIRM_TTL_MS = 10 * 60 * 1000;
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const CODE_RE = /^[0-9a-f]{8}$/;
 const MAX_ERROR_LENGTH = 320;
-const TARGET_SPEC_PATH = 'docs/specs/counter.md';
+const TARGET_SPEC_PATH = COUNTER_SPEC_PATH;
 const MERGED_RESULT = '已合并，后续编码/部署处理中';
 const PASSING_CHECK_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 
@@ -91,6 +105,10 @@ export interface MergeServiceDeps {
   notify?: (text: string) => Promise<void>;
   now?: () => number;
   confirmationCodeFactory?: () => string;
+  /** 面板需求受信绑定；缺失或非法时所有面板代码 PR fail closed。 */
+  panelBinding?: PanelBinding;
+  /** 已部署控制器受管的可信验收资产根，禁止从候选树读取契约。 */
+  trustedE2eRoot?: string;
 }
 
 class MergeEvidenceError extends Error {
@@ -262,6 +280,8 @@ export class MergeService {
   private readonly notify?: (text: string) => Promise<void>;
   private readonly now: () => number;
   private readonly confirmationCodeFactory: () => string;
+  private readonly panelBinding?: PanelBinding;
+  private readonly trustedE2eRoot?: string;
 
   constructor(deps: MergeServiceDeps) {
     this.repo = deps.repo.trim();
@@ -275,6 +295,8 @@ export class MergeService {
     this.now = deps.now ?? Date.now;
     this.confirmationCodeFactory =
       deps.confirmationCodeFactory ?? (() => randomBytes(4).toString('hex'));
+    this.panelBinding = deps.panelBinding;
+    this.trustedE2eRoot = deps.trustedE2eRoot;
   }
 
   async preflight(prNumber: number, rawContext?: FeishuActorContext): Promise<string> {
@@ -718,7 +740,11 @@ export class MergeService {
       this.readTree(pr.headSHA),
       this.rawDiff(pr, evidenceBaseSHA),
     ]);
-    this.validateChangedFiles(pr, branchType, files, tree, rawDiff);
+    const codeProfile =
+      branchType === 'code'
+        ? this.managedProfile(requiredString(meta.reqId, 'PR 元数据 reqId'))
+        : undefined;
+    this.validateChangedFiles(pr, branchType, files, tree, rawDiff, codeProfile);
     if (branchType === 'docs') {
       await this.verifyDocContent(pr, files[0]!, tree);
     }
@@ -797,6 +823,184 @@ export class MergeService {
     return '文档请求 pr-open、commitSHA、baseSHA 与已验证 docContent';
   }
 
+  private managedProfile(reqId: string): DeliveryProfile | undefined {
+    const profile = deliveryProfile(reqId, this.panelBinding);
+    if (
+      reqId === PANEL_REQ_ID &&
+      (!this.panelBinding || !isValidPanelBinding(this.panelBinding))
+    ) {
+      throw new MergeEvidenceError('面板代码 PR 缺少合法受信绑定，拒绝合并');
+    }
+    return profile;
+  }
+
+  private assertPanelStateBinding(profile: DeliveryProfile): void {
+    if (profile.project !== 'panel') return;
+    const binding = this.panelBinding;
+    const state = this.state.snapshot();
+    const requirement = state.requirements[profile.reqId];
+    if (!binding || !isValidPanelBinding(binding)) {
+      throw new MergeEvidenceError('面板代码 PR 缺少合法受信绑定，拒绝合并');
+    }
+    if (
+      !sameRepo(this.repo, binding.repo) ||
+      !state.repo ||
+      !sameRepo(state.repo, binding.repo)
+    ) {
+      throw new MergeEvidenceError('面板 PR 仓库与 state/受信绑定不一致');
+    }
+    if (this.mainBranch !== binding.mainBranch) {
+      throw new MergeEvidenceError('面板 PR 目标主线与受信绑定不一致');
+    }
+    if (
+      !requirement ||
+      requirement.issueNumber !== binding.issueNumber ||
+      requirement.specPath !== profile.specPath
+    ) {
+      throw new MergeEvidenceError('面板 PR 的 state requirement 与受信 Issue/路径不一致');
+    }
+  }
+
+  private async assertPanelRemoteBinding(
+    profile: DeliveryProfile,
+    mode: 'active' | 'merged',
+  ): Promise<void> {
+    if (profile.project !== 'panel') return;
+    const binding = this.panelBinding;
+    if (!binding || !isValidPanelBinding(binding)) {
+      throw new MergeEvidenceError('面板代码 PR 缺少合法受信绑定，拒绝合并');
+    }
+    try {
+      const [repositoryId, issue] = await Promise.all([
+        this.github.getDispatchRepositoryId(),
+        this.github.getDispatchIssue(binding.issueNumber),
+      ]);
+      if (!sameRepositoryId(repositoryId, binding.repositoryId)) {
+        throw new MergeEvidenceError('面板 PR 当前远端仓库数字 ID 与受信绑定不一致');
+      }
+      if (issue.number !== binding.issueNumber || (mode === 'active' && issue.state !== 'open')) {
+        throw new MergeEvidenceError('面板 PR 当前远端 Issue 与受信绑定不一致或已关闭');
+      }
+    } catch (error) {
+      if (error instanceof MergeEvidenceError) throw error;
+      throw new MergeEvidenceError(`面板 PR 无法核验当前远端仓库/Issue：${boundedError(error)}`);
+    }
+  }
+
+  private async assertPanelAnchor(sourceMainSha: string): Promise<void> {
+    const binding = this.panelBinding;
+    if (!binding || !isValidPanelBinding(binding)) {
+      throw new MergeEvidenceError('面板代码 PR 缺少合法受信绑定，拒绝合并');
+    }
+    let files: Record<string, string>;
+    try {
+      files = await this.git.readSpecSnapshot(this.repoDir, binding.confirmedMainSha);
+    } catch {
+      throw new MergeEvidenceError('面板首次接续锚点规格不可读取');
+    }
+    const parsed = parseSpecs(files);
+    if (parsed.errors.length > 0) {
+      throw new MergeEvidenceError('面板首次接续锚点规格解析失败');
+    }
+    const anchor = parsed.specs.find(
+      (spec) => spec.id === PANEL_REQ_ID && spec.path === PANEL_SPEC_PATH,
+    );
+    if (!anchor || anchor.hash !== binding.specHash) {
+      throw new MergeEvidenceError('面板首次接续锚点规格哈希与受信绑定不一致');
+    }
+    if (!(await this.git.isAncestor(this.repoDir, binding.confirmedMainSha, sourceMainSha))) {
+      throw new MergeEvidenceError('面板当前冻结来源不包含首次接续锚点');
+    }
+  }
+
+  private async assertPanelSourceSnapshot(
+    sourceMainSha: string,
+    expectedSpecHash: string,
+  ): Promise<Spec> {
+    let files: Record<string, string>;
+    try {
+      files = await this.git.readSpecSnapshot(this.repoDir, sourceMainSha);
+    } catch {
+      throw new MergeEvidenceError('面板冻结来源规格不可读取');
+    }
+    const parsed = parseSpecs(files);
+    if (parsed.errors.length > 0) {
+      throw new MergeEvidenceError('面板冻结来源规格解析失败');
+    }
+    const spec = parsed.specs.find(
+      (candidate) =>
+        candidate.id === PANEL_REQ_ID &&
+        candidate.path === PANEL_SPEC_PATH &&
+        candidate.hash === expectedSpecHash,
+    );
+    if (!spec) {
+      throw new MergeEvidenceError('面板冻结来源规格哈希与 job/meta/requirement 不一致');
+    }
+    return spec;
+  }
+
+  private assertPanelTrustedContract(spec: Spec): void {
+    if (spec.id !== PANEL_REQ_ID || spec.path !== PANEL_SPEC_PATH) {
+      throw new MergeEvidenceError('面板当前规格路径或需求 ID 非法');
+    }
+    if (!this.trustedE2eRoot) {
+      throw new MergeEvidenceError('控制器未配置受信面板验收资产，拒绝合并');
+    }
+    try {
+      const raw = readFileSync(
+        join(this.trustedE2eRoot, 'tests', 'e2e', 'contracts', 'panel.json'),
+        'utf8',
+      );
+      const contract = parseE2eContract(JSON.parse(raw) as unknown, 'panel');
+      if (
+        contract.reqId !== spec.id ||
+        contract.specPath !== spec.path ||
+        contract.specHash !== spec.hash
+      ) {
+        throw new MergeEvidenceError('当前 main 面板规格与受信验收契约版本不一致');
+      }
+      if (!contract.acceptanceCases) {
+        throw new MergeEvidenceError('受信面板验收契约缺少 acceptanceCases，仅冒烟不得合并');
+      }
+      const coverage = verifyPanelAcceptanceCoverage(
+        contract,
+        { [spec.path]: spec.body },
+        spec.id,
+      );
+      if (!coverage.ok) {
+        throw new MergeEvidenceError(`受信面板验收映射与冻结规格 A1..An 不一致：${coverage.detail}`);
+      }
+    } catch (error) {
+      if (error instanceof MergeEvidenceError) throw error;
+      throw new MergeEvidenceError('受信面板验收契约缺失或解析失败');
+    }
+  }
+
+  private assertManagedDispatch(
+    revision: DispatchRevision,
+    profile: DeliveryProfile,
+  ): void {
+    if (
+      !validateDispatchRevision(revision) ||
+      revision.reqId !== profile.reqId ||
+      revision.specPath !== profile.specPath ||
+      revision.task.allowedPaths.length !== 1 ||
+      revision.task.allowedPaths[0] !== `${profile.sourceDir}/**`
+    ) {
+      throw new MergeEvidenceError('冻结 dispatchRevision 与受信交付画像不一致');
+    }
+    if (profile.project === 'panel') {
+      const binding = this.panelBinding;
+      if (
+        !binding ||
+        !sameRepositoryId(revision.repoId, binding.repositoryId) ||
+        revision.issueNumber !== binding.issueNumber
+      ) {
+        throw new MergeEvidenceError('面板冻结 dispatchRevision 的仓库或 Issue 与受信绑定不一致');
+      }
+    }
+  }
+
   private async validateCodeBinding(
     pr: PullRequestDetail,
     meta: Record<string, unknown>,
@@ -810,6 +1014,14 @@ export class MergeService {
     const sourceMainSha = requiredString(meta.sourceMainSha, 'PR 元数据 sourceMainSha');
     const jobId = requiredString(meta.jobId, 'PR 元数据 jobId');
     const attempt = requiredInteger(meta.attempt, 'PR 元数据 attempt', 1);
+    const profile = this.managedProfile(reqId);
+    if (profile) {
+      if (specPath !== profile.specPath) {
+        throw new MergeEvidenceError('PR 元数据 specPath 与受信交付画像不一致');
+      }
+      this.assertPanelStateBinding(profile);
+      await this.assertPanelRemoteBinding(profile, mode);
+    }
     const state = this.state.snapshot();
     const requirement = state.requirements[reqId];
     const job: JobState | undefined = state.jobs[jobId];
@@ -838,6 +1050,9 @@ export class MergeService {
     if (requirement && requirement.specPath !== specPath) {
       throw new MergeEvidenceError('PR 元数据 specPath 与 state requirement 不一致');
     }
+    if (profile && !requirement) {
+      throw new MergeEvidenceError('受管代码 PR 缺少 state requirement 绑定');
+    }
     const metaRevision =
       meta.dispatchRevision === undefined
         ? undefined
@@ -850,6 +1065,10 @@ export class MergeService {
       stateRevision = job.dispatchRevision;
     }
     const dispatch: DispatchRevision | undefined = latestDispatchRevision(state, reqId);
+    if (profile && dispatch) this.assertManagedDispatch(dispatch, profile);
+    if (profile?.project === 'panel' && !dispatch) {
+      throw new MergeEvidenceError('面板代码 PR 缺少当前冻结 dispatchRevision');
+    }
     if ((metaRevision === undefined) !== (stateRevision === undefined)) {
       throw new MergeEvidenceError('PR 元数据与 job 的 dispatchRevision 必须同时存在');
     }
@@ -884,6 +1103,12 @@ export class MergeService {
         dispatch.reqId !== reqId
       ) {
         throw new MergeEvidenceError('当前冻结 dispatchRevision 与 requirement/job/PR 绑定不一致');
+      }
+      if (
+        profile?.project === 'panel' &&
+        job.issueNumber !== this.panelBinding?.issueNumber
+      ) {
+        throw new MergeEvidenceError('面板 job Issue 与受信绑定不一致');
       }
     }
     const activeStatuses = new Set(['in-review']);
@@ -926,6 +1151,11 @@ export class MergeService {
       if (!currentSpec || currentSpec.hash !== requirement.specHash || currentSpec.hash !== specHash) {
         throw new MergeEvidenceError('当前 origin/main 需求哈希与 state/PR specHash 不一致');
       }
+      if (profile?.project === 'panel') {
+        const sourceSpec = await this.assertPanelSourceSnapshot(sourceMainSha, specHash);
+        this.assertPanelTrustedContract(sourceSpec);
+        await this.assertPanelAnchor(sourceMainSha);
+      }
       if (!(await this.git.hasBranch(this.repoDir, expectedBranch))) {
         throw new MergeEvidenceError('受控 Worker 本地分支不存在，无法确认持久 headSHA');
       }
@@ -935,6 +1165,12 @@ export class MergeService {
       if (localHead !== persistedHead) {
         throw new MergeEvidenceError('受控 Worker 本地分支 SHA 与持久 headSHA 不一致');
       }
+    } else if (profile?.project === 'panel') {
+      const currentMainSha = await this.currentMainSha();
+      await this.assertSourceInMain(sourceMainSha, currentMainSha);
+      const sourceSpec = await this.assertPanelSourceSnapshot(sourceMainSha, specHash);
+      this.assertPanelTrustedContract(sourceSpec);
+      await this.assertPanelAnchor(sourceMainSha);
     }
     return mode === 'active'
       ? `job ${jobId} 处于 in-review，PR/本地分支 head、attempt/specHash/sourceMainSha 全匹配`
@@ -1010,6 +1246,7 @@ export class MergeService {
     files: PullFile[],
     tree: TreeEntry[],
     rawDiff: RawDiffEntry[],
+    codeProfile?: DeliveryProfile,
   ): void {
     if (pr.changedFiles <= 0) throw new MergeEvidenceError('PR 没有变更文件');
     if (files.length !== pr.changedFiles) {
@@ -1050,9 +1287,10 @@ export class MergeService {
       return;
     }
 
+    const sourcePrefix = `${codeProfile?.sourceDir ?? 'src'}/`;
     for (const file of files) {
       if (
-        !file.filename.startsWith('src/') ||
+        !file.filename.startsWith(sourcePrefix) ||
         file.previousFilename ||
         (file.status !== 'modified' && file.status !== 'added')
       ) {
@@ -1074,7 +1312,7 @@ export class MergeService {
     for (const entry of rawDiff) {
       const oldAllowed = entry.oldMode === '100644' || entry.oldMode === '000000';
       if (
-        !entry.path.startsWith('src/') ||
+        !entry.path.startsWith(sourcePrefix) ||
         !oldAllowed ||
         entry.newMode !== '100644' ||
         (entry.status !== 'M' && entry.status !== 'A')
@@ -1280,12 +1518,19 @@ export class MergeService {
   }
 
   private async currentSpecSnapshot(): Promise<CurrentSpecSnapshot> {
-    await this.git.fetch(this.repoDir, this.mainBranch);
-    const mainSha = (await this.git.revParse(this.repoDir, `origin/${this.mainBranch}`)).trim().toLowerCase();
-    if (!SHA_RE.test(mainSha)) throw new MergeEvidenceError('origin/main 不是完整 SHA');
+    const mainSha = await this.currentMainSha();
     const files = await this.git.readSpecSnapshot(this.repoDir, `origin/${this.mainBranch}`);
     const parsed = parseSpecs(files);
     return { mainSha, specs: parsed.specs };
+  }
+
+  private async currentMainSha(): Promise<string> {
+    await this.git.fetch(this.repoDir, this.mainBranch);
+    const mainSha = (await this.git.revParse(this.repoDir, `origin/${this.mainBranch}`))
+      .trim()
+      .toLowerCase();
+    if (!SHA_RE.test(mainSha)) throw new MergeEvidenceError(`origin/${this.mainBranch} 不是完整 SHA`);
+    return mainSha;
   }
 
   /** 代码冻结基线只需仍在当前主线历史中；文档请求仍要求从当前 main 直接起草。 */

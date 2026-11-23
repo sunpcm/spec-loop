@@ -1,27 +1,15 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import { readFileSync } from 'node:fs';
-
-const panelContract = JSON.parse(
-  readFileSync(new URL('./contracts/panel.json', import.meta.url), 'utf8'),
-) as {
-  specPath: string;
-  reqId: string;
-  caseIds: string[];
-};
-
-expect(panelContract.caseIds.length, '面板合同至少包含一个行为用例').toBeGreaterThan(0);
-expect(panelContract.specPath).toBe('docs/specs/counter.md');
-expect(panelContract.reqId).toBe('REQ-CNT-01');
+import { PANEL_DEMO_CASE_IDS } from './panel-case-ids.ts';
 
 const MAX_DEMO_STEPS = 16;
 
-test.describe('本机面板合成演示验收', () => {
+test.describe('本机面板既有合成演示与证据回归', () => {
   test.beforeEach(async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await openPanel(page);
   });
 
-  test('PANEL-DEMO-001 演示标识可见且明确为浏览器内合成场景', async ({ page }) => {
+  test(`${PANEL_DEMO_CASE_IDS[0]} 演示标识可见且明确为浏览器内合成场景`, async ({ page }) => {
     await page.getByRole('button', { name: '演示模式', exact: true }).click();
     await expect(page.getByLabel('合成演示数据', { exact: true })).toBeVisible();
     await expect(
@@ -32,7 +20,7 @@ test.describe('本机面板合成演示验收', () => {
     ).toBeVisible();
   });
 
-  test('PANEL-DEMO-002 点击节点显示该节点的详情与合成证据', async ({ page }) => {
+  test(`${PANEL_DEMO_CASE_IDS[1]} 点击节点显示该节点的详情与合成证据`, async ({ page }) => {
     await page.getByRole('button', { name: '演示模式', exact: true }).click();
     const taskNode = page.getByRole('button', { name: /^同步开发任务，/ });
     await taskNode.click();
@@ -50,7 +38,7 @@ test.describe('本机面板合成演示验收', () => {
     ).toBeVisible();
   });
 
-  test('PANEL-DEMO-003 文档门禁阻断推进，仅显式模拟确认可越过', async ({ page }) => {
+  test(`${PANEL_DEMO_CASE_IDS[2]} 文档门禁阻断推进，仅显式模拟确认可越过`, async ({ page }) => {
     await page.getByRole('button', { name: '演示模式', exact: true }).click();
     const apiRequests = observeAPIRequests(page);
     const next = page.getByRole('button', { name: '下一步', exact: true });
@@ -75,7 +63,7 @@ test.describe('本机面板合成演示验收', () => {
     expect(apiRequests(), '演示交互期间不应发起同源 API 请求').toEqual([]);
   });
 
-  test('PANEL-DEMO-004 固定检查失败门禁阻断推进，仅显式模拟重试可越过', async ({ page }) => {
+  test(`${PANEL_DEMO_CASE_IDS[3]} 固定检查失败门禁阻断推进，仅显式模拟重试可越过`, async ({ page }) => {
     await page.getByRole('button', { name: '演示模式', exact: true }).click();
     const apiRequests = observeAPIRequests(page);
     const next = page.getByRole('button', { name: '下一步', exact: true });
@@ -101,7 +89,7 @@ test.describe('本机面板合成演示验收', () => {
     expect(apiRequests(), '演示交互期间不应发起同源 API 请求').toEqual([]);
   });
 
-  test('PANEL-DEMO-005 代码门禁单独阻断并允许显式模拟确认', async ({ page }) => {
+  test(`${PANEL_DEMO_CASE_IDS[4]} 代码门禁单独阻断并允许显式模拟确认`, async ({ page }) => {
     await page.getByRole('button', { name: '演示模式', exact: true }).click();
     const next = page.getByRole('button', { name: '下一步', exact: true });
     const details = page.locator('#node-details-panel');

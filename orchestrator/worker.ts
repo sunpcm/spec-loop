@@ -3,16 +3,17 @@ import { dirname, join, matchesGlob } from 'node:path';
 import {
   resolveBrowserCacheDir,
   runBrowserGate,
-  readSpecFilesFromDir,
+  readCandidateSpecFile,
   type BrowserGateOptions,
   type BrowserGateResult,
 } from './browser-gate.ts';
+import { deliveryProfile, isPanelReqId, type PanelBinding } from './delivery-profile.ts';
 import { encodeMetaBlock } from './github.ts';
 import type { GitClient } from './git.ts';
 import type { GithubClient } from './github.ts';
 import { redact, type Logger } from './log.ts';
 import { preparePiAgentDir, runPi, type PiInvocation, type PiResult } from './pi-runner.ts';
-import { WORKER_PROMPT } from './prompts.ts';
+import { workerPromptFor } from './prompts.ts';
 import { buildIsolationPaths, type IsolationPaths, type SandboxProfileSpec } from './sandbox.ts';
 import { parseSpecs } from './specs.ts';
 import { createNodeTestRunRecord } from './test-evidence-node.ts';
@@ -22,9 +23,11 @@ import {
   defaultVerificationCommands,
   makeSandboxedRunner,
   runVerification,
+  assertNoSymlinkRoot,
   validateWorkerManifest,
   verificationPassed,
   type VerificationResult,
+  type WorkerSourceRoot,
 } from './validate.ts';
 import type { DispatchRevision, Spec } from './types.ts';
 
@@ -54,6 +57,8 @@ export interface WorkerDeps {
   /** 可信验收套件根目录（已部署控制器的受管 tests/e2e + playwright.config.ts），默认取当前控制器工作树。 */
   browserE2eRoot?: string;
   runBrowserGate?: (opts: BrowserGateOptions) => Promise<BrowserGateResult>;
+  /** 面板交付绑定；仅显式绑定的 REQ-PANEL-01 才会被 delivery-profile 解析为 panel。 */
+  panelBinding?: PanelBinding;
 }
 
 export interface WorkerInput {
@@ -263,8 +268,9 @@ function linkNodeModules(repoDir: string, workDir: string): void {
   }
 }
 
-function readSrcSnapshot(workDir: string): Record<string, string> {
-  const srcDir = join(workDir, 'src');
+function readSourceSnapshot(workDir: string, sourceDir: WorkerSourceRoot): Record<string, string> {
+  assertNoSymlinkRoot(workDir, sourceDir);
+  const srcDir = join(workDir, sourceDir);
   if (!existsSync(srcDir)) return {};
   const result: Record<string, string> = {};
   const walk = (dir: string): void => {
@@ -304,6 +310,7 @@ function buildWorkerPrompt(
   spec: Spec,
   srcSnapshot: Record<string, string>,
   dispatchRevision?: DispatchRevision,
+  sourceDir: string = 'src',
 ): string {
   const srcText = Object.entries(srcSnapshot)
     .sort(([a], [b]) => a.localeCompare(b))
@@ -313,9 +320,9 @@ function buildWorkerPrompt(
   const specHeading = dispatchRevision ? '## 原规格（同版完整需求块）' : '## 当前需求';
   const specPathLine = dispatchRevision ? `规格路径: ${spec.path}\n` : '';
   const sourceHeading = dispatchRevision
-    ? `## 固定来源 SHA \`${dispatchRevision.sourceMainSha}\` 的 src 快照`
-    : '## 当前 src 快照';
-  return `${WORKER_PROMPT}\n\n${dispatchSection}${specHeading}\n${specPathLine}${spec.body}\n\n需求 ID: ${spec.id}\n需求哈希: ${spec.hash}\n\n${sourceHeading}\n${srcText || '(无 src 文件)'}`;
+    ? `## 固定来源 SHA \`${dispatchRevision.sourceMainSha}\` 的 ${sourceDir} 快照`
+    : `## 当前 ${sourceDir} 快照`;
+  return `${workerPromptFor(sourceDir)}\n\n${dispatchSection}${specHeading}\n${specPathLine}${spec.body}\n\n需求 ID: ${spec.id}\n需求哈希: ${spec.hash}\n\n${sourceHeading}\n${srcText || `(无 ${sourceDir} 文件)`}`;
 }
 
 const MAX_PI_LOG_BYTES = 64 * 1024;
@@ -353,8 +360,9 @@ function buildWorkerRetryPrompt(
   srcSnapshot: Record<string, string>,
   failureSummary: string,
   dispatchRevision?: DispatchRevision,
+  sourceDir: string = 'src',
 ): string {
-  return `${buildWorkerPrompt(spec, srcSnapshot, dispatchRevision)}\n\n## 上一次尝试失败摘要\n${failureSummary}\n\n请修正上述问题后，重新输出完整 JSON 对象。`;
+  return `${buildWorkerPrompt(spec, srcSnapshot, dispatchRevision, sourceDir)}\n\n## 上一次尝试失败摘要\n${failureSummary}\n\n请修正上述问题后，重新输出完整 JSON 对象。`;
 }
 
 /**
@@ -385,6 +393,28 @@ export function buildVerifierSandboxSpec(
 export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promise<WorkerOutcome> {
   const logger = deps.logger;
   const mainBranch = deps.mainBranch ?? 'main';
+  const profile = deliveryProfile(input.reqId, deps.panelBinding);
+  if (isPanelReqId(input.reqId)) {
+    if (!profile) {
+      return {
+        status: 'failed',
+        error: `面板需求 ${input.reqId} 缺少受信 PanelBinding，拒绝以默认计数器路径启动 Worker`,
+        failureStage: 'plan',
+        resumeAction: 'worker',
+      };
+    }
+    if (!input.dispatchRevision) {
+      return {
+        status: 'failed',
+        error: `面板需求 ${input.reqId} 缺少冻结派工版本，拒绝启动 Worker`,
+        failureStage: 'plan',
+        resumeAction: 'worker',
+      };
+    }
+  }
+  const sourceDir = profile?.sourceDir ?? 'src';
+  const project = profile?.project ?? 'counter';
+  const buildScript = profile?.buildScript ?? 'build';
   const dispatchPreflight = dispatchPreflightOutcome(deps, input);
   if (dispatchPreflight) return dispatchPreflight;
   const branch = buildWorkerBranchName(
@@ -427,9 +457,9 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       denyNetwork: false,
     };
 
-    const srcSnapshot = readSrcSnapshot(workDir);
+    const srcSnapshot = readSourceSnapshot(workDir, sourceDir);
     mkdirSync(jobLogDir, { recursive: true });
-    const basePrompt = buildWorkerPrompt(input.spec, srcSnapshot, input.dispatchRevision);
+    const basePrompt = buildWorkerPrompt(input.spec, srcSnapshot, input.dispatchRevision, sourceDir);
     const piAttempts = Math.max(1, deps.piAttempts ?? DEFAULT_PI_ATTEMPTS);
     const totalBudgetMs = deps.piTotalBudgetMs ?? DEFAULT_PI_TOTAL_BUDGET_MS;
     const piTimeoutMs = deps.piTimeoutMs ?? Number.parseInt(process.env.SPEC_LOOP_PI_TIMEOUT_MS ?? '300000', 10);
@@ -449,7 +479,7 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       }
       const prompt = n === 0
         ? basePrompt
-        : buildWorkerRetryPrompt(input.spec, srcSnapshot, attemptError, input.dispatchRevision);
+        : buildWorkerRetryPrompt(input.spec, srcSnapshot, attemptError, input.dispatchRevision, sourceDir);
       const invocation: PiInvocation = {
         role: 'worker',
         prompt,
@@ -487,7 +517,7 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
 
     let files;
     try {
-      files = validateWorkerManifest(workDir, piResult!.output);
+      files = validateWorkerManifest(workDir, piResult!.output, sourceDir);
     } catch (error) {
       return {
         status: 'failed',
@@ -522,10 +552,10 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       writeFileSync(file.absPath, file.content, 'utf8');
     }
 
-    // 提交前核对实际变更范围：仅允许 src/**。
-    await deps.git.add(workDir, ['src']);
+    // 提交前核对实际变更范围：仅允许 profile 决定的 sourceDir/**。
+    await deps.git.add(workDir, [sourceDir]);
     const changed = await deps.git.diffNameOnly(workDir, 'HEAD');
-    const outOfScope = changed.filter((p) => !p.startsWith('src/'));
+    const outOfScope = changed.filter((p) => !p.startsWith(`${sourceDir}/`));
     if (outOfScope.length > 0) {
       await deps.git.reset(workDir);
       return {
@@ -549,7 +579,7 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
     const verify = deps.verify ?? (async (cwd: string) => {
       const runner = makeSandboxedRunner(verifierSandbox, { timeoutMs: deps.verifyTimeoutMs ?? 300000 });
       return runVerification(
-        defaultVerificationCommands(),
+        defaultVerificationCommands(buildScript),
         cwd,
         runner,
         buildVerifierEnv(
@@ -572,6 +602,8 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
         jobId: input.jobId,
         reqId: input.reqId,
         specHash: input.spec.hash,
+        specPath: input.spec.path,
+        dispatchRevision: input.dispatchRevision?.revision,
         sourceMainSha: input.sourceMainSha,
         candidateTreeSha: treeSha,
         ok: testResult.ok,
@@ -619,6 +651,13 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
     const browserCacheDir = deps.browserCacheDir ?? resolveBrowserCacheDir();
     const browserE2eRoot = deps.browserE2eRoot ?? deps.repoDir;
     const browserGate = deps.runBrowserGate ?? runBrowserGate;
+    // 从候选快照按冻结身份读取精确白名单规格文件（不递归），缺失、符号链接或哈希不符
+    // 都 fail closed。不能以 input.spec.body 覆盖候选树，否则候选缺版/错版会被误认成当前版本。
+    const gateSpecFiles = readCandidateSpecFile(snapshotDir, {
+      reqId: input.reqId,
+      specPath: input.spec.path,
+      specHash: input.spec.hash,
+    });
     // 浏览器证据与 jobRoot 的生命周期分离；成功发布不能删除 PR 引用的报告、
     // 回执和冻结套件，凭据仍只放在会被清理的 agent 目录。
     mkdirSync(browserEvidenceDir, { recursive: true });
@@ -628,9 +667,11 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       artifactDir: join(snapshotDir, 'dist'),
       mountPath: '/',
       version: input.sourceMainSha,
-      project: 'counter',
+      project,
       reqId: input.reqId,
-      specFiles: readSpecFilesFromDir(snapshotDir),
+      specPath: input.spec.path,
+      dispatchRevision: input.dispatchRevision?.revision,
+      specFiles: gateSpecFiles,
       jobTmp: browserEvidenceDir,
       browserCacheDir,
       globalAgentDir,
@@ -649,7 +690,9 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
       JSON.stringify(
         {
           reqId: input.reqId,
+          specPath: input.spec.path,
           specHash: input.spec.hash,
+          dispatchRevision: input.dispatchRevision?.revision,
           sourceMainSha: input.sourceMainSha,
           candidateTreeSha: treeSha,
           suiteFingerprint: gateResult.suiteFingerprint,
@@ -661,6 +704,7 @@ export async function runWorkerJob(deps: WorkerDeps, input: WorkerInput): Promis
           stderrLogPath: gateResult.stderrLogPath,
           receiptPath: gateResult.receiptPath,
           displayVersion: input.sourceMainSha,
+          productBinding: gateResult.productBinding,
           executedCaseIds: gateResult.executedCaseIds,
         },
         null,

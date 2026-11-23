@@ -500,7 +500,14 @@ function makeHarness(
     }
     return { stdout: '', stderr: `unexpected fake gh path: ${path}`, code: 1 };
   };
-  const gitClient = new GitClient();
+  const gitClient = new GitClient(undefined, {
+    repo: REPO,
+    mainBranch: 'main',
+    repositoryId: 'github-repository-id:9001',
+    issueNumber: 18,
+    confirmedMainSha: fixture.baseSHA,
+    specHash: fixture.baseSpecHash,
+  });
   const githubClient = new GithubClient(REPO, runner);
   harness.makeService = (codeFactory = () => FIXED_CODE) =>
     new MergeService({

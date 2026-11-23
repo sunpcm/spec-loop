@@ -1,6 +1,13 @@
 import { currentDispatchGrant, type DispatchLabelEvent } from './dispatch-grant.ts';
+import {
+  PANEL_REQ_ID,
+  PANEL_SPEC_PATH,
+  isRegisteredSpecPath,
+  sameRepositoryId,
+} from './delivery-profile.ts';
 import type {
   DispatchGrant,
+  DispatchObservation,
   DispatchRevision,
   DispatchStep,
   DispatchTask,
@@ -173,7 +180,9 @@ export function validateDispatchRevision(rev: unknown): rev is DispatchRevision 
     || typeof candidate.specHash !== 'string'
     || !/^[0-9a-f]{64}$/.test(candidate.specHash)
     || typeof candidate.specPath !== 'string'
-    || !/^docs\/specs\/[^/]+\.md$/.test(candidate.specPath)
+    || !isRegisteredSpecPath(candidate.specPath)
+    || (candidate.specPath === PANEL_SPEC_PATH && candidate.reqId !== PANEL_REQ_ID)
+    || (candidate.reqId === PANEL_REQ_ID && candidate.specPath !== PANEL_SPEC_PATH)
     || typeof candidate.sourceMainSha !== 'string'
     || !/^[0-9a-f]{40}$/.test(candidate.sourceMainSha)
     || !validateDispatchTask(candidate.task)
@@ -193,6 +202,12 @@ export function validateDispatchRevision(rev: unknown): rev is DispatchRevision 
     return false;
   }
   if (candidate.grant !== undefined && !validateDispatchGrant(candidate.grant)) return false;
+  if (
+    candidate.observation !== undefined
+    && !validateDispatchObservation(candidate.observation, candidate.publishedAt)
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -207,6 +222,33 @@ function validateDispatchGrant(grant: unknown): grant is DispatchGrant {
     && typeof candidate.grantedAt === 'string'
     && Number.isFinite(Date.parse(candidate.grantedAt))
   );
+}
+
+function validateDispatchObservation(
+  observation: unknown,
+  publishedAt: string | undefined,
+): observation is DispatchObservation {
+  if (!observation || typeof observation !== 'object' || Array.isArray(observation)) {
+    return false;
+  }
+  const candidate = observation as Partial<DispatchObservation>;
+  if (
+    candidate.state !== 'awaiting-label'
+    && candidate.state !== 'authorized'
+    && candidate.state !== 'unverified'
+  ) {
+    return false;
+  }
+  if (typeof candidate.observedAt !== 'string') {
+    return false;
+  }
+  const observedMs = Date.parse(candidate.observedAt);
+  if (!Number.isFinite(observedMs) || new Date(observedMs).toISOString() !== candidate.observedAt) {
+    return false;
+  }
+  if (publishedAt === undefined) return true;
+  const publishedMs = Date.parse(publishedAt);
+  return Number.isFinite(publishedMs) && observedMs >= publishedMs;
 }
 
 /** 下一个版本号：在既有历史最大版本基础上 +1，编号永久占用、不回退。 */
@@ -286,6 +328,138 @@ export type DispatchClaimDecision =
   | { claimable: true; revision: DispatchRevision; grant: DispatchGrant }
   | { claimable: false; reason: string };
 
+export type DispatchObservationDecision =
+  | {
+      state: 'authorized';
+      grant: DispatchGrant;
+      reason: string;
+    }
+  | {
+      state: 'awaiting-label';
+      reason: string;
+    }
+  | {
+      state: 'unverified';
+      reason: string;
+    };
+
+/**
+ * 将已成功读取的远端身份、标签和事件归并成一次可持久观察。
+ *
+ * 无标签、仅历史标签、撤标或操作者不在白名单内都表示当次没有有效许可；
+ * 标签与最新事件矛盾、同秒无法定序、事件 ID 冲突或本地版本不完整才表示
+ * 证据冲突/不足。网络和 API 读取失败由 runtime 在调用本函数前归为 unverified。
+ */
+export function evaluateDispatchObservation(
+  revision: DispatchRevision,
+  ctx: DispatchGrantContext,
+): DispatchObservationDecision {
+  if (!validateDispatchRevision(revision)) {
+    return { state: 'unverified', reason: '冻结派工记录格式非法' };
+  }
+  if (!sameRepositoryId(revision.repoId, ctx.repoId)) {
+    return { state: 'unverified', reason: '数字仓库身份不一致' };
+  }
+  if (revision.issueNumber !== ctx.issueNumber) {
+    return { state: 'unverified', reason: 'Issue 编号与冻结版本不一致' };
+  }
+  if (!revision.publishedAt || revision.publicationCommentId === undefined) {
+    return { state: 'unverified', reason: '版本尚未完整公布' };
+  }
+  if (!Number.isFinite(Date.parse(revision.publishedAt))) {
+    return { state: 'unverified', reason: '版本公布时间无效' };
+  }
+
+  const eventConflict = dispatchEventConflict(ctx.events, dispatchLabel(revision.revision));
+  if (eventConflict) {
+    return { state: 'unverified', reason: eventConflict };
+  }
+
+  const label = dispatchLabel(revision.revision);
+  const currentLabel = ctx.labels.includes(label);
+  const publishedMs = Date.parse(revision.publishedAt);
+  const relevantAfterPublish = ctx.events
+    .filter((event) => event.name === label && Date.parse(event.createdAt) > publishedMs)
+    .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
+  const latest = relevantAfterPublish.at(-1);
+
+  if (!currentLabel) {
+    if (latest?.event === 'labeled') {
+      return {
+        state: 'unverified',
+        reason: '当前缺少本版标签，但最新事件仍为添加',
+      };
+    }
+    return {
+      state: 'awaiting-label',
+      reason: latest?.event === 'unlabeled' ? '本版开工标签已撤下' : '尚无本版开工标签',
+    };
+  }
+
+  if (!latest) {
+    return {
+      state: 'awaiting-label',
+      reason: '当前标签早于本版公布，不构成本版许可',
+    };
+  }
+  if (latest.event === 'unlabeled') {
+    return {
+      state: 'unverified',
+      reason: '当前标签与最新撤标事件冲突',
+    };
+  }
+
+  const grantEvent = currentDispatchGrant(
+    ctx.events,
+    ctx.labels,
+    revision.revision,
+    revision.publishedAt,
+    ctx.allowedActorIds,
+  );
+  if (!grantEvent) {
+    return {
+      state: 'awaiting-label',
+      reason: '当前标签没有白名单操作者的有效本版添加事件',
+    };
+  }
+  return {
+    state: 'authorized',
+    grant: {
+      eventId: grantEvent.id,
+      actorId: grantEvent.actorId ?? '',
+      grantedAt: grantEvent.createdAt,
+    },
+    reason: '已确认白名单操作者的本版开工许可',
+  };
+}
+
+function dispatchEventConflict(events: DispatchLabelEvent[], label: string): string | null {
+  const byId = new Map<number, DispatchLabelEvent>();
+  for (const event of events) {
+    if (!Number.isSafeInteger(event.id) || event.id <= 0) return '标签事件 ID 无效';
+    const earlier = byId.get(event.id);
+    if (earlier) {
+      if (
+        earlier.actorId !== event.actorId
+        || earlier.name !== event.name
+        || earlier.event !== event.event
+        || earlier.createdAt !== event.createdAt
+      ) {
+        return '相同标签事件 ID 对应冲突内容';
+      }
+      continue;
+    }
+    byId.set(event.id, event);
+    if (!Number.isFinite(Date.parse(event.createdAt))) return '标签事件时间无效';
+  }
+
+  const relevant = [...byId.values()].filter((event) => event.name === label);
+  if (relevant.length === 0) return null;
+  const latestMs = Math.max(...relevant.map((event) => Date.parse(event.createdAt)));
+  const latest = relevant.filter((event) => Date.parse(event.createdAt) === latestMs);
+  return latest.length > 1 ? '本版最新标签事件同秒无法定序' : null;
+}
+
 /**
  * 依据持久化历史与远端标签/事件，判断当前版本是否可领取。
  * 只负责派工侧门禁：仓库/Issue 绑定、版本已发布、当前标签与最新事件是白名单添加。
@@ -299,7 +473,9 @@ export function evaluateDispatchClaim(
   const list = state.dispatchRevisions?.[reqId] ?? [];
   if (list.length === 0) return { claimable: false, reason: 'no-dispatch-revision' };
   const revision = list[list.length - 1]!;
-  if (revision.repoId !== ctx.repoId) return { claimable: false, reason: 'repo-mismatch' };
+  if (!sameRepositoryId(revision.repoId, ctx.repoId)) {
+    return { claimable: false, reason: 'repo-mismatch' };
+  }
   if (revision.issueNumber !== ctx.issueNumber) return { claimable: false, reason: 'issue-mismatch' };
   if (!revision.publishedAt || !revision.publicationCommentId) {
     return { claimable: false, reason: 'not-published' };

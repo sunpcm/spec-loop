@@ -1,6 +1,10 @@
 # Playwright 独立验收
 
-`counter` project 验收 `REQ-CNT-01`，`panel` project 验收浏览器内合成演示和测试证据详情。合同 `contracts/counter.json` 只列计数器 caseId，并绑定当前需求标识、路径和需求块哈希；`contracts/panel.json` 只列面板 caseId，不带规格哈希。需求变化后须由维护者更新验收基线，测试不能自动刷新哈希。
+`counter` project 验收 `REQ-CNT-01`。`panel` project 当前只回归既有浏览器内合成演示和测试证据详情，并绑定已确认的 `REQ-PANEL-01`、路径 `docs/specs/pending/panel.md` 与需求块哈希。这里的 `PANEL-DEMO-*`、`PANEL-EVIDENCE-*` 不代表 #19 的等待说明已经实施或通过；把这些既有回归归入面板套件是为了让框架选择、契约和产物连续性可核验，等待说明的实际 A1～A8 用例仍待 #19 排期后由独立测试作者补充。
+
+合同 `contracts/counter.json` 与 `contracts/panel.json` 都必须绑定当前需求标识、路径和需求块哈希。规格确认提交、运行来源 SHA 和候选树属于每次执行的证据，不写入需求契约。需求变化后须由维护者更新验收基线，测试不能自动刷新哈希。
+
+面板业务门禁还要求可选 `acceptanceCases` 把所选规格的每条验收 A1…An 映射到真实执行的 caseId。不同验收可以复用同一个真实 caseId，同一验收的数组内不得重复。手动或框架冒烟可以只运行 `caseIds`，但 Worker 与合并构建的业务门禁在映射缺失、覆盖规格外验收、未覆盖规格验收项或映射用例没有真实通过时必须 fail closed。当前真实 `panel.json` 保留已确认哈希和既有冒烟 caseIds，不预填尚不存在的 #19 A1～A8 映射，因此本轮的冒烟套件不能单独把面板需求标成业务成功。
 
 协调器启动静态测试服务后，通过 `SPEC_LOOP_E2E_BASE_URL` 提供本机 IPv4 地址及端口，地址可含 `/releases/<sha>/`；各项 `page.goto('./')` 使用相对路径保留前缀。两个项目分别由协调器提供对应 artifact。`SPEC_LOOP_E2E_VERSION` 为计数器页面的预期版本，`SPEC_LOOP_E2E_REPORT_DIR` 保存顶层 JSON、HTML、截图和失败 trace；协调器每次只选择一个 project，并为各项目使用独立报告目录。
 

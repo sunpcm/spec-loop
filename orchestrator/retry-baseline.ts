@@ -1,11 +1,24 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import {
+  COUNTER_REQ_ID,
+  COUNTER_SPEC_PATH,
+  PANEL_SPEC_PATH,
+  deliveryProfile,
+  isPanelReqId,
+  isValidPanelBinding,
+  sameRepositoryId,
+  type DeliveryProfile,
+  type PanelBinding,
+} from './delivery-profile.ts';
+import { parseE2eContract, verifyPanelAcceptanceCoverage } from './browser-gate.ts';
 import { validateDispatchRevision } from './dispatch-task.ts';
 import { encodeMetaBlock, extractMeta, stripMeta } from './github.ts';
 import type { GithubClient } from './github.ts';
 import type { GitClient } from './git.ts';
 import type { Logger } from './log.ts';
+import { validateRegisteredPanelIssue } from './panel-registration.ts';
 import { buildIssueBody, buildRequirementMeta } from './reconciler.ts';
 import { parseSpecs } from './specs.ts';
 import type { StateStore } from './state.ts';
@@ -22,13 +35,26 @@ import type {
 } from './types.ts';
 import type { WorkerInput, WorkerOutcome } from './worker.ts';
 
+export {
+  COUNTER_REQ_ID,
+  COUNTER_SPEC_PATH,
+  PANEL_REQ_ID,
+  PANEL_SPEC_PATH,
+  deliveryProfile,
+  isPanelReqId,
+  isValidPanelBinding,
+  sameRepositoryId,
+  type PanelBinding,
+  type DeliveryProject,
+  type DeliveryProfile,
+} from './delivery-profile.ts';
+
 const SHA_RE = /^[0-9a-f]{40}$/;
 export const BASELINE_OPERATION_RE = /^retry-baseline-[0-9a-f]{24}$/;
 export const BASELINE_JOB_RE = /^retry-baseline-[0-9a-f]{24}-job$/;
 const PREPARED_FAILURE_STAGE = 'retry-baseline';
 const PREPARED_RESUME_ACTION = 'retry-baseline';
 const STALE_FAILURE_STAGE = 'retry-baseline-stale';
-const COUNTER_REQ_ID = 'REQ-CNT-01';
 
 export interface PublishDispatchRevisionInput {
   reqId: string;
@@ -54,6 +80,8 @@ export interface RetryBaselineDeps {
   /** 已部署控制器受管的可信测试资产根；绝不从候选规格 worktree 读取验收契约。 */
   trustedE2eRoot?: string;
   mainBranch?: string;
+  /** 面板受信绑定；未绑定时面板需求在重试路径 fail closed。 */
+  panelBinding?: PanelBinding;
   hooks?: RetryBaselineHooks;
   /**
    * runtime 注入的 scheduler 唯一冻结发布入口。counter 的 main 已推进恢复只允许
@@ -207,6 +235,111 @@ function messageFor(baseline: RetryBaselineState, text: string): string {
   return `${text}（重试操作 ${baseline.operationId}，基线 ${baseline.fromSourceMainSha.slice(0, 8)} → ${baseline.targetSourceMainSha.slice(0, 8)}）`;
 }
 
+/** 面板需求未配置受信绑定或绑定非法时，返回阻断原因；非面板返回 null。 */
+function panelGuardError(deps: RetryBaselineDeps, reqId: string): string | null {
+  if (!isPanelReqId(reqId)) return null;
+  if (!deps.panelBinding) {
+    return `需求 ${reqId} 是面板需求，但控制器未配置面板受信绑定，拒绝继续`;
+  }
+  if (!isValidPanelBinding(deps.panelBinding)) {
+    return `需求 ${reqId} 的面板受信绑定格式非法，拒绝继续`;
+  }
+  return null;
+}
+
+function managedProfile(
+  deps: Pick<RetryBaselineDeps, 'panelBinding'>,
+  reqId: string,
+): DeliveryProfile | undefined {
+  return deliveryProfile(reqId, deps.panelBinding);
+}
+
+function sameRepository(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase();
+}
+
+function panelStateBindingError(
+  deps: Pick<RetryBaselineDeps, 'panelBinding' | 'mainBranch'>,
+  state: OrchestratorState,
+  profile: DeliveryProfile,
+  requirement: RequirementState | undefined,
+  issueNumber: number,
+): string | null {
+  if (profile.project !== 'panel') return null;
+  const binding = deps.panelBinding;
+  if (!binding || !isValidPanelBinding(binding)) {
+    return `需求 ${profile.reqId} 缺少合法面板受信绑定，拒绝继续`;
+  }
+  if (!state.repo || !sameRepository(state.repo, binding.repo)) {
+    return `需求 ${profile.reqId} 的 state 仓库与面板受信绑定不一致，拒绝继续`;
+  }
+  if ((deps.mainBranch ?? 'main') !== binding.mainBranch) {
+    return `需求 ${profile.reqId} 的当前主线与面板受信绑定不一致，拒绝继续`;
+  }
+  if (issueNumber !== binding.issueNumber) {
+    return `需求 ${profile.reqId} 的 Issue #${issueNumber} 与受信卡 #${binding.issueNumber} 不一致，拒绝继续`;
+  }
+  if (
+    !requirement ||
+    requirement.issueNumber !== binding.issueNumber ||
+    requirement.specPath !== profile.specPath
+  ) {
+    return `需求 ${profile.reqId} 的本地需求绑定与面板受信卡/路径不一致，拒绝继续`;
+  }
+  return null;
+}
+
+function managedRevisionShapeError(
+  revision: DispatchRevision | undefined,
+  profile: DeliveryProfile,
+): string | null {
+  if (!revision) return `需求 ${profile.reqId} 缺少当前冻结派工版本`;
+  if (
+    !validateDispatchRevision(revision) ||
+    revision.reqId !== profile.reqId ||
+    revision.specPath !== profile.specPath
+  ) {
+    return `需求 ${profile.reqId} 的当前冻结派工版本格式、需求或规格路径非法`;
+  }
+  const expectedAllowedPath = `${profile.sourceDir}/**`;
+  if (
+    (revision.task.allowedPaths.length === 0 ||
+      revision.task.allowedPaths.some((path) => path !== expectedAllowedPath))
+  ) {
+    return `需求 ${profile.reqId} 的冻结派工写集未严格限定为 ${expectedAllowedPath}`;
+  }
+  return null;
+}
+
+async function panelAnchorError(
+  deps: RetryBaselineDeps,
+  profile: DeliveryProfile,
+  sourceMainSha: string,
+): Promise<string | null> {
+  if (profile.project !== 'panel') return null;
+  const binding = deps.panelBinding;
+  if (!binding || !isValidPanelBinding(binding)) {
+    return `需求 ${profile.reqId} 缺少合法面板受信绑定，拒绝继续`;
+  }
+  try {
+    const anchor = parsedSpec(
+      await deps.git.readSpecSnapshot(deps.repoDir, binding.confirmedMainSha),
+      profile.reqId,
+      profile.specPath,
+      binding.specHash,
+    );
+    if (anchor.hash !== binding.specHash) {
+      return `面板首次接续锚点 ${binding.confirmedMainSha.slice(0, 8)} 的规格哈希已变化`;
+    }
+    if (!(await deps.git.isAncestor(deps.repoDir, binding.confirmedMainSha, sourceMainSha))) {
+      return `面板冻结来源 ${sourceMainSha.slice(0, 8)} 不包含首次接续锚点 ${binding.confirmedMainSha.slice(0, 8)}`;
+    }
+  } catch (error) {
+    return `面板首次接续锚点核验失败: ${errorText(error)}`;
+  }
+  return null;
+}
+
 function expectedNewJob(
   baseline: RetryBaselineState,
   dispatchRevision?: DispatchRevision,
@@ -298,10 +431,11 @@ async function currentMain(deps: RetryBaselineDeps): Promise<string> {
   return sha;
 }
 
-function latestCounterRevision(
+function latestManagedRevision(
   state: OrchestratorState,
+  reqId: string,
 ): DispatchRevision | undefined {
-  return (state.dispatchRevisions?.[COUNTER_REQ_ID] ?? []).at(-1);
+  return (state.dispatchRevisions?.[reqId] ?? []).at(-1);
 }
 
 function isPublishedRevision(revision: DispatchRevision): boolean {
@@ -324,15 +458,16 @@ function sameDispatchIdentity(left: DispatchRevision, right: DispatchRevision): 
   );
 }
 
-function counterRevisionForBaseline(
+function managedRevisionForBaseline(
   state: OrchestratorState,
   baseline: RetryBaselineState,
+  profile: DeliveryProfile,
   requireGrant: boolean,
 ): DispatchRevision | undefined {
-  const revision = latestCounterRevision(state);
+  const revision = latestManagedRevision(state, baseline.reqId);
   if (
     !revision ||
-    !validateDispatchRevision(revision) ||
+    managedRevisionShapeError(revision, profile) ||
     !isPublishedRevision(revision) ||
     revision.reqId !== baseline.reqId ||
     revision.issueNumber !== baseline.issueNumber ||
@@ -346,13 +481,24 @@ function counterRevisionForBaseline(
   return revision;
 }
 
-async function currentCounterSpec(
+async function readManagedSpecFiles(
+  deps: RetryBaselineDeps,
+  ref: string,
+): Promise<Record<string, string>> {
+  return await deps.git.readSpecSnapshot(deps.repoDir, ref);
+}
+
+async function currentManagedSpec(
   deps: RetryBaselineDeps,
   reqId: string,
   specPath: string,
   targetMainSha: string,
 ): Promise<Spec> {
-  const specs = parsedSpecs(await deps.git.readSpecSnapshot(deps.repoDir, targetMainSha));
+  const profile = managedProfile(deps, reqId);
+  if (!profile || specPath !== profile.specPath) {
+    throw new Error(`需求 ${reqId} 没有受信的交付路径 ${specPath}`);
+  }
+  const specs = parsedSpecs(await readManagedSpecFiles(deps, targetMainSha));
   const spec = specs.find((candidate) => candidate.id === reqId && candidate.path === specPath);
   if (!spec) throw new Error(`当前 main 缺少 ${reqId} 的已确认需求块`);
   const contractError = trustedContractError(deps.trustedE2eRoot, spec);
@@ -360,21 +506,41 @@ async function currentCounterSpec(
   return spec;
 }
 
-async function publishCounterRevision(
+async function publishManagedRevision(
   deps: RetryBaselineDeps,
+  profile: DeliveryProfile,
   issueNumber: number,
   spec: Spec,
   targetMainSha: string,
   repoId: string,
 ): Promise<RetryBaselineResult> {
+  const panelError = panelGuardError(deps, profile.reqId);
+  if (panelError) return result('blocked', panelError);
+
+  let issues: ManagedIssue[];
   let issue: ManagedIssue;
   try {
-    issue = await readIssue(deps, issueNumber);
+    issues = await deps.github.listIssues();
+    issue = exactIssue(issues, issueNumber);
   } catch (error) {
     return result('blocked', `#${issueNumber} Issue 读取失败，拒绝发布新 rN: ${errorText(error)}`);
   }
   if (issue.state !== 'open') {
     return result('blocked', `#${issueNumber} Issue 已关闭，拒绝发布新 rN`);
+  }
+  if (profile.project === 'panel') {
+    const binding = deps.panelBinding;
+    if (!binding) return result('blocked', `需求 ${profile.reqId} 缺少面板受信绑定，拒绝发布新 rN`);
+    const selection = validateRegisteredPanelIssue({
+      binding,
+      issues,
+      state: deps.state.snapshot(),
+    });
+    if (!selection.ok) {
+      return result('blocked', `${selection.reason}，拒绝发布新 rN`);
+    }
+    const anchorError = await panelAnchorError(deps, profile, targetMainSha);
+    if (anchorError) return result('blocked', `${anchorError}，拒绝发布新 rN`);
   }
 
   let prs: ManagedPR[];
@@ -388,14 +554,14 @@ async function publishCounterRevision(
   }
   const unknown = prs.find(
     (pr) =>
-      pr.meta?.reqId === COUNTER_REQ_ID &&
+      pr.meta?.reqId === profile.reqId &&
       pr.state !== 'open' &&
       pr.state !== 'closed',
   );
   if (unknown) {
     return result(
       'blocked',
-      `需求 ${COUNTER_REQ_ID} 的 ${prLink(unknown.number)} 状态未知，拒绝发布新 rN`,
+      `需求 ${profile.reqId} 的 ${prLink(unknown.number)} 状态未知，拒绝发布新 rN`,
     );
   }
   if (!deps.publishDispatchRevision) {
@@ -408,7 +574,7 @@ async function publishCounterRevision(
   let published: DispatchRevision;
   try {
     published = await deps.publishDispatchRevision({
-      reqId: COUNTER_REQ_ID,
+      reqId: profile.reqId,
       issueNumber,
       spec,
       targetMainSha,
@@ -421,13 +587,13 @@ async function publishCounterRevision(
     );
   }
   if (
-    !validateDispatchRevision(published) ||
-    published.reqId !== COUNTER_REQ_ID ||
+    managedRevisionShapeError(published, profile) ||
+    published.reqId !== profile.reqId ||
     published.issueNumber !== issueNumber ||
     published.specPath !== spec.path ||
     published.specHash !== spec.hash ||
     published.sourceMainSha !== targetMainSha ||
-    published.repoId !== repoId
+    !sameRepositoryId(published.repoId, repoId)
   ) {
     return result(
       'blocked',
@@ -436,9 +602,10 @@ async function publishCounterRevision(
   }
 
   const after = deps.state.snapshot();
-  const persisted = latestCounterRevision(after);
+  const persisted = latestManagedRevision(after, profile.reqId);
   if (
     !persisted ||
+    managedRevisionShapeError(persisted, profile) ||
     !sameDispatchIdentity(persisted, published) ||
     !isPublishedRevision(persisted)
   ) {
@@ -449,15 +616,16 @@ async function publishCounterRevision(
   }
   try {
     await deps.state.update((state) => {
-      const current = latestCounterRevision(state);
+      const current = latestManagedRevision(state, profile.reqId);
       if (
         !current ||
+        managedRevisionShapeError(current, profile) ||
         !sameDispatchIdentity(current, persisted) ||
         !isPublishedRevision(current)
       ) {
         throw new Error('发布回读后派工版本已变化');
       }
-      state.requirements[COUNTER_REQ_ID] = {
+      state.requirements[profile.reqId] = {
         issueNumber,
         specHash: current.specHash,
         specPath: current.specPath,
@@ -477,26 +645,38 @@ async function publishCounterRevision(
   );
 }
 
-async function prepareCounterRetry(
+async function prepareManagedRetry(
   deps: RetryBaselineDeps,
   state: OrchestratorState,
+  profile: DeliveryProfile,
   requirement: RequirementState,
   oldJob: JobState,
   issueNumber: number,
 ): Promise<{ revision: DispatchRevision; targetMainSha: string } | RetryBaselineResult> {
-  const revisions = state.dispatchRevisions?.[COUNTER_REQ_ID] ?? [];
+  const panelError = panelGuardError(deps, profile.reqId);
+  if (panelError) return result('blocked', panelError);
+  const stateBindingError = panelStateBindingError(
+    deps,
+    state,
+    profile,
+    requirement,
+    issueNumber,
+  );
+  if (stateBindingError) return result('blocked', `#${issueNumber} ${stateBindingError}`);
+
+  const revisions = state.dispatchRevisions?.[profile.reqId] ?? [];
   const latest = revisions.at(-1);
   const priorPublished = [...revisions].reverse().find(isPublishedRevision);
-  if (!latest || !priorPublished || !validateDispatchRevision(latest)) {
+  if (!latest || !priorPublished || managedRevisionShapeError(latest, profile)) {
     return result(
       'blocked',
-      `#${issueNumber} 计数器尚无已发布的冻结派工版本；显式重试不能启动编码`,
+      `#${issueNumber} 需求 ${profile.reqId} 尚无已发布的冻结派工版本；显式重试不能启动编码`,
     );
   }
   if (
-    latest.reqId !== COUNTER_REQ_ID ||
+    latest.reqId !== profile.reqId ||
     latest.issueNumber !== issueNumber ||
-    latest.repoId !== priorPublished.repoId
+    !sameRepositoryId(latest.repoId, priorPublished.repoId)
   ) {
     return result(
       'blocked',
@@ -519,11 +699,20 @@ async function prepareCounterRetry(
       `#${issueNumber} 当前仓库数字 ID 读取失败，拒绝重试: ${errorText(error)}`,
     );
   }
-  if (!/^[0-9]+$/.test(repoId) || latest.repoId !== repoId) {
+  if (!/^(?:github-repository-id:)?[1-9][0-9]*$/.test(repoId) ||
+    !sameRepositoryId(latest.repoId, repoId)) {
     return result(
       'blocked',
       `#${issueNumber} 当前仓库数字 ID 与冻结派工版本不一致，拒绝重试`,
     );
+  }
+  if (
+    profile.project === 'panel' &&
+    (!deps.panelBinding ||
+      !isValidPanelBinding(deps.panelBinding) ||
+      !sameRepositoryId(repoId, deps.panelBinding.repositoryId))
+  ) {
+    return result('blocked', `#${issueNumber} 当前仓库数字 ID 与面板受信绑定不一致，拒绝重试`);
   }
 
   if (!isPublishedRevision(latest) || latest.sourceMainSha !== targetMainSha) {
@@ -539,13 +728,15 @@ async function prepareCounterRetry(
         `#${issueNumber} 冻结来源不是当前 main 的祖先（${progress}），拒绝发布新 rN`,
       );
     }
+    const anchorError = await panelAnchorError(deps, profile, targetMainSha);
+    if (anchorError) return result('blocked', `#${issueNumber} ${anchorError}`);
     let spec: Spec;
     try {
-      spec = await currentCounterSpec(deps, COUNTER_REQ_ID, requirement.specPath, targetMainSha);
+      spec = await currentManagedSpec(deps, profile.reqId, requirement.specPath, targetMainSha);
     } catch (error) {
       return result('blocked', `#${issueNumber} 当前已确认规格读取失败: ${errorText(error)}`);
     }
-    return publishCounterRevision(deps, issueNumber, spec, targetMainSha, repoId);
+    return publishManagedRevision(deps, profile, issueNumber, spec, targetMainSha, repoId);
   }
 
   if (
@@ -554,19 +745,30 @@ async function prepareCounterRetry(
     requirement.sourceMainSha !== latest.sourceMainSha ||
     oldJob.specHash !== latest.specHash ||
     oldJob.sourceMainSha !== latest.sourceMainSha ||
-    (oldJob.dispatchRevision !== undefined &&
-      oldJob.dispatchRevision !== latest.revision)
+    (profile.project === 'panel' && oldJob.dispatchRevision !== latest.revision)
   ) {
     return result(
       'blocked',
       `#${issueNumber} 最新失败作业与已发布 r${latest.revision} 的冻结依据不一致，拒绝增加 attempt`,
     );
   }
+  if (
+    profile.project === 'counter' &&
+    oldJob.dispatchRevision !== undefined &&
+    oldJob.dispatchRevision !== latest.revision
+  ) {
+    return result(
+      'blocked',
+      `#${issueNumber} 最新失败作业与已发布 r${latest.revision} 的冻结依据不一致，拒绝增加 attempt`,
+    );
+  }
+  const anchorError = await panelAnchorError(deps, profile, targetMainSha);
+  if (anchorError) return result('blocked', `#${issueNumber} ${anchorError}`);
   let currentSpec: Spec;
   try {
     currentSpec = await validateLocalSpec(
       deps,
-      COUNTER_REQ_ID,
+      profile.reqId,
       latest.specPath,
       latest.specHash,
       targetMainSha,
@@ -623,7 +825,8 @@ async function validateLocalSpec(
   specHash: string,
   sha: string,
 ): Promise<Spec> {
-  return parsedSpec(await deps.git.readSpecSnapshot(deps.repoDir, sha), reqId, specPath, specHash);
+  const files = await deps.git.readSpecSnapshot(deps.repoDir, sha);
+  return parsedSpec(files, reqId, specPath, specHash);
 }
 
 function issueBindingError(issue: ManagedIssue, reqId: string, requirement: RequirementState, oldJob: JobState): string | null {
@@ -822,10 +1025,40 @@ async function readIssue(deps: RetryBaselineDeps, issueNumber: number): Promise<
 }
 
 function trustedContractError(trustedE2eRoot: string | undefined, spec: Spec): string | null {
-  if (spec.id !== 'REQ-CNT-01') return null;
+  const contractFile = spec.id === COUNTER_REQ_ID
+    ? 'counter.json'
+    : spec.id === 'REQ-PANEL-01' && spec.path === PANEL_SPEC_PATH
+      ? 'panel.json'
+      : null;
+  if (!contractFile) return null;
   if (!trustedE2eRoot) return '控制器未配置受管可信验收资产目录，拒绝创建新基线';
   try {
-    const raw = readFileSync(join(trustedE2eRoot, 'tests', 'e2e', 'contracts', 'counter.json'), 'utf8');
+    const raw = readFileSync(
+      join(trustedE2eRoot, 'tests', 'e2e', 'contracts', contractFile),
+      'utf8',
+    );
+    if (spec.id === 'REQ-PANEL-01' && spec.path === PANEL_SPEC_PATH) {
+      const contract = parseE2eContract(JSON.parse(raw) as unknown, 'panel');
+      if (
+        contract.reqId !== spec.id ||
+        contract.specPath !== spec.path ||
+        contract.specHash !== spec.hash
+      ) {
+        return '当前 main 的面板规格与受信验收契约版本不一致；拒绝创建新基线';
+      }
+      if (!contract.acceptanceCases) {
+        return '受信面板验收契约缺少 acceptanceCases，仅冒烟不得创建新基线';
+      }
+      const coverage = verifyPanelAcceptanceCoverage(
+        contract,
+        { [spec.path]: spec.body },
+        spec.id,
+      );
+      if (!coverage.ok) {
+        return `受信面板验收映射与冻结规格 A1..An 不一致：${coverage.detail}`;
+      }
+      return null;
+    }
     const contract = JSON.parse(raw) as Record<string, unknown>;
     if (
       contract.reqId !== spec.id ||
@@ -838,7 +1071,7 @@ function trustedContractError(trustedE2eRoot: string | undefined, spec: Spec): s
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return '控制器受管可信验收资产缺少 counter 契约，拒绝创建新基线';
+      return `控制器受管可信验收资产缺少 ${contractFile} 契约，拒绝创建新基线`;
     }
     return '可信验收契约解析失败，拒绝创建新基线';
   }
@@ -1033,19 +1266,32 @@ export async function prepareRetryBaseline(
   if (entries.length !== 1) return result('blocked', `#${issueNumber} 需求绑定数量异常，拒绝创建新基线`);
 
   const [reqId, requirement] = entries[0]!;
+  const panelError = panelGuardError(deps, reqId);
+  if (panelError) return result('blocked', panelError);
+  const profile = managedProfile(deps, reqId);
+  if (profile) {
+    const stateBindingError = panelStateBindingError(
+      deps,
+      snapshot,
+      profile,
+      requirement,
+      issueNumber,
+    );
+    if (stateBindingError) return result('blocked', `#${issueNumber} ${stateBindingError}`);
+  }
   const active = activeBaselines(snapshot, reqId, issueNumber);
   if (active.length > 1) {
     return result('blocked', `需求 ${reqId} 存在多个未结束的新基线准备，停止重试`);
   }
   if (active.length === 1) {
     const pending = active[0]!;
-    const dispatchRevision = reqId === COUNTER_REQ_ID
-      ? counterRevisionForBaseline(snapshot, pending, true)
+    const dispatchRevision = profile
+      ? managedRevisionForBaseline(snapshot, pending, profile, true)
       : undefined;
-    if (reqId === COUNTER_REQ_ID && !dispatchRevision) {
+    if (profile && !dispatchRevision) {
       return result(
         'blocked',
-        `#${issueNumber} 未决重试准备缺少当前已发布且带授权的 counter 派工版本，拒绝恢复 Worker`,
+        `#${issueNumber} 未决重试准备缺少当前已发布且带授权的 ${reqId} 派工版本，拒绝恢复 Worker`,
         pending,
       );
     }
@@ -1124,8 +1370,15 @@ export async function prepareRetryBaseline(
 
   let targetMainSha: string;
   let dispatchRevision: DispatchRevision | undefined;
-  if (reqId === COUNTER_REQ_ID) {
-    const checked = await prepareCounterRetry(deps, snapshot, requirement, oldJob, issueNumber);
+  if (profile) {
+    const checked = await prepareManagedRetry(
+      deps,
+      snapshot,
+      profile,
+      requirement,
+      oldJob,
+      issueNumber,
+    );
     if ('status' in checked) return checked;
     targetMainSha = checked.targetMainSha;
     dispatchRevision = checked.revision;
@@ -1352,21 +1605,40 @@ async function resumePreparedBaseline(
   explicit: boolean,
   dispatchRevision?: DispatchRevision,
 ): Promise<RetryBaselineResult> {
+  const panelError = panelGuardError(deps, stored.reqId);
+  if (panelError) return result('blocked', messageFor(stored, panelError), stored);
   const snapshot = deps.state.snapshot();
   const requirement = snapshot.requirements[stored.reqId];
   const oldJob = snapshot.jobs[stored.fromJobId];
   const newJob = snapshot.jobs[stored.newJobId];
-  const boundDispatchRevision = stored.reqId === COUNTER_REQ_ID
-    ? counterRevisionForBaseline(snapshot, stored, explicit)
+  const profile = managedProfile(deps, stored.reqId);
+  if (profile) {
+    const stateBindingError = panelStateBindingError(
+      deps,
+      snapshot,
+      profile,
+      requirement,
+      stored.issueNumber,
+    );
+    if (stateBindingError) {
+      return result('blocked', messageFor(stored, stateBindingError), stored);
+    }
+    const anchorError = await panelAnchorError(deps, profile, stored.targetSourceMainSha);
+    if (anchorError) {
+      return result('blocked', messageFor(stored, anchorError), stored);
+    }
+  }
+  const boundDispatchRevision = profile
+    ? managedRevisionForBaseline(snapshot, stored, profile, explicit)
     : dispatchRevision;
-  if (stored.reqId === COUNTER_REQ_ID && !boundDispatchRevision) {
+  if (profile && !boundDispatchRevision) {
     return result(
       'blocked',
       messageFor(
         stored,
         explicit
-          ? '当前 counter 派工版本已发布但无有效授权，拒绝恢复 Worker'
-          : '当前 counter 派工版本与未决准备不一致，停止自动恢复',
+          ? `当前 ${stored.reqId} 派工版本已发布但无有效授权，拒绝恢复 Worker`
+          : `当前 ${stored.reqId} 派工版本与未决准备不一致，停止自动恢复`,
       ),
       stored,
     );
@@ -1532,6 +1804,25 @@ async function finishReady(
   deps: RetryBaselineDeps,
   preflight: Preflight,
 ): Promise<Preflight | RetryBaselineResult> {
+  const panelError = panelGuardError(deps, preflight.reqId);
+  if (panelError) return result('blocked', messageFor(preflight.baseline, panelError), preflight.baseline);
+  const profile = managedProfile(deps, preflight.reqId);
+  if (profile) {
+    const stateBindingError = panelStateBindingError(
+      deps,
+      deps.state.snapshot(),
+      profile,
+      deps.state.snapshot().requirements[preflight.reqId],
+      preflight.issueNumber,
+    );
+    if (stateBindingError) {
+      return result('blocked', messageFor(preflight.baseline, stateBindingError), preflight.baseline);
+    }
+    const anchorError = await panelAnchorError(deps, profile, preflight.targetMainSha);
+    if (anchorError) {
+      return result('blocked', messageFor(preflight.baseline, anchorError), preflight.baseline);
+    }
+  }
   deps.hooks?.beforeCommitReady?.(preflight.baseline, deps.state.snapshot());
   const nextJob = {
     ...readyJob(preflight.baseline, preflight.newJob),
@@ -1545,17 +1836,21 @@ async function finishReady(
       const current = s.requirements[preflight.reqId];
       const old = s.jobs[preflight.oldJob.jobId];
       const job = s.jobs[preflight.baseline.newJobId];
-      const latestDispatch = latestCounterRevision(s);
+      const latestDispatch = latestManagedRevision(s, preflight.reqId);
       const dispatchBindingError =
-        preflight.reqId === COUNTER_REQ_ID &&
-        (!preflight.dispatchRevision ||
+        profile &&
+        (!latestDispatch ||
+          managedRevisionShapeError(latestDispatch, profile) ||
+          !preflight.dispatchRevision ||
           !latestDispatch ||
           latestDispatch.revision !== preflight.dispatchRevision.revision ||
+          !sameDispatchIdentity(latestDispatch, preflight.dispatchRevision) ||
           !isPublishedRevision(latestDispatch) ||
           !latestDispatch.grant ||
-          latestDispatch.specHash !== baseline?.specHash ||
-          latestDispatch.specPath !== baseline?.specPath ||
-          latestDispatch.sourceMainSha !== baseline?.targetSourceMainSha);
+          latestDispatch.issueNumber !== preflight.issueNumber ||
+          (deps.panelBinding &&
+            profile.project === 'panel' &&
+            !sameRepositoryId(latestDispatch.repoId, deps.panelBinding.repositoryId)));
       if (
         !baseline ||
         !current ||
@@ -1658,18 +1953,37 @@ async function runPreparedJob(
   stored: RetryBaselineState,
   dispatchRevision?: DispatchRevision,
 ): Promise<RetryBaselineResult> {
+  const panelError = panelGuardError(deps, stored.reqId);
+  if (panelError) return result('blocked', messageFor(stored, panelError), stored);
   const snapshot = deps.state.snapshot();
   const baseline = snapshot.retryBaselines?.[stored.operationId];
   const requirement = snapshot.requirements[stored.reqId];
   const oldJob = snapshot.jobs[stored.fromJobId];
   const newJob = snapshot.jobs[stored.newJobId];
-  const boundDispatchRevision = stored.reqId === COUNTER_REQ_ID
-    ? counterRevisionForBaseline(snapshot, stored, true)
+  const profile = managedProfile(deps, stored.reqId);
+  if (profile) {
+    const stateBindingError = panelStateBindingError(
+      deps,
+      snapshot,
+      profile,
+      requirement,
+      stored.issueNumber,
+    );
+    if (stateBindingError) {
+      return result('blocked', messageFor(stored, stateBindingError), stored);
+    }
+    const anchorError = await panelAnchorError(deps, profile, stored.targetSourceMainSha);
+    if (anchorError) {
+      return result('blocked', messageFor(stored, anchorError), stored);
+    }
+  }
+  const boundDispatchRevision = profile
+    ? managedRevisionForBaseline(snapshot, stored, profile, true)
     : dispatchRevision;
-  if (stored.reqId === COUNTER_REQ_ID && !boundDispatchRevision) {
+  if (profile && !boundDispatchRevision) {
     return result(
       'blocked',
-      messageFor(stored, '当前 counter 派工版本缺少已发布记录或有效授权，未调用 Worker'),
+      messageFor(stored, `当前 ${stored.reqId} 派工版本缺少已发布记录或有效授权，未调用 Worker`),
       baseline ?? stored,
     );
   }
@@ -1719,10 +2033,10 @@ async function runPreparedJob(
   if (!fixedTarget && !hasMoved) {
     return result('pending', messageFor(baseline, '执行前 main 无法核验为固定 target，未调用 Worker'), baseline);
   }
-  if (stored.reqId === COUNTER_REQ_ID && !fixedTarget) {
+  if (profile && !fixedTarget) {
     return result(
       'stale',
-      messageFor(baseline, '执行前 counter main 已变化，未调用 Worker；请重新显式重试发布待排期 rN'),
+      messageFor(baseline, `执行前 ${stored.reqId} main 已变化，未调用 Worker；请重新显式重试发布待排期 rN`),
       baseline,
     );
   }
@@ -1762,11 +2076,11 @@ async function runPreparedJob(
   if (await deps.github.branchExists(baseline.newJobId)) {
     return result('blocked', messageFor(baseline, '新 Job 的受管分支已存在但无匹配 PR，未调用 Worker'), baseline);
   }
-  if (stored.reqId === COUNTER_REQ_ID) {
+  if (profile) {
     let claimedRevision: DispatchRevision | undefined;
     try {
       await deps.state.update((s) => {
-        const currentRevision = counterRevisionForBaseline(s, baseline, true);
+        const currentRevision = managedRevisionForBaseline(s, baseline, profile, true);
         const currentJob = s.jobs[baseline.newJobId];
         if (
           !currentRevision ||
@@ -1790,14 +2104,14 @@ async function runPreparedJob(
     } catch (error) {
       return result(
         'blocked',
-        messageFor(baseline, `显式重试领取 counter Job 失败，未调用 Worker: ${errorText(error)}`),
+        messageFor(baseline, `显式重试领取 ${stored.reqId} Job 失败，未调用 Worker: ${errorText(error)}`),
         baseline,
       );
     }
     if (!claimedRevision) {
       return result(
         'blocked',
-        messageFor(baseline, '显式重试领取前 counter 版本、授权或 Job 状态已变化，未调用 Worker'),
+        messageFor(baseline, `显式重试领取前 ${stored.reqId} 版本、授权或 Job 状态已变化，未调用 Worker`),
         baseline,
       );
     }
@@ -1879,9 +2193,38 @@ async function resumeReadyBaseline(
   deps: RetryBaselineDeps,
   baseline: RetryBaselineState,
 ): Promise<void> {
+  const panelError = panelGuardError(deps, baseline.reqId);
+  if (panelError) {
+    deps.logger.warn(`重试 ready ${baseline.operationId}: ${panelError}`);
+    return;
+  }
   const snapshot = deps.state.snapshot();
   const requirement = snapshot.requirements[baseline.reqId];
   const newJob = snapshot.jobs[baseline.newJobId];
+  const profile = managedProfile(deps, baseline.reqId);
+  if (profile) {
+    const stateBindingError = panelStateBindingError(
+      deps,
+      snapshot,
+      profile,
+      requirement,
+      baseline.issueNumber,
+    );
+    if (stateBindingError) {
+      deps.logger.warn(`重试 ready ${baseline.operationId}: ${stateBindingError}`);
+      return;
+    }
+    const anchorError = await panelAnchorError(deps, profile, baseline.targetSourceMainSha);
+    if (
+      anchorError ||
+      !managedRevisionForBaseline(snapshot, baseline, profile, true)
+    ) {
+      deps.logger.warn(
+        `重试 ready ${baseline.operationId}: ${anchorError ?? '当前冻结派工版本或授权已变化'}`,
+      );
+      return;
+    }
+  }
   const bindingError = currentBindingError(baseline, requirement);
   if (
     bindingError ||
@@ -1942,21 +2285,39 @@ async function recordWarning(
 }
 
 async function persistPrepared(deps: RetryBaselineDeps, preflight: RetryBaselinePreflight): Promise<void> {
+  const panelError = panelGuardError(deps, preflight.reqId);
+  if (panelError) throw new Error(panelError);
+  const profile = managedProfile(deps, preflight.reqId);
+  if (profile) {
+    const stateBindingError = panelStateBindingError(
+      deps,
+      deps.state.snapshot(),
+      profile,
+      preflight.requirement,
+      preflight.issueNumber,
+    );
+    if (stateBindingError) throw new Error(stateBindingError);
+    const anchorError = await panelAnchorError(deps, profile, preflight.targetMainSha);
+    if (anchorError) throw new Error(anchorError);
+  }
   deps.hooks?.beforePersistPrepared?.(preflight.baseline);
   await deps.state.update((s) => {
     const requirement = s.requirements[preflight.reqId];
     const oldJob = s.jobs[preflight.oldJob.jobId];
-    const latestDispatch = latestCounterRevision(s);
+    const latestDispatch = latestManagedRevision(s, preflight.reqId);
     const dispatchBindingError =
-      preflight.reqId === COUNTER_REQ_ID &&
-      (!preflight.dispatchRevision ||
-        !latestDispatch ||
+      profile &&
+      (!latestDispatch ||
+        managedRevisionShapeError(latestDispatch, profile) ||
+        !preflight.dispatchRevision ||
         latestDispatch.revision !== preflight.dispatchRevision.revision ||
+        !sameDispatchIdentity(latestDispatch, preflight.dispatchRevision) ||
         !isPublishedRevision(latestDispatch) ||
         !latestDispatch.grant ||
-        latestDispatch.specHash !== preflight.baseline.specHash ||
-        latestDispatch.specPath !== preflight.baseline.specPath ||
-        latestDispatch.sourceMainSha !== preflight.baseline.targetSourceMainSha);
+        latestDispatch.issueNumber !== preflight.issueNumber ||
+        (deps.panelBinding &&
+          profile.project === 'panel' &&
+          !sameRepositoryId(latestDispatch.repoId, deps.panelBinding.repositoryId)));
     if (
       !requirement ||
       !oldJob ||
@@ -2036,6 +2397,11 @@ export async function resumeRetryBaselines(deps: RetryBaselineDeps): Promise<voi
   for (const baseline of pending) {
     try {
       const current = deps.state.snapshot();
+      const panelError = panelGuardError(deps, baseline.reqId);
+      if (panelError) {
+        deps.logger.warn(`重试准备 ${baseline.operationId}: ${panelError}`);
+        continue;
+      }
       // 重启/对账只读恢复既有准备，不能因一次恢复新增未登记的新 Job。
       if (!current.jobs[baseline.fromJobId]) {
         deps.logger.warn(`重试准备 ${baseline.operationId} 旧 Job 链接缺失，保留待人工检查`);

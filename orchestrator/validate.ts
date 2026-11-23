@@ -18,6 +18,14 @@ export interface ValidatedFile {
   content: string;
 }
 
+/** Worker 允许写入的受信源码根；counter 用 `src`，panel 用 `panel/src`。 */
+export type WorkerSourceRoot = 'src' | 'panel/src';
+
+/** Worker 构建脚本；由交付 profile 决定。 */
+export type WorkerBuildScript = 'build' | 'build:panel';
+
+const SOURCE_ROOT_RE = /^(?:src|panel\/src)$/;
+
 function assertNoSymlinkIn(baseAbs: string, parts: string[]): void {
   let cursor = baseAbs;
   for (const part of parts) {
@@ -25,8 +33,9 @@ function assertNoSymlinkIn(baseAbs: string, parts: string[]): void {
     let stat;
     try {
       stat = lstatSync(cursor);
-    } catch {
-      continue;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw new Error(`无法检查路径（${cursor}），拒绝继续: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (stat.isSymbolicLink()) {
       throw new Error(`拒绝符号链接路径: ${cursor}`);
@@ -34,9 +43,41 @@ function assertNoSymlinkIn(baseAbs: string, parts: string[]): void {
   }
 }
 
-export function resolveSafePath(baseDir: string, relPath: string): string {
+/**
+ * 核对受信源码根每一级（如 `src`、`panel`、`panel/src`）都不是符号链接，
+ * 并且存在时为目录。快照读取与 validateWorkerManifest 共用同一路径规则；
+ * 缺失的层级不报错，由调用方按“无源码”处理。
+ */
+export function assertNoSymlinkRoot(baseDir: string, allowedRoot: WorkerSourceRoot = 'src'): void {
+  if (!SOURCE_ROOT_RE.test(allowedRoot)) {
+    throw new Error(`无效的允许根路径: ${allowedRoot}`);
+  }
+  const baseAbs = resolve(baseDir);
+  let cursor = baseAbs;
+  for (const part of allowedRoot.split('/')) {
+    cursor = join(cursor, part);
+    let stat;
+    try {
+      stat = lstatSync(cursor);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw new Error(`无法检查源码根（${cursor}），拒绝继续: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`拒绝符号链接源码根: ${cursor}`);
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`源码根不是目录: ${cursor}`);
+    }
+  }
+}
+
+export function resolveSafePath(baseDir: string, relPath: string, allowedRoot: string = 'src'): string {
   if (typeof relPath !== 'string' || relPath.length === 0) {
     throw new Error('空路径');
+  }
+  if (!SOURCE_ROOT_RE.test(allowedRoot)) {
+    throw new Error(`无效的允许根路径: ${allowedRoot}`);
   }
   if (relPath.includes('\0')) throw new Error(`路径包含 NUL: ${relPath}`);
   if (isAbsolute(relPath)) throw new Error(`拒绝绝对路径: ${relPath}`);
@@ -50,8 +91,8 @@ export function resolveSafePath(baseDir: string, relPath: string): string {
   if (parts.some((p) => p === '..')) {
     throw new Error(`拒绝路径穿越: ${relPath}`);
   }
-  if (parts[0] !== 'src') {
-    throw new Error(`越权路径（仅允许 src/**）: ${relPath}`);
+  if (normalized !== allowedRoot && !normalized.startsWith(`${allowedRoot}/`)) {
+    throw new Error(`越权路径（仅允许 ${allowedRoot}/**）: ${relPath}`);
   }
 
   const baseAbs = resolve(baseDir);
@@ -63,7 +104,11 @@ export function resolveSafePath(baseDir: string, relPath: string): string {
   return absPath;
 }
 
-export function validateWorkerManifest(baseDir: string, output: unknown): ValidatedFile[] {
+export function validateWorkerManifest(
+  baseDir: string,
+  output: unknown,
+  allowedRoot: string = 'src',
+): ValidatedFile[] {
   if (!output || typeof output !== 'object') {
     throw new Error('Worker 输出必须是 JSON 对象');
   }
@@ -76,7 +121,11 @@ export function validateWorkerManifest(baseDir: string, output: unknown): Valida
     if (!file || typeof file !== 'object' || typeof file.path !== 'string' || typeof file.content !== 'string') {
       throw new Error('Worker 文件项必须包含 string path 与 string content');
     }
-    files.push({ relPath: file.path, absPath: resolveSafePath(baseDir, file.path), content: file.content });
+    files.push({
+      relPath: file.path,
+      absPath: resolveSafePath(baseDir, file.path, allowedRoot),
+      content: file.content,
+    });
   }
   return files;
 }
@@ -101,11 +150,11 @@ export type CommandRunner = (
   opts: { cwd: string; env: Record<string, string> },
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 
-export function defaultVerificationCommands(): VerificationCommand[] {
+export function defaultVerificationCommands(buildScript: WorkerBuildScript = 'build'): VerificationCommand[] {
   return [
     { name: 'typecheck', cmd: 'npm', args: ['run', 'typecheck'] },
     { name: 'test', cmd: 'npm', args: ['test'] },
-    { name: 'build', cmd: 'npm', args: ['run', 'build'] },
+    { name: 'build', cmd: 'npm', args: ['run', buildScript] },
   ];
 }
 

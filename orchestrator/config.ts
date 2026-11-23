@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { isValidPanelBinding, type PanelBinding } from './delivery-profile.ts';
 import type { FeishuSettings } from './feishu-contract.ts';
 
 export interface Config {
@@ -26,6 +27,8 @@ export interface Config {
   logRetentionDays: number;
   reportToken: string;
   dispatchAllowedUserIds?: string[];
+  /** 面板需求的受信 opt-in 绑定；未配置时面板需求不参与派工。 */
+  panelBinding?: PanelBinding;
   feishu: FeishuSettings;
 }
 
@@ -47,6 +50,27 @@ function splitCsv(raw: string | undefined): string[] {
     .split(',')
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
+}
+
+/**
+ * 读取本机显式 `SPEC_LOOP_PANEL_BINDING` JSON。未设置/空值返回 undefined（默认停用面板），
+ * 设置后必须通过受信绑定校验；任何字段非法都直接抛出（fail closed），不放宽到静默忽略。
+ */
+function parsePanelBinding(): PanelBinding | undefined {
+  const raw = process.env.SPEC_LOOP_PANEL_BINDING?.trim();
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('SPEC_LOOP_PANEL_BINDING 必须是有效 JSON');
+  }
+  if (!isValidPanelBinding(parsed)) {
+    throw new Error(
+      'SPEC_LOOP_PANEL_BINDING 字段非法：需要 repo/mainBranch/repositoryId/issueNumber/confirmedMainSha/specHash 且边界有效',
+    );
+  }
+  return parsed;
 }
 
 export function parsePublicUrl(raw: string | undefined): string {
@@ -137,6 +161,7 @@ export function loadConfig(repoDir: string = process.cwd()): Config {
     logRetentionDays: intEnv('SPEC_LOOP_LOG_RETENTION_DAYS', 7),
     reportToken: strEnv('SPEC_LOOP_REPORT_TOKEN', ''),
     dispatchAllowedUserIds: splitCsv(process.env.SPEC_LOOP_DISPATCH_ALLOWED_USER_IDS),
+    panelBinding: parsePanelBinding(),
     feishu: {
       enabled: process.env.FEISHU_ENABLED === 'true',
       appId: process.env.FEISHU_APP_ID,
