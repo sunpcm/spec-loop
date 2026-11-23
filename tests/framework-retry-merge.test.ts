@@ -584,6 +584,10 @@ function confirmationCode(message: string): string {
   return match[1]!;
 }
 
+function codeMergedResult(prNumber = PR_NUMBER): string {
+  return `代码 PR #${prNumber} 已合并，仅确认代码。发布结果请查看同版本的健康检查和发布回执。`;
+}
+
 function mergeStage(state: StateStore): MergeRequestStage | undefined {
   return Object.values(state.snapshot().mergeRequests ?? {})[0]?.stage;
 }
@@ -844,10 +848,14 @@ test('面板 r2 代码 PR 合并正例只允许 panel/src/**，预检与确认�
 
     const code = confirmationCode(preview);
     const merged = await h.service.confirm(PR_NUMBER, code, actor);
-    assert.equal(merged, '已合并，后续编码/部署处理中');
+    assert.equal(merged, codeMergedResult());
     assert.equal(h.githubState.putCount, 1);
     assert.equal(mergeStage(h.state), 'merged');
     assert.equal(h.state.snapshot().jobs.oldPanelJob?.status, 'in-review');
+    assert.equal(
+      Object.values(h.state.snapshot().mergeRequests ?? {})[0]?.result,
+      codeMergedResult(),
+    );
     assert.equal(h.notifications.length, 1);
   } finally {
     fx.dispose();
@@ -1053,7 +1061,7 @@ test('面板预检后换绑定不能复用确认码，恢复已合并记录也�
       })),
       actor,
     );
-    assert.equal(merged, '已合并，后续编码/部署处理中');
+    assert.equal(merged, codeMergedResult());
     assert.equal(first.githubState.putCount, 1);
 
     const recovery = mergeServices(fx, {

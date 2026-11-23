@@ -541,6 +541,18 @@ function confirmationCode(message: string): string {
   return match[1]!;
 }
 
+function docsMergedResult(prNumber = PR_NUMBER): string {
+  return `文档 PR #${prNumber} 已合并，仅确认这版需求。Issue 公布本版清单后由操作者打标排期。`;
+}
+
+function codeMergedResult(prNumber = PR_NUMBER): string {
+  return `代码 PR #${prNumber} 已合并，仅确认代码。发布结果请查看同版本的健康检查和发布回执。`;
+}
+
+function mergeNotification(result: string, prUrl: string): string {
+  return `${result} ${prUrl}`;
+}
+
 test('文档 PR 成功路径同时核对 check-runs 与 combined status 后，以 REST PUT 指定 head 合并', async (t) => {
   const h = makeHarness('docs');
   t.after(() => rmSync(h.root, { recursive: true, force: true }));
@@ -557,7 +569,7 @@ test('文档 PR 成功路径同时核对 check-runs 与 combined status 后，�
   assert.equal(pending?.chatId, actor.chatId);
 
   const result = await h.service.confirm(PR_NUMBER, code, context());
-  assert.equal(result, '已合并，后续编码/部署处理中');
+  assert.equal(result, docsMergedResult());
   assert.equal(h.putCount, 1);
   assert.deepEqual(h.putCalls[0], [
     'api',
@@ -576,7 +588,8 @@ test('文档 PR 成功路径同时核对 check-runs 与 combined status 后，�
   const record = Object.values(h.state.snapshot().mergeRequests ?? {})[0];
   assert.equal(record?.stage, 'merged');
   assert.equal(record?.mergeCommitSha, MERGE_SHA);
-  assert.equal(h.notifications.length, 1);
+  assert.equal(record?.result, docsMergedResult());
+  assert.deepEqual(h.notifications, [mergeNotification(docsMergedResult(), h.rawPull.html_url)]);
 });
 
 test('代码 PR 成功路径保持 job=in-review，不提前设置 done 或关闭任务', async (t) => {
@@ -589,10 +602,77 @@ test('代码 PR 成功路径保持 job=in-review，不提前设置 done 或关�
   const code = confirmationCode(preview);
   const result = await h.service.confirm(PR_NUMBER, code, context());
 
-  assert.equal(result, '已合并，后续编码/部署处理中');
+  assert.equal(result, codeMergedResult());
   assert.equal(h.putCount, 1);
   assert.equal(h.state.snapshot().jobs['job-code-1']?.status, 'in-review');
   assert.equal(h.state.snapshot().jobs['job-code-1']?.prNumber, PR_NUMBER);
+  const record = Object.values(h.state.snapshot().mergeRequests ?? {})[0];
+  assert.equal(record?.result, codeMergedResult());
+  assert.deepEqual(h.notifications, [mergeNotification(codeMergedResult(), h.rawPull.html_url)]);
+});
+
+test('代码合并历史旧文案按已核验类型只读渲染，不写状态且不重复通知', async (t) => {
+  const h = makeHarness('code');
+  t.after(() => rmSync(h.root, { recursive: true, force: true }));
+  const code = confirmationCode(await h.service.preflight(PR_NUMBER, actor));
+  assert.equal(
+    await h.service.confirm(PR_NUMBER, code, context('om_confirm_initial')),
+    codeMergedResult(),
+  );
+  assert.equal(h.putCount, 1);
+  assert.deepEqual(h.notifications, [mergeNotification(codeMergedResult(), h.rawPull.html_url)]);
+
+  await h.state.update((state) => {
+    const record = Object.values(state.mergeRequests ?? {})[0];
+    assert.ok(record);
+    record.type = 'docs';
+    record.result = '已合并，后续编码/部署处理中';
+    record.updatedAt = '2026-11-14T02:30:00.000Z';
+  });
+  const historical = Object.values(h.state.snapshot().mergeRequests ?? {})[0]!;
+  const restarted = h.makeService();
+  assert.equal(await restarted.preflight(PR_NUMBER, actor), codeMergedResult());
+  assert.equal(h.putCount, 1);
+  assert.equal(h.notifications.length, 1);
+  assert.equal(
+    Object.values(h.state.snapshot().mergeRequests ?? {})[0]?.result,
+    historical.result,
+  );
+  assert.equal(
+    Object.values(h.state.snapshot().mergeRequests ?? {})[0]?.updatedAt,
+    historical.updatedAt,
+  );
+});
+
+test('文档合并历史旧文案按已核验类型只读渲染，不写状态且不重复通知', async (t) => {
+  const h = makeHarness('docs');
+  t.after(() => rmSync(h.root, { recursive: true, force: true }));
+  const code = confirmationCode(await h.service.preflight(PR_NUMBER, actor));
+  assert.equal(
+    await h.service.confirm(PR_NUMBER, code, context('om_confirm_docs_initial')),
+    docsMergedResult(),
+  );
+  await h.state.update((state) => {
+    const record = Object.values(state.mergeRequests ?? {})[0];
+    assert.ok(record);
+    record.type = 'code';
+    record.result = '已合并，后续编码/部署处理中';
+    record.updatedAt = '2026-11-14T02:30:00.000Z';
+  });
+
+  const historical = Object.values(h.state.snapshot().mergeRequests ?? {})[0]!;
+  const restarted = h.makeService();
+  assert.equal(await restarted.preflight(PR_NUMBER, actor), docsMergedResult());
+  assert.equal(h.putCount, 1);
+  assert.equal(h.notifications.length, 1);
+  assert.equal(
+    Object.values(h.state.snapshot().mergeRequests ?? {})[0]?.result,
+    historical.result,
+  );
+  assert.equal(
+    Object.values(h.state.snapshot().mergeRequests ?? {})[0]?.updatedAt,
+    historical.updatedAt,
+  );
 });
 
 test('真实本仓检查 API 形态被逐项解析：check-runs 与 status 都必须覆盖', async (t) => {
@@ -1061,7 +1141,7 @@ test('同码并发确认由状态落盘串行化，只发送一个 PUT', async (
   ]);
   const responses = [first, second];
   assert.equal(
-    responses.filter((response) => response === '已合并，后续编码/部署处理中').length,
+    responses.filter((response) => response === codeMergedResult()).length,
     1,
   );
   assert.equal(responses.filter((response) => /不再是 confirmable|拒绝合并/.test(response)).length, 1);
@@ -1118,24 +1198,28 @@ test('远端已合并但 success state 落盘失败时仍按远端真值成功�
 
   assert.equal(
     await h.service.confirm(PR_NUMBER, code, context('om_confirm_persist')),
-    '已合并，后续编码/部署处理中',
+    codeMergedResult(),
   );
   assert.equal(h.putCount, 1);
   assert.equal(
     Object.values(h.state.snapshot().mergeRequests ?? {})[0]?.stage,
     'attempted',
   );
+  assert.equal(h.notifications.length, 0);
 
   h.nowMs += 60 * 60 * 1000;
   assert.equal(
     await h.service.confirm(PR_NUMBER, code, context('om_confirm_recover')),
-    '已合并，后续编码/部署处理中',
+    codeMergedResult(),
   );
   assert.equal(h.putCount, 1);
   assert.equal(
     Object.values(h.state.snapshot().mergeRequests ?? {})[0]?.stage,
     'merged',
   );
+  assert.deepEqual(h.notifications, [
+    mergeNotification(codeMergedResult(), h.rawPull.html_url),
+  ]);
 });
 
 test('PUT 响应丢失且 PR 仍 open：持久 unknown，TTL 过后仅只读对账且不重发', async (t) => {
@@ -1175,13 +1259,47 @@ test('PUT 成功响应丢失但远端已经合并：回读恢复 merged，不重
 
   assert.equal(
     await h.service.confirm(PR_NUMBER, code, context()),
-    '已合并，后续编码/部署处理中',
+    codeMergedResult(),
   );
   assert.equal(h.putCount, 1);
   assert.equal(
     Object.values(h.state.snapshot().mergeRequests ?? {})[0]?.stage,
     'merged',
   );
+});
+
+test('后台恢复按核验类型持久化代码合并回执并通知一次', async (t) => {
+  const h = makeHarness('code');
+  t.after(() => rmSync(h.root, { recursive: true, force: true }));
+  h.putMode = 'open-timeout';
+  const code = confirmationCode(await h.service.preflight(PR_NUMBER, actor));
+
+  assert.match(
+    await h.service.confirm(PR_NUMBER, code, context('om_confirm_background_start')),
+    /合并结果未确定/,
+  );
+  assert.equal(h.putCount, 1);
+  assert.equal(h.notifications.length, 0);
+  await h.state.update((state) => {
+    const record = Object.values(state.mergeRequests ?? {})[0];
+    assert.ok(record);
+    record.type = 'docs';
+  });
+
+  h.rawPull.state = 'closed';
+  h.rawPull.merged = true;
+  h.rawPull.merge_commit_sha = h.mergeSha;
+  await h.service.reconcilePending();
+
+  assert.equal(h.putCount, 1);
+  const record = Object.values(h.state.snapshot().mergeRequests ?? {})[0];
+  assert.equal(record?.stage, 'merged');
+  assert.equal(record?.type, 'code');
+  assert.equal(record?.mergeCommitSha, h.mergeSha);
+  assert.equal(record?.result, codeMergedResult());
+  assert.deepEqual(h.notifications, [
+    mergeNotification(codeMergedResult(), h.rawPull.html_url),
+  ]);
 });
 
 test('merge API 声称 merged=true 但回读 open 时记 unknown，后续不重发 PUT', async (t) => {
@@ -1324,7 +1442,7 @@ test('已合并 PR 早返回仍校验同仓和受管 state/meta，不给非受�
   managed.rawPull.merge_commit_sha = MERGE_SHA;
   assert.equal(
     await managed.service.preflight(PR_NUMBER, actor),
-    '已合并，后续编码/部署处理中',
+    docsMergedResult(),
   );
   assert.equal(managed.putCount, 0);
   assert.equal(
@@ -1343,6 +1461,20 @@ test('已合并 PR 早返回仍校验同仓和受管 state/meta，不给非受�
   assert.match(rejected, /受管/);
 });
 
+test('代码 PR 已远端合并且无本地合并记录时仍返回固定合并事实', async (t) => {
+  const pending = makeHarness('code');
+  t.after(() => rmSync(pending.root, { recursive: true, force: true }));
+  pending.rawPull.state = 'closed';
+  pending.rawPull.merged = true;
+  pending.rawPull.merge_commit_sha = MERGE_SHA;
+  assert.equal(
+    await pending.service.preflight(PR_NUMBER, actor),
+    codeMergedResult(),
+  );
+  assert.equal(pending.putCount, 0);
+  assert.equal(Object.keys(pending.state.snapshot().mergeRequests ?? {}).length, 0);
+});
+
 test('已合并早返回允许 main 已前进，但仍复核受管文档绑定与文件证据', async (t) => {
   const h = makeHarness('docs');
   t.after(() => rmSync(h.root, { recursive: true, force: true }));
@@ -1354,7 +1486,7 @@ test('已合并早返回允许 main 已前进，但仍复核受管文档绑定�
 
   assert.equal(
     await h.service.preflight(PR_NUMBER, actor),
-    '已合并，后续编码/部署处理中',
+    docsMergedResult(),
   );
   h.filePages = [[{ filename: 'docs/specs/other.md', status: 'modified' }]];
   assert.match(
@@ -1369,7 +1501,7 @@ test('代码已合并后 spec 更新，旧确认码重放仅返回已合并且�
   const code = confirmationCode(await h.service.preflight(PR_NUMBER, actor));
   assert.equal(
     await h.service.confirm(PR_NUMBER, code, context('om_confirm_original')),
-    '已合并，后续编码/部署处理中',
+    codeMergedResult(),
   );
   assert.equal(h.putCount, 1);
   assert.equal(h.notifications.length, 1);
@@ -1388,7 +1520,7 @@ test('代码已合并后 spec 更新，旧确认码重放仅返回已合并且�
   for (const messageId of ['om_confirm_history_1', 'om_confirm_history_2']) {
     assert.equal(
       await h.service.confirm(PR_NUMBER, code, context(messageId)),
-      '已合并，后续编码/部署处理中',
+      codeMergedResult(),
     );
   }
   assert.equal(h.putCount, 1);

@@ -35,7 +35,6 @@ const SHA_RE = /^[0-9a-f]{40}$/i;
 const CODE_RE = /^[0-9a-f]{8}$/;
 const MAX_ERROR_LENGTH = 320;
 const TARGET_SPEC_PATH = COUNTER_SPEC_PATH;
-const MERGED_RESULT = '已合并，后续编码/部署处理中';
 const PASSING_CHECK_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 
 interface PullRequestDetail {
@@ -343,11 +342,11 @@ export class MergeService {
     try {
       const pr = await this.getPull(prNumber);
       if (pr.merged) {
-        await this.validateManagedEvidence(pr, undefined, 'merged');
+        const evidence = await this.validateManagedEvidence(pr, undefined, 'merged');
         this.logger.info(
           `[MERGE] PR #${prNumber} 已合并，受管绑定复核通过 head=${pr.headSHA.slice(0, 8)}`,
         );
-        return MERGED_RESULT;
+        return this.mergedResult(evidence.type, pr.number);
       }
       const current = await this.currentSpecSnapshot();
       const evidence = await this.validateManagedEvidence(pr, current, 'active');
@@ -438,14 +437,14 @@ export class MergeService {
       initialPull = await this.getPull(prNumber);
       if (initialPull.merged) {
         this.assertRecordHead(record, initialPull);
-        await this.validateManagedEvidence(
+        const evidence = await this.validateManagedEvidence(
           initialPull,
           undefined,
           'merged',
           record.baseSHA,
         );
         if (!initialPull.mergeCommitSha) throw new MergeEvidenceError('已合并 PR 缺少有效 merge commit SHA');
-        return await this.finishMerged(record, initialPull.mergeCommitSha);
+        return await this.finishMerged(record, initialPull.mergeCommitSha, evidence.type);
       }
       const current = await this.currentSpecSnapshot();
       await this.assertRecordSnapshot(record, initialPull, current.mainSha);
@@ -479,7 +478,7 @@ export class MergeService {
       const finalPull = await this.getPull(prNumber);
       if (finalPull.merged) {
         this.assertRecordHead(attempted, finalPull);
-        await this.validateManagedEvidence(
+        const evidence = await this.validateManagedEvidence(
           finalPull,
           undefined,
           'merged',
@@ -488,7 +487,7 @@ export class MergeService {
         if (!finalPull.mergeCommitSha) {
           throw new MergeEvidenceError('已合并 PR 缺少有效 merge commit SHA');
         }
-        return await this.finishMerged(attempted, finalPull.mergeCommitSha);
+        return await this.finishMerged(attempted, finalPull.mergeCommitSha, evidence.type);
       }
       const finalCurrent = await this.currentSpecSnapshot();
       await this.assertRecordSnapshot(attempted, finalPull, finalCurrent.mainSha);
@@ -555,7 +554,10 @@ export class MergeService {
       }
       return this.preflightMessage(record);
     }
-    if (record.stage === 'attempted' || record.stage === 'unknown' || record.stage === 'merged') {
+    if (record.stage === 'merged') {
+      return await this.verifyAndReturnMerged(record);
+    }
+    if (record.stage === 'attempted' || record.stage === 'unknown') {
       return await this.reconcile(record);
     }
     if (record.stage === 'expired') return this.expiredMessage(record);
@@ -569,8 +571,13 @@ export class MergeService {
       if (!pr.merged) {
         throw new MergeEvidenceError('已合并记录对应的 PR 当前回读仍为 open，拒绝改写历史合并结论');
       }
-      await this.validateManagedEvidence(pr, undefined, 'merged', record.baseSHA);
-      return MERGED_RESULT;
+      const evidence = await this.validateManagedEvidence(
+        pr,
+        undefined,
+        'merged',
+        record.baseSHA,
+      );
+      return this.mergedResult(evidence.type, pr.number);
     } catch (error) {
       this.logger.warn(`[MERGE] PR #${record.prNumber} 已合并幂等复核失败 ${boundedError(error)}`);
       return this.reject(record.prNumber, `已合并记录无法通过受管绑定复核：${boundedError(error)}`);
@@ -582,9 +589,14 @@ export class MergeService {
       const pr = await this.getPull(record.prNumber);
       this.assertRecordHead(record, pr);
       if (pr.merged) {
-        await this.validateManagedEvidence(pr, undefined, 'merged', record.baseSHA);
+        const evidence = await this.validateManagedEvidence(
+          pr,
+          undefined,
+          'merged',
+          record.baseSHA,
+        );
         if (!pr.mergeCommitSha) throw new MergeEvidenceError('已合并 PR 缺少有效 merge commit SHA');
-        return await this.finishMerged(record, pr.mergeCommitSha);
+        return await this.finishMerged(record, pr.mergeCommitSha, evidence.type);
       }
       if (pr.state === 'closed') {
         await this.markTerminal(record, 'failed', 'PR 已关闭但未合并，请重新创建或重新预检');
@@ -631,14 +643,19 @@ export class MergeService {
 
     if (pull.merged) {
       try {
-        await this.validateManagedEvidence(pull, undefined, 'merged', record.baseSHA);
+        const evidence = await this.validateManagedEvidence(
+          pull,
+          undefined,
+          'merged',
+          record.baseSHA,
+        );
         if (!pull.mergeCommitSha) throw new MergeEvidenceError('已合并 PR 缺少有效 merge commit SHA');
         const responseMerged = response?.merged === true;
         const responseSha = optionalString(response?.sha)?.toLowerCase();
         if (responseMerged && responseSha !== pull.mergeCommitSha) {
           throw new MergeEvidenceError('merge API 响应 SHA 与 PR 回读不一致，结果记为 unknown');
         }
-        return await this.finishMerged(record, pull.mergeCommitSha);
+        return await this.finishMerged(record, pull.mergeCommitSha, evidence.type);
       } catch (error) {
         const message = boundedError(error);
         await this.markUnknown(record, message);
@@ -1776,15 +1793,24 @@ export class MergeService {
     }
   }
 
-  private async finishMerged(record: MergeRequestState, mergeCommitSha: string): Promise<string> {
+  private async finishMerged(
+    record: MergeRequestState,
+    mergeCommitSha: string,
+    type: MergePrType,
+  ): Promise<string> {
+    const result = this.mergedResult(type, record.prNumber);
+    let persistedTransition = false;
     try {
-      await this.state.update((state) => {
+      const update = await this.state.update((state) => {
         const target = state.mergeRequests?.[record.requestId];
-        if (!target) return;
-        if (target.stage === 'merged' && target.mergeCommitSha === mergeCommitSha) return;
+        if (!target) return false;
+        if (target.stage === 'merged' && target.mergeCommitSha === mergeCommitSha) {
+          return false;
+        }
         target.stage = 'merged';
+        target.type = type;
         target.mergeCommitSha = mergeCommitSha;
-        target.result = MERGED_RESULT;
+        target.result = result;
         target.error = undefined;
         target.updatedAt = this.isoNow();
         state.opLog.push({
@@ -1793,19 +1819,32 @@ export class MergeService {
           operationKey: `merge:${target.prNumber}:${target.headSHA.slice(0, 8)}`,
           detail: `PR #${target.prNumber} 已合并 ${mergeCommitSha.slice(0, 8)}`,
         });
+        return true;
       });
+      persistedTransition = update.result;
     } catch (error) {
       this.logger.error(
         `[MERGE] PR #${record.prNumber} 已合并但 success state 落盘失败，保留 attempted 供恢复 ${boundedError(error)}`,
       );
     }
-    try {
-      await this.notify?.(`${MERGED_RESULT} ${record.prUrl}`);
-    } catch (error) {
-      this.logger.warn(`[MERGE] PR #${record.prNumber} 合并通知失败，不改变合并结果 ${boundedError(error)}`);
+    if (persistedTransition) {
+      try {
+        await this.notify?.(`${result} ${record.prUrl}`);
+      } catch (error) {
+        this.logger.warn(`[MERGE] PR #${record.prNumber} 合并通知失败，不改变合并结果 ${boundedError(error)}`);
+      }
     }
     this.logger.info(`[MERGE] PR #${record.prNumber} merged ${mergeCommitSha.slice(0, 8)}`);
-    return MERGED_RESULT;
+    return result;
+  }
+
+  private mergedResult(
+    type: MergePrType,
+    prNumber: number,
+  ): string {
+    return type === 'docs'
+      ? `文档 PR #${prNumber} 已合并，仅确认这版需求。Issue 公布本版清单后由操作者打标排期。`
+      : `代码 PR #${prNumber} 已合并，仅确认代码。发布结果请查看同版本的健康检查和发布回执。`;
   }
 
   private isoNow(): string {
