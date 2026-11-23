@@ -5,9 +5,9 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const promptDir = join(here, 'prompts');
 
-const DEFAULT_WORKER_PROMPT = `你是 Spec Loop 的 Worker。只能修改 src/ 下的前端源文件。
+const DEFAULT_WORKER_PROMPT = `你是 Spec Loop 的 Worker。只能修改 {{SOURCE_ROOT}}/ 下的前端源文件。
 只输出一个 JSON 对象，不要输出其它文字，格式：
-{"summary":"改动摘要","files":[{"path":"src/counter.ts","content":"..."}]}
+{"summary":"改动摘要","files":[{"path":"{{SOURCE_ROOT}}/counter.ts","content":"..."}]}
 禁止 shell、git、GitHub 或任意文件系统工具；不要读取或修改 docs、package.json、orchestrator。`;
 
 const DEFAULT_PLANNER_PROMPT = `你是 Spec Loop 的 Planner（任务 Agent）。根据给定需求快照只提出目标、步骤与验收引用。
@@ -31,3 +31,8 @@ export const SPEC_AUTHOR_PROMPT = load(
 只输出一个 JSON 对象：{"summary":"...","content":"完整的新文档内容"}。
 必须保留所有现有需求 ID，不能新增或删除需求块，不能修改其它文件。`,
 );
+
+/** 按交付 sourceDir 实例化 Worker 系统提示，允许 `src` 或 `panel/src` 两种受信写集。 */
+export function workerPromptFor(sourceDir: string): string {
+  return WORKER_PROMPT.replaceAll('{{SOURCE_ROOT}}', sourceDir);
+}

@@ -9,7 +9,7 @@ import type {
   SpecDiffEntry,
 } from './types.ts';
 
-export type ReconcileKind = 'create' | 'update' | 'close' | 'close-pr' | 'noop';
+export type ReconcileKind = 'create' | 'update' | 'close' | 'close-pr' | 'noop' | 'panel';
 
 export const HUMAN_AREA_BEGIN = '<!-- spec-loop:human:start -->';
 export const HUMAN_AREA_END = '<!-- spec-loop:human:end -->';

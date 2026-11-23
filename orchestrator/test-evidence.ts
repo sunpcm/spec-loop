@@ -74,6 +74,13 @@ export interface TestRunSummary {
   jobId: string | null;
   reqId: string | null;
   specHash: string | null;
+  /**
+   * 冻结规格的仓库相对路径。与 dispatchRevision 一起用于区分相同 specHash/来源
+   * SHA 的不同版本；旧记录或手工记录缺失时为 null。
+   */
+  specPath?: string | null;
+  /** 本记录对应的已发布派工版本号；缺失时不能按哈希反推 rN。 */
+  dispatchRevision?: number | null;
   sourceMainSha: string | null;
   candidateTreeSha: string | null;
   suiteFingerprint: string | null;
@@ -138,6 +145,7 @@ export interface TestEvidenceArtifact {
 const ID_RE = /^[a-z0-9][a-z0-9-]{1,127}$/i;
 const SHA_RE = /^[0-9a-f]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+const TEST_RUN_SPEC_PATH_RE = /^docs\/specs\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.md$/;
 const KIND_BY_EXT: Record<string, TestArtifactKind | undefined> = {
   '.png': 'screenshot',
   '.webm': 'video',
@@ -185,6 +193,18 @@ function nullableNumber(value: unknown): number | null {
 
 function nullableBoolean(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null;
+}
+
+export function isTestRunSpecPath(value: unknown): value is string {
+  return (
+    typeof value === 'string'
+    && TEST_RUN_SPEC_PATH_RE.test(value)
+    && !value.split('/').includes('..')
+  );
+}
+
+export function isTestRunDispatchRevision(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
 
 function safeCount(value: unknown): number | null {
@@ -345,11 +365,19 @@ export function parseTestRunRecord(raw: unknown): TestRunRecord | null {
   const sourceMainSha = nullableString(record.sourceMainSha);
   const candidateTreeSha = nullableString(record.candidateTreeSha);
   const suiteFingerprint = nullableString(record.suiteFingerprint);
+  const specPath = record.specPath === undefined || record.specPath === null
+    ? null
+    : record.specPath;
+  const dispatchRevision = record.dispatchRevision === undefined || record.dispatchRevision === null
+    ? null
+    : record.dispatchRevision;
 
   if (specHash && !SHA256_RE.test(specHash)) return null;
   if (sourceMainSha && !SHA_RE.test(sourceMainSha)) return null;
   if (candidateTreeSha && !SHA_RE.test(candidateTreeSha)) return null;
   if (suiteFingerprint && !SHA256_RE.test(suiteFingerprint)) return null;
+  if (specPath !== null && !isTestRunSpecPath(specPath)) return null;
+  if (dispatchRevision !== null && !isTestRunDispatchRevision(dispatchRevision)) return null;
 
   return {
     id,
@@ -361,6 +389,8 @@ export function parseTestRunRecord(raw: unknown): TestRunRecord | null {
     jobId: nullableString(record.jobId),
     reqId: nullableString(record.reqId),
     specHash,
+    specPath,
+    dispatchRevision,
     sourceMainSha,
     candidateTreeSha,
     suiteFingerprint,
@@ -545,6 +575,8 @@ export function createManualTestRunRecord(input: {
   jobId?: string | null;
   reqId?: string | null;
   specHash?: string | null;
+  specPath?: string | null;
+  dispatchRevision?: number | null;
   sourceMainSha?: string | null;
   candidateTreeSha?: string | null;
   suiteFingerprint?: string | null;
@@ -564,6 +596,8 @@ export function createManualTestRunRecord(input: {
     jobId: input.jobId ?? null,
     reqId: input.reqId ?? null,
     specHash: input.specHash ?? null,
+    specPath: input.specPath ?? null,
+    dispatchRevision: input.dispatchRevision ?? null,
     sourceMainSha: input.sourceMainSha ?? null,
     candidateTreeSha: input.candidateTreeSha ?? null,
     suiteFingerprint: input.suiteFingerprint ?? null,

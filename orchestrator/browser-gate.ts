@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, extname, join, normalize, sep } from 'node:path';
 import type { Logger } from './log.ts';
 import { buildIsolationPaths, runSandboxed, sandboxExecAvailable, sandboxExecBin, type IsolationPaths, type SandboxProfileSpec } from './sandbox.ts';
+import { splitSpecSections } from './dispatch-task.ts';
 import { parseSpecs } from './specs.ts';
 import {
   artifactKindFromName,
@@ -25,6 +26,8 @@ export interface E2eContract {
   specPath?: string;
   specHash?: string;
   caseIds: string[];
+  /** 面板业务门禁的验收映射：键 A1..An，值是对应受信 caseId 非空数组。 */
+  acceptanceCases?: Record<string, string[]>;
 }
 
 export interface E2eReportSummary {
@@ -163,6 +166,52 @@ function readNonEmptyString(record: Record<string, unknown>, key: string): strin
   return value.trim();
 }
 
+const ACCEPTANCE_KEY_RE = /^A[0-9]+$/;
+
+/**
+ * 解析面板可选验收映射：键 A1..An，值是对应受信 caseId 非空数组，且必须都已在 caseIds 中声明。
+ * 各条 A 的 caseId 之间不要求互斥，同一个真实浏览器用例可以覆盖多条验收（如 A6/A8）；
+ * 只要求同一条 A 内没有重复 caseId。
+ */
+function normalizeAcceptanceCases(raw: unknown, caseIds: string[]): Record<string, string[]> | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('acceptanceCases 必须是 JSON 对象');
+  }
+  const record = raw as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length === 0) {
+    throw new Error('acceptanceCases 不能为空');
+  }
+  const declared = new Set(caseIds);
+  const result: Record<string, string[]> = {};
+  for (const key of keys) {
+    if (!ACCEPTANCE_KEY_RE.test(key)) {
+      throw new Error(`acceptanceCases 键必须是 A1..An，非法键: ${key}`);
+    }
+    const value = record[key];
+    if (!Array.isArray(value) || value.length === 0) {
+      throw new Error(`acceptanceCases.${key} 必须是非空数组`);
+    }
+    const ids: string[] = [];
+    for (const item of value) {
+      if (typeof item !== 'string' || item.trim() === '') {
+        throw new Error(`acceptanceCases.${key} 只能包含非空字符串`);
+      }
+      const id = item.trim();
+      if (!declared.has(id)) {
+        throw new Error(`acceptanceCases.${key} 的 caseId ${id} 未在 caseIds 中声明`);
+      }
+      ids.push(id);
+    }
+    if (ids.length !== new Set(ids).size) {
+      throw new Error(`acceptanceCases.${key} 的 caseId 存在重复`);
+    }
+    result[key] = ids;
+  }
+  return result;
+}
+
 export function parseE2eContract(raw: unknown, project: E2eProject): E2eContract {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('验收契约必须是 JSON 对象');
@@ -181,7 +230,20 @@ export function parseE2eContract(raw: unknown, project: E2eProject): E2eContract
     }
     return { reqId, specPath, specHash, caseIds };
   }
-  return { caseIds };
+  const reqId = readNonEmptyString(c, 'reqId') ?? '';
+  const specPath = readNonEmptyString(c, 'specPath') ?? '';
+  const specHash = readNonEmptyString(c, 'specHash') ?? '';
+  if ((reqId || specPath || specHash) && (!reqId || !specPath || !specHash)) {
+    throw new Error('panel 契约的产品绑定必须同时包含 reqId、specPath 与 specHash');
+  }
+  if (specHash && !SHA256_RE.test(specHash)) {
+    throw new Error('panel 契约 specHash 必须是 64 位十六进制');
+  }
+  const acceptanceCases = normalizeAcceptanceCases(c.acceptanceCases, caseIds);
+  if (reqId || specPath || specHash) {
+    return { reqId, specPath, specHash, caseIds, acceptanceCases };
+  }
+  return { caseIds, acceptanceCases };
 }
 
 export interface CounterContractCheck {
@@ -220,6 +282,41 @@ export function verifyCounterContract(
     return { ok: false, detail: `契约 reqId ${reqId} 与本次需求 ${expectedReqId} 不匹配`, specHash: spec.hash };
   }
   return { ok: true, detail: '验收契约与候选规格一致', specHash: spec.hash };
+}
+
+/**
+ * 面板业务门禁的第二道校验：对照所选规格的每条验收（A1..An），验收映射必须完整覆盖。
+ * 规格本身无验收条目时不强制映射；缺失映射即 fail closed，避免冒烟单独产生产品成功。
+ */
+export function verifyPanelAcceptanceCoverage(
+  contract: E2eContract,
+  specFiles: Record<string, string>,
+  expectedReqId?: string,
+): CounterContractCheck {
+  const reqId = contract.reqId ?? '';
+  const parsed = parseSpecs(specFiles);
+  if (parsed.errors.length > 0) {
+    return { ok: false, detail: `规格解析失败: ${parsed.errors[0]?.reason ?? '未知错误'}`, specHash: '' };
+  }
+  const spec = parsed.specs.find((s) => s.id === reqId);
+  if (!spec) {
+    return { ok: false, detail: `契约 reqId ${reqId} 不在候选规格快照中`, specHash: '' };
+  }
+  const requiredKeys = splitSpecSections(spec.body).acceptances.map((_, index) => `A${index + 1}`);
+  const mapping = contract.acceptanceCases ?? {};
+  const actualKeys = Object.keys(mapping);
+  const required = new Set(requiredKeys);
+  const actual = new Set(actualKeys);
+  const missing = requiredKeys.filter((key) => !actual.has(key));
+  const extra = actualKeys.filter((key) => !required.has(key));
+  if (missing.length > 0 || extra.length > 0) {
+    return {
+      ok: false,
+      detail: `验收映射键必须与规格 A1..An 精确相等：缺失 [${missing.join(', ') || '无'}]，多余 [${extra.join(', ') || '无'}]`,
+      specHash: spec.hash,
+    };
+  }
+  return { ok: true, detail: '验收映射与所选规格 A1..An 精确相等', specHash: spec.hash };
 }
 
 export function extractCaseId(title: string): string | undefined {
@@ -476,6 +573,73 @@ export function readSpecFilesFromDir(rootDir: string): Record<string, string> {
   return files;
 }
 
+/** 受信规格的冻结身份：门禁按此精确读取候选快照，缺失或不符 fail closed。 */
+export interface FrozenSpecIdentity {
+  reqId: string;
+  specPath: string;
+  specHash: string;
+}
+
+/**
+ * 从候选快照按冻结身份读取精确白名单规格文件（不递归）。
+ *
+ * 与 `readSpecFilesFromDir` 的目录扫描不同，这里只读取冻结 `specPath` 指向的整份文件，
+ * 用 lstat 拒绝符号链接、以 parseSpecs 复核 reqId/path/hash；链接或哈希不符抛错，
+ * 缺失时返回空对象，由真实门禁按“reqId 不在候选规格快照中”fail closed。返回
+ * `{ [specPath]: 原文 }`，供 Worker 与合并构建的浏览器门禁共用，不能用输入正文补写所验树。
+ */
+export function readCandidateSpecFile(
+  candidateRoot: string,
+  frozen: FrozenSpecIdentity,
+): Record<string, string> {
+  if (!frozen.reqId || !frozen.specPath || !frozen.specHash) {
+    throw new Error('候选规格读取缺少冻结身份 reqId/specPath/specHash');
+  }
+  const path = frozen.specPath.replace(/\\/g, '/');
+  if (path.includes('\0') || path.startsWith('/') || /^[A-Za-z]:/.test(path)) {
+    throw new Error(`冻结规格路径非法: ${frozen.specPath}`);
+  }
+  if (path.split('/').some((part) => part === '..' || part === '')) {
+    throw new Error(`冻结规格路径非法: ${frozen.specPath}`);
+  }
+  const parts = path.split('/');
+  let archivedPath = candidateRoot;
+  for (let index = 0; index < parts.length; index += 1) {
+    archivedPath = join(archivedPath, parts[index]!);
+    let stat;
+    try {
+      stat = lstatSync(archivedPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+      throw new Error(
+        `无法读取候选快照中的受信规格（${archivedPath}）: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`候选快照中的受信规格路径包含符号链接: ${frozen.specPath}`);
+    }
+    const last = index === parts.length - 1;
+    if ((!last && !stat.isDirectory()) || (last && !stat.isFile())) {
+      throw new Error(`候选快照中的受信规格不是普通文件: ${frozen.specPath}`);
+    }
+  }
+  const body = readFileSync(archivedPath, 'utf8');
+  const parsed = parseSpecs({ [frozen.specPath]: body });
+  if (parsed.errors.length > 0) {
+    throw new Error(`候选规格解析失败: ${parsed.errors[0]?.reason ?? '未知错误'}`);
+  }
+  const exact = parsed.specs.find(
+    (spec) =>
+      spec.id === frozen.reqId
+      && spec.path === frozen.specPath
+      && spec.hash === frozen.specHash,
+  );
+  if (!exact) {
+    throw new Error(`候选规格与冻结身份不一致: ${frozen.reqId} ${frozen.specPath}`);
+  }
+  return { [frozen.specPath]: body };
+}
+
 function readE2eSuiteFiles(e2eRoot: string): Record<string, string> {
   const files: Record<string, string> = {};
   const collect = (dir: string, prefix: string): void => {
@@ -687,6 +851,13 @@ export interface BrowserGateEnvOptions {
   version: string;
   browserCacheDir: string;
   video: 'retain-on-failure' | 'on';
+  reqId?: string;
+  specPath?: string;
+  specHash?: string;
+  dispatchRevision?: number;
+  sourceMainSha?: string;
+  candidateTreeSha?: string;
+  jobId?: string;
 }
 
 export function buildBrowserGateEnv(opts: BrowserGateEnvOptions): Record<string, string> {
@@ -703,6 +874,17 @@ export function buildBrowserGateEnv(opts: BrowserGateEnvOptions): Record<string,
   env.SPEC_LOOP_E2E_REPORT_DIR = opts.reportDir;
   env.SPEC_LOOP_E2E_VIDEO = opts.video;
   env.PLAYWRIGHT_BROWSERS_PATH = opts.browserCacheDir;
+  if (opts.reqId?.trim()) env.SPEC_LOOP_E2E_REQ_ID = opts.reqId.trim();
+  if (opts.specPath?.trim()) env.SPEC_LOOP_E2E_SPEC_PATH = opts.specPath.trim();
+  if (opts.specHash?.trim()) env.SPEC_LOOP_E2E_SPEC_HASH = opts.specHash.trim();
+  if (opts.dispatchRevision !== undefined) {
+    env.SPEC_LOOP_E2E_DISPATCH_REVISION = String(opts.dispatchRevision);
+  }
+  if (opts.sourceMainSha?.trim()) env.SPEC_LOOP_E2E_SOURCE_MAIN_SHA = opts.sourceMainSha.trim();
+  if (opts.candidateTreeSha?.trim()) {
+    env.SPEC_LOOP_E2E_CANDIDATE_TREE_SHA = opts.candidateTreeSha.trim();
+  }
+  if (opts.jobId?.trim()) env.SPEC_LOOP_E2E_JOB_ID = opts.jobId.trim();
   return env;
 }
 
@@ -744,6 +926,8 @@ export interface BrowserGateOptions {
   version: string;
   project: E2eProject;
   reqId?: string;
+  specPath?: string;
+  dispatchRevision?: number;
   specFiles: Record<string, string>;
   jobTmp: string;
   browserCacheDir: string;
@@ -759,6 +943,10 @@ export interface BrowserGateOptions {
   jobId?: string;
   sourceMainSha?: string;
   candidateTreeSha?: string;
+  /** 仅允许未绑定产品的手动冒烟跳过产品绑定；不会生成本轮产品成功证据。 */
+  unboundProductSmoke?: boolean;
+  /** 面板调用方要求契约必须具有完整产品绑定；缺任一项 fail closed。 */
+  requireProductBinding?: boolean;
 }
 
 export interface BrowserGateResult {
@@ -774,6 +962,7 @@ export interface BrowserGateResult {
   summary?: E2eReportSummary;
   suiteFingerprint?: string;
   specHash?: string;
+  productBinding?: 'bound' | 'unbound-product-smoke';
   testRunRecord?: TestRunRecord | null;
 }
 
@@ -782,7 +971,13 @@ export interface BrowserGateReceipt {
   kind: 'browser-gate-receipt';
   project: E2eProject;
   reqId?: string;
+  specPath?: string;
   specHash?: string;
+  dispatchRevision?: number;
+  sourceMainSha?: string;
+  candidateTreeSha?: string;
+  jobId?: string;
+  productBinding: 'bound' | 'unbound-product-smoke';
   displayVersion: string;
   suiteFingerprint?: string;
   node: string;
@@ -1060,7 +1255,9 @@ function summaryFromPlaywright(raw: unknown, project: E2eProject): TestRunSummar
 function makeBrowserTestRunRecord(opts: {
   project: E2eProject;
   reqId?: string;
+  specPath?: string;
   specHash?: string;
+  dispatchRevision?: number;
   sourceMainSha?: string;
   candidateTreeSha?: string;
   jobId?: string;
@@ -1111,7 +1308,9 @@ function makeBrowserTestRunRecord(opts: {
     finishedAt: new Date().toISOString(),
     jobId: opts.jobId ?? null,
     reqId: opts.reqId ?? null,
+    specPath: opts.specPath ?? null,
     specHash: opts.specHash ?? null,
+    dispatchRevision: opts.dispatchRevision ?? null,
     sourceMainSha: opts.sourceMainSha ?? null,
     candidateTreeSha: opts.candidateTreeSha ?? null,
     suiteFingerprint: opts.suiteFingerprint ?? null,
@@ -1144,6 +1343,10 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
   const startedAt = new Date().toISOString();
   const evidenceStage = opts.evidenceStage ?? 'manual';
   const testRunsRoot = opts.testRunsRoot;
+  let evidenceReqId = opts.reqId;
+  let evidenceSpecPath = opts.specPath;
+  let productBinding: 'bound' | 'unbound-product-smoke' =
+    opts.project === 'counter' ? 'bound' : 'unbound-product-smoke';
   const writeEvidence = (
     ok: boolean,
     reportPath = join(reportDir, 'results.json'),
@@ -1153,8 +1356,10 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
     if (!testRunsRoot) return null;
     const record = makeBrowserTestRunRecord({
       project: opts.project,
-      reqId: opts.reqId,
+      reqId: evidenceReqId,
+      specPath: evidenceSpecPath,
       specHash: currentSpecHash,
+      dispatchRevision: opts.dispatchRevision,
       sourceMainSha: opts.sourceMainSha,
       candidateTreeSha: opts.candidateTreeSha,
       jobId: opts.jobId,
@@ -1188,8 +1393,15 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
     stdoutLogPath,
     stderrLogPath,
     receiptPath,
+    productBinding,
     ...extra,
   });
+
+  if (opts.project === 'panel' && opts.unboundProductSmoke && opts.requireProductBinding) {
+    const result = fail('unboundProductSmoke 与 requireProductBinding 不能同时启用');
+    result.testRunRecord = writeEvidence(false);
+    return result;
+  }
 
   if (!sandboxExecAvailable(execBin)) {
     const result = fail(`fail-closed: sandbox-exec 不可用（${execBin}），拒绝无隔离浏览器验收`);
@@ -1245,7 +1457,39 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
   }
 
   let specHash: string | undefined;
-  if (opts.project === 'counter') {
+  const contractBound = Boolean(contract.reqId && contract.specPath && contract.specHash);
+  const versionBound = opts.project === 'counter'
+    || (contractBound && !opts.unboundProductSmoke);
+  productBinding = versionBound ? 'bound' : 'unbound-product-smoke';
+  if (opts.project === 'panel' && opts.requireProductBinding && !versionBound) {
+    const result = fail('panel 产品门禁要求完整 reqId/specPath/specHash 契约绑定', {
+      contract,
+    });
+    result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint);
+    return result;
+  }
+  if (versionBound) {
+    if (opts.reqId && contract.reqId && opts.reqId !== contract.reqId) {
+      const result = fail(`门禁 reqId ${opts.reqId} 与契约 ${contract.reqId} 不一致`, {
+        contract,
+      });
+      result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint);
+      return result;
+    }
+    if (opts.specPath && contract.specPath && opts.specPath !== contract.specPath) {
+      const result = fail(`门禁 specPath ${opts.specPath} 与契约 ${contract.specPath} 不一致`, {
+        contract,
+      });
+      result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint);
+      return result;
+    }
+    evidenceReqId = opts.reqId ?? contract.reqId;
+    evidenceSpecPath = opts.specPath ?? contract.specPath;
+  } else {
+    evidenceReqId = undefined;
+    evidenceSpecPath = undefined;
+  }
+  if (versionBound) {
     const check = verifyCounterContract(contract, opts.specFiles, opts.reqId);
     if (!check.ok) {
       specHash = check.specHash;
@@ -1255,6 +1499,45 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
     }
     specHash = check.specHash;
   }
+  if (
+    opts.project === 'panel'
+    && (versionBound || evidenceStage === 'worker' || evidenceStage === 'build')
+  ) {
+    const acceptance = contract.acceptanceCases;
+    if (!acceptance || Object.keys(acceptance).length === 0) {
+      const result = fail('panel 业务门禁缺少 acceptanceCases 验收映射，仅冒烟不得产生产品成功', {
+        contract,
+        specHash,
+      });
+      result.testRunRecord = writeEvidence(false, join(reportDir, 'results.json'), suiteFingerprint, specHash);
+      return result;
+    }
+    const coverage = verifyPanelAcceptanceCoverage(contract, opts.specFiles, opts.reqId);
+    if (!coverage.ok) {
+      const result = fail(`panel 验收映射不完整：${coverage.detail}`, {
+        contract,
+        specHash: coverage.specHash || specHash,
+      });
+      result.testRunRecord = writeEvidence(
+        false,
+        join(reportDir, 'results.json'),
+        suiteFingerprint,
+        coverage.specHash || specHash,
+      );
+      return result;
+    }
+  }
+
+  const receiptIdentity = (currentSpecHash: string | undefined) => ({
+    reqId: productBinding === 'bound' ? evidenceReqId : undefined,
+    specPath: productBinding === 'bound' ? evidenceSpecPath : undefined,
+    specHash: productBinding === 'bound' ? currentSpecHash : undefined,
+    dispatchRevision: opts.dispatchRevision,
+    sourceMainSha: opts.sourceMainSha,
+    candidateTreeSha: opts.candidateTreeSha,
+    jobId: opts.jobId,
+    productBinding,
+  });
 
   const server = createCandidateStaticServer({ artifactDir, mountPath: opts.mountPath });
   let port = 0;
@@ -1284,6 +1567,13 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
       version: opts.version,
       browserCacheDir,
       video: opts.video ?? 'retain-on-failure',
+      reqId: productBinding === 'bound' ? evidenceReqId : undefined,
+      specPath: productBinding === 'bound' ? evidenceSpecPath : undefined,
+      specHash: productBinding === 'bound' ? specHash : undefined,
+      dispatchRevision: opts.dispatchRevision,
+      sourceMainSha: opts.sourceMainSha,
+      candidateTreeSha: opts.candidateTreeSha,
+      jobId: opts.jobId,
     });
 
     const runner = opts.runner ?? defaultBrowserGateRunner();
@@ -1306,8 +1596,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
           schema: 1,
           kind: 'browser-gate-receipt',
           project: opts.project,
-          reqId: opts.reqId,
-          specHash,
+          ...receiptIdentity(specHash),
           displayVersion: opts.version,
           suiteFingerprint,
           ok: false,
@@ -1332,8 +1621,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
           schema: 1,
           kind: 'browser-gate-receipt',
           project: opts.project,
-          reqId: opts.reqId,
-          specHash,
+          ...receiptIdentity(specHash),
           displayVersion: opts.version,
           suiteFingerprint,
           ok: false,
@@ -1361,8 +1649,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
           schema: 1,
           kind: 'browser-gate-receipt',
           project: opts.project,
-          reqId: opts.reqId,
-          specHash,
+          ...receiptIdentity(specHash),
           displayVersion: opts.version,
           suiteFingerprint,
           ok: false,
@@ -1390,8 +1677,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
           schema: 1,
           kind: 'browser-gate-receipt',
           project: opts.project,
-          reqId: opts.reqId,
-          specHash,
+          ...receiptIdentity(specHash),
           displayVersion: opts.version,
           suiteFingerprint,
           ok: false,
@@ -1420,8 +1706,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
           schema: 1,
           kind: 'browser-gate-receipt',
           project: opts.project,
-          reqId: opts.reqId,
-          specHash,
+          ...receiptIdentity(specHash),
           displayVersion: opts.version,
           suiteFingerprint,
           ok: false,
@@ -1451,8 +1736,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
         schema: 1,
         kind: 'browser-gate-receipt',
         project: opts.project,
-        reqId: opts.reqId,
-        specHash,
+        ...receiptIdentity(specHash),
         displayVersion: opts.version,
         suiteFingerprint,
         ok: true,
@@ -1482,6 +1766,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
       summary,
       suiteFingerprint,
       specHash,
+      productBinding,
     };
     gateResult.testRunRecord = writeEvidence(true, reportPath, suiteFingerprint, specHash);
     return gateResult;
@@ -1494,8 +1779,7 @@ export async function runBrowserGate(opts: BrowserGateOptions): Promise<BrowserG
           schema: 1,
           kind: 'browser-gate-receipt',
           project: opts.project,
-          reqId: opts.reqId,
-          specHash,
+          ...receiptIdentity(specHash),
           displayVersion: opts.version,
           suiteFingerprint,
           ok: false,

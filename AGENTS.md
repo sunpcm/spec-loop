@@ -9,8 +9,8 @@
 - `spec-author` 接收固定 `origin/main` 的 `docs/specs/counter.md` 与用户文本，只输出 `{summary, content}` JSON。它不能调用工具、shell 或 GitHub，不能直接写仓库；控制器校验路径、大小、既有需求块保留和实际变化后，才允许写唯一白名单文件。
 - 主 Agent 负责架构、独立评审、Git 集成与真实链路验收；实施子 Agent 负责其任务说明指定的代码、测试和交付报告。
 - 实施节点仅修改指定 worktree 和文件范围；不 commit/push/merge、不操作远端、不读取凭据，不自行扩大范围。
-- 运行时 Planner 只输出任务计划，Worker 只输出 `src` 文件变更，`spec-author` 只输出需求文档 JSON；控制器验证路径、需求版本和检查结果后执行 git/gh。任何 Agent 不得自主 Merge。
-- 计数器的文档 PR 由用户确认合并。需求进入 `main` 并登记到 GitHub 主 Issue 后停在待排期，由有权限的用户为当前任务版本添加“可开工/rN”标签。控制器验证许可和版本后才派发 Worker。需求改版需要新的开工许可，重复打标只领取一次。代码 PR 再由用户确认合并发布。受控飞书入口只允许绑定会话中的白名单用户通过显式预检/确认触发，首版仅支持受管同仓 `pi/spec-*` 或 `pi/req-*`、base 为 `main` 的 PR。模型或实施 Agent 不得自主选择、发起或代做 Merge。
+- 运行时 Planner 只输出任务计划，Worker 只输出当前交付配置允许的源码变更，当前包括 `REQ-CNT-01` 的 `src/**` 与显式绑定的 `REQ-PANEL-01` 的 `panel/src/**`。`spec-author` 只输出需求文档 JSON。控制器验证路径、需求版本和检查结果后执行 git/gh。任何 Agent 不得自主 Merge。
+- 文档 PR 由用户确认合并。需求进入 `main` 并登记到 GitHub 主 Issue 后停在待排期，由有权限的用户为当前任务版本添加“可开工/rN”标签。计数器或显式绑定面板使用按版人工门禁。历史非受管任务继续沿用既有兼容路径。计数器和面板独立排期，合并文档不会直接开工。控制器验证许可和版本后才派发 Worker。需求改版需要新的开工许可，重复打标只领取一次。代码 PR 再由用户确认合并发布。受控飞书入口只允许绑定会话中的白名单用户通过显式预检/确认触发，首版仅支持受管同仓 `pi/spec-*` 或 `pi/req-*`、base 为 `main` 的 PR。模型或实施 Agent 不得自主选择、发起或代做 Merge。
 - 模型路由按用户本次授权：workbuddy/deepseek-v4-pro、workbuddy/deepseek-v4.1-flash、zcode/GLM-5.3、zcode/GLM-5.3-Flash；四者均失败才回退内置 GPT。调用失败不丢弃 WIP，后续有界复检、可用后切回。
 
 ## 第一轮最小保障
@@ -32,7 +32,7 @@
 
 浏览器验收门禁：Worker 在固定 `typecheck`/`node:test`/`build` 通过后、commit/push/PR 前强制跑 `runBrowserGate`；合并构建在固定检查和构建后对同一产物验收，成功才继续 `healthCheck/switchPreview/markDeployed`。门禁在独立 `sandbox-exec` profile 中运行，只放行该次候选的本机固定端口，禁止公网/其他端口/敏感读/源写。真实 HTTP/listen 集成测试用 `SPEC_LOOP_VERIFY=1` 主验收门控，默认 `npm test` 不尝试 listen。`npm run test:e2e*` 必须经 `orchestrator/browser-gate-cli.ts` 的同一受控沙箱，不接受裸跑 `playwright test` 或任意外站 URL。
 
-测试所有权：`tests/e2e/**` 与 `playwright.config.ts` 由独立测试作者维护，契约 `tests/e2e/contracts/counter.json`（`reqId/specPath/specHash/caseIds`）与 `panel.json`（仅 `caseIds`）是其输出；实施节点不改、不读其私有目录，也不代写或刷新预期哈希。可信验收套件来自已部署控制器受管资产（`WorkerDeps.browserE2eRoot`），与候选 `sourceMainSha` 快照分离，避免把测试基线锁死在旧请求 SHA。
+测试所有权：`tests/e2e/**` 与 `playwright.config.ts` 由独立测试作者维护，`counter.json` 与 `panel.json` 均以 `reqId/specPath/specHash/caseIds` 标识受控契约。实施节点不改、不读其私有目录，也不代写或刷新预期哈希。可信验收套件来自已部署控制器受管资产（`WorkerDeps.browserE2eRoot`），与候选 `sourceMainSha` 快照分离，避免把测试基线锁死在旧请求 SHA。计数器沿用自己的验收契约。显式绑定的面板产品交付还须使用受控 `acceptanceCases` 将已确认规格中的每条验收映射到允许的 `caseId`。面板业务门禁不能只凭 `caseIds` 宣称成功。
 
 没有数据库或外部业务测试库；测试使用临时 Git 仓库及模拟 gh/Pi/飞书。真实 GitHub/Pi/飞书验收由主 Agent 在本任务授权范围执行，人工 Merge 由用户完成。
 

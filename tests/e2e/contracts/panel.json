@@ -1,6 +1,7 @@
 {
-  "specPath": "docs/specs/counter.md",
-  "reqId": "REQ-CNT-01",
+  "reqId": "REQ-PANEL-01",
+  "specPath": "docs/specs/pending/panel.md",
+  "specHash": "18ba326d25372f75362ce9735fcd472ffa5ce060686f7abe166521cb6b1abef6",
   "caseIds": [
     "PANEL-DEMO-001",
     "PANEL-DEMO-002",

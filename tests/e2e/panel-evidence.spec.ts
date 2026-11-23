@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
+import { PANEL_EVIDENCE_CASE_IDS } from './panel-case-ids.ts';
 
 // 固定 API 夹具，不是一次真实浏览器执行留下的证据。
 type TestRunsResponse = {
@@ -58,16 +59,6 @@ type TestRunsResponse = {
     }>;
   }>;
 };
-
-const PANEL_EVIDENCE_CASE_IDS = [
-  'PANEL-EVIDENCE-001',
-  'PANEL-EVIDENCE-002',
-  'PANEL-EVIDENCE-003',
-  'PANEL-EVIDENCE-004',
-  'PANEL-EVIDENCE-005',
-  'PANEL-EVIDENCE-006',
-  'PANEL-EVIDENCE-007',
-] as const;
 
 const BROWSER_RUN_ID = 'fixture-browser-failed';
 const UNKNOWN_RUN_ID = 'fixture-fixed-unknown';

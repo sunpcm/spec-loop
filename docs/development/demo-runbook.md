@@ -42,6 +42,7 @@ SPEC_LOOP_DEV_PORT=5174
 SPEC_LOOP_PUBLIC_URL=https://spec-loop.biubiuniu.com/
 ```
 计数器的开工许可使用 GitHub 账号的数字 ID。用负责手动排期的账号执行 `gh api user --jq '.id'`，将返回的数字写入本地 `SPEC_LOOP_DISPATCH_ALLOWED_USER_IDS`，多个 ID 用英文逗号分隔。空名单时任务仍可登记，Worker 等待授权。飞书用户 ID 和 GitHub 数字 ID 分开配置。
+面板需求默认关闭。需要接入 `REQ-PANEL-01` 时，在 `.env.local` 配置单行 JSON `SPEC_LOOP_PANEL_BINDING`，固定仓库名、主线、`github-repository-id:<数字>`、受信 Issue、首次接续的主线 SHA 与规格哈希；字段必须全部匹配，否则配置加载失败。确认锚点只用于首次接续普通 Issue，后续 rN 使用各版冻结的来源 SHA 与规格哈希。关闭绑定时旧面板标签不会触发 Worker。
 加载配置的进程必须显式指定文件。每个运行 `demo:*` 的终端都执行：
 ```bash
 export SPEC_LOOP_ENV_FILE="$PWD/.env.local"
