@@ -27,6 +27,7 @@ import {
 import {
   readPanelArtifactVersion,
   resolveBrowserGateCliPlan,
+  runBrowserGateCli,
 } from '../orchestrator/browser-gate-cli.ts';
 import type { GitClient } from '../orchestrator/git.ts';
 import type { GithubClient } from '../orchestrator/github.ts';
@@ -541,6 +542,93 @@ test('面板 CLI version.json 缺失、坏 JSON、空版本与符号链接都 fa
     rmSync(join(artifactDir, 'version.json'));
     symlinkSync(join(root, 'outside.json'), join(artifactDir, 'version.json'));
     assert.throws(() => readPanelArtifactVersion(artifactDir), /符号链接/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('browser-gate CLI 只给绑定面板注入面板身份，counter 与手动 smoke 保持各自契约', async () => {
+  const root = tempRoot();
+  const repoDir = join(root, 'repo');
+  const counterDist = join(root, 'counter-dist');
+  const panelDist = join(root, 'panel-dist');
+  const jobRoot = join(root, 'jobs');
+  const browserCacheDir = join(root, 'browsers');
+  try {
+    mkdirSync(join(repoDir, 'docs', 'specs'), { recursive: true });
+    mkdirSync(counterDist, { recursive: true });
+    mkdirSync(panelDist, { recursive: true });
+    mkdirSync(jobRoot, { recursive: true });
+    mkdirSync(browserCacheDir, { recursive: true });
+    writeFileSync(join(repoDir, COUNTER_PATH), COUNTER_BODY, 'utf8');
+    writeFileSync(join(counterDist, 'index.html'), '<main>counter</main>', 'utf8');
+    writeFileSync(join(panelDist, 'index.html'), '<main>panel</main>', 'utf8');
+    writeFileSync(join(panelDist, 'version.json'), '{"version":"panel-local"}\n', 'utf8');
+
+    const observed: BrowserGateOptions[] = [];
+    const gateRunner = async (options: BrowserGateOptions): Promise<BrowserGateResult> => {
+      observed.push(options);
+      return okBrowserGate();
+    };
+
+    await runBrowserGateCli('counter', {
+      repoDir,
+      env: { SPEC_LOOP_OUT_DIR: counterDist },
+      jobTmpRoot: jobRoot,
+      browserCacheDir,
+      evidenceJobId: 'cli-counter',
+      gateRunner,
+    });
+    await runBrowserGateCli('panel', {
+      repoDir,
+      env: { SPEC_LOOP_OUT_DIR: panelDist },
+      jobTmpRoot: jobRoot,
+      browserCacheDir,
+      evidenceJobId: 'cli-panel-unbound',
+      gateRunner,
+    });
+
+    const boundSha = 'b'.repeat(40);
+    writeFileSync(join(panelDist, 'version.json'), `${JSON.stringify({ version: boundSha })}\n`, 'utf8');
+    await runBrowserGateCli('panel', {
+      repoDir,
+      env: { SPEC_LOOP_OUT_DIR: panelDist },
+      jobTmpRoot: jobRoot,
+      browserCacheDir,
+      evidenceJobId: 'cli-panel-bound',
+      git: {
+        async hasCommit(): Promise<boolean> {
+          return true;
+        },
+        async archive(_repoDir: string, _sha: string, targetDir: string): Promise<void> {
+          mkdirSync(join(targetDir, 'docs', 'specs', 'pending'), { recursive: true });
+          writeFileSync(join(targetDir, ...PANEL_SPEC_PATH.split('/')), PANEL_SPEC_BODY, 'utf8');
+        },
+      },
+      gateRunner,
+    });
+
+    assert.equal(observed.length, 3);
+    const [counter, panelUnbound, panelBound] = observed;
+    assert.equal(counter?.project, 'counter');
+    assert.equal(counter?.reqId, undefined);
+    assert.equal(counter?.specPath, undefined);
+    assert.equal(counter?.specFiles[COUNTER_PATH], COUNTER_BODY);
+    assert.equal(counter?.requireProductBinding, undefined);
+    assert.equal(counter?.unboundProductSmoke, undefined);
+
+    assert.equal(panelUnbound?.project, 'panel');
+    assert.equal(panelUnbound?.reqId, undefined);
+    assert.equal(panelUnbound?.specPath, undefined);
+    assert.equal(panelUnbound?.requireProductBinding, undefined);
+    assert.equal(panelUnbound?.unboundProductSmoke, true);
+
+    assert.equal(panelBound?.project, 'panel');
+    assert.equal(panelBound?.reqId, PANEL_REQ_ID);
+    assert.equal(panelBound?.specPath, PANEL_SPEC_PATH);
+    assert.equal(panelBound?.specFiles[PANEL_SPEC_PATH], PANEL_SPEC_BODY);
+    assert.equal(panelBound?.requireProductBinding, true);
+    assert.equal(panelBound?.unboundProductSmoke, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -6,6 +6,7 @@ import {
   resolveSeatbeltPath,
   runBrowserGate,
   readSpecFilesFromDir,
+  type BrowserGateOptions,
   type BrowserGateResult,
   type BrowserGateRunner,
   type E2eProject,
@@ -204,6 +205,8 @@ export interface BrowserGateCliOptions {
   evidenceJobId?: string;
   execBin?: string;
   timeoutMs?: number;
+  /** 测试注入点，生产调用固定使用真实 runBrowserGate。 */
+  gateRunner?: (options: BrowserGateOptions) => Promise<BrowserGateResult>;
 }
 
 export async function resolveBrowserGateCliPlan(
@@ -271,15 +274,16 @@ export async function runBrowserGateCli(
   video: 'retain-on-failure' | 'on' = 'retain-on-failure',
 ): Promise<BrowserGateResult> {
   const plan = await resolveBrowserGateCliPlan(project, options, video);
+  const executeGate = options.gateRunner ?? runBrowserGate;
   try {
-    return await runBrowserGate({
+    return await executeGate({
       repoDir: plan.repoDir,
       e2eRoot: plan.e2eRoot,
       artifactDir: plan.artifactDir,
       mountPath: '/',
       version: plan.version,
       project: plan.project,
-      ...(plan.productBinding === 'bound'
+      ...(plan.project === 'panel' && plan.productBinding === 'bound'
         ? { reqId: PANEL_REQ_ID, specPath: PANEL_SPEC_PATH }
         : {}),
       specFiles: plan.specFiles,
@@ -293,9 +297,11 @@ export async function runBrowserGateCli(
       evidenceStage: 'manual',
       video: plan.video,
       jobId: plan.jobId,
-      ...(plan.productBinding === 'bound' ? { requireProductBinding: true } : {
-        unboundProductSmoke: true,
-      }),
+      ...(plan.project === 'panel'
+        ? plan.productBinding === 'bound'
+          ? { requireProductBinding: true }
+          : { unboundProductSmoke: true }
+        : {}),
     });
   } finally {
     if (plan.archiveDir) rmSync(plan.archiveDir, { recursive: true, force: true });
